@@ -53,3 +53,4 @@ futures-util = "0.3"
 rcgen = "0.13"
 base64 = "0.22"
 sha2.workspace = true
+tempfile = "3"

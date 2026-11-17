@@ -4,7 +4,7 @@
 pub mod drive;
 pub mod engine;
 pub mod frame;
-mod gfx;
+pub mod gfx;
 mod keep_active;
 pub mod keyboard;
 pub mod layout;

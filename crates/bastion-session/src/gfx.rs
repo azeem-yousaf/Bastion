@@ -106,6 +106,7 @@ fn run(
     codecs: &AtomicU32,
     reset: &AtomicBool,
 ) {
+    let mut capture = Capture::from_env();
     while let Ok(job) = jobs.recv() {
         match job {
             Job::Start(id) => match client.start(id) {
@@ -113,6 +114,9 @@ fn run(
                 Err(e) => warn!(error = %e, "Graphics pipeline failed to start"),
             },
             Job::Data(id, payload) => {
+                if let Some(c) = capture.as_mut() {
+                    c.record(&payload);
+                }
                 let started = Instant::now();
                 let result = client.process(id, &payload);
                 let took = started.elapsed();
@@ -140,6 +144,109 @@ fn run(
         }
     }
     debug!("Graphics thread finished");
+}
+
+/// Opt-in recording of the raw graphics channel (`BASTION_GFX_CAPTURE=<folder>`), for
+/// replaying real sessions in benchmarks (`examples/gfx_replay.rs`).
+///
+/// A recording contains the remote screen's contents, so it is never on by default, files are
+/// owner-only, and nothing is sent anywhere.
+///
+/// Format: `BGFXCAP1`, then for each message a little-endian `u32` length and the bytes as
+/// received on the channel (ZGFX-wrapped).
+struct Capture {
+    out: std::io::BufWriter<std::fs::File>,
+}
+
+const CAPTURE_MAGIC: &[u8; 8] = b"BGFXCAP1";
+
+impl Capture {
+    fn from_env() -> Option<Self> {
+        let dir = std::path::PathBuf::from(std::env::var_os("BASTION_GFX_CAPTURE")?);
+        let open = || -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::create_dir_all(&dir)?;
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            let path = dir.join(format!("gfx-{}-{}.bin", stamp.as_secs(), stamp.subsec_millis()));
+            let file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
+            Ok((path, file))
+        };
+        match open() {
+            Ok((path, file)) => {
+                warn!(path = %path.display(), "Recording the graphics channel (contains screen contents)");
+                let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+                std::io::Write::write_all(&mut out, CAPTURE_MAGIC).ok()?;
+                Some(Self { out })
+            }
+            Err(e) => {
+                warn!(error = %e, "Cannot record the graphics channel");
+                None
+            }
+        }
+    }
+
+    fn record(&mut self, payload: &[u8]) {
+        use std::io::Write as _;
+        let len = u32::try_from(payload.len()).unwrap_or(u32::MAX).to_le_bytes();
+        if self.out.write_all(&len).and_then(|()| self.out.write_all(payload)).is_err() {
+            warn!("Graphics recording stopped (write failed)");
+        }
+    }
+}
+
+/// Totals from [`replay_capture`].
+#[derive(Debug)]
+pub struct ReplayStats {
+    pub messages: usize,
+    pub bytes: usize,
+    /// Wall-clock time spent in the pipeline and compositing (excludes reading the file).
+    pub busy: Duration,
+}
+
+/// Replays a recording through the same pipeline and compositing as a live session, recording
+/// the usual `gfx.*`/`frame.*` metrics. Used by `examples/gfx_replay.rs`.
+pub fn replay_capture(
+    path: &std::path::Path,
+    display: &bastion_core::profile::DisplaySettings,
+) -> anyhow::Result<ReplayStats> {
+    let data = std::fs::read(path)?;
+    let body = data
+        .strip_prefix(CAPTURE_MAGIC.as_slice())
+        .ok_or_else(|| anyhow::anyhow!("not a Bastion graphics recording"))?;
+    let mut messages = Vec::new();
+    let mut rest = body;
+    while rest.len() >= 4 {
+        let len = u32::from_le_bytes(rest[..4].try_into()?) as usize;
+        anyhow::ensure!(rest.len() >= 4 + len, "truncated recording");
+        messages.push(&rest[4..4 + len]);
+        rest = &rest[4 + len..];
+    }
+    let (replies, _keep) = mpsc::unbounded_channel();
+    let shared =
+        GfxShared { frame: Arc::new(SharedFrame::default()), waker: Arc::new(|| {}), replies, active: Arc::default() };
+    let codecs = Arc::new(AtomicU32::new(0));
+    let reset = Arc::new(AtomicBool::new(false));
+    let mut client = gfx_client(display, Some(reset.clone()), codecs.clone());
+    client.start(1).map_err(|e| anyhow::anyhow!("start: {e}"))?;
+    let mut busy = Duration::ZERO;
+    let mut bytes = 0;
+    for msg in &messages {
+        bytes += msg.len();
+        let started = Instant::now();
+        let result = client.process(1, msg);
+        let took = started.elapsed();
+        bastion_metrics::GFX_PROCESS.record(took);
+        record_codec_time(codecs.swap(0, Ordering::Relaxed), took);
+        if let Err(e) = result {
+            warn!(error = %e, "Graphics pipeline error during replay");
+        }
+        let _ = reset.swap(false, Ordering::Relaxed);
+        composite(&mut client, &shared);
+        busy += started.elapsed();
+        // The renderer would take the dirty list; keep it from growing across the replay.
+        shared.frame.lock().dirty.clear();
+    }
+    Ok(ReplayStats { messages: messages.len(), bytes, busy })
 }
 
 fn reply(shared: &GfxShared, channel_id: u32, msgs: Vec<DvcMessage>) {
@@ -465,6 +572,45 @@ mod tests {
     /// Server → client message as it arrives on the channel (ZGFX segment, uncompressed).
     fn wire(pdu: GfxPdu) -> Vec<u8> {
         ironrdp_graphics::zgfx::wrap_uncompressed(&ironrdp_core::encode_vec(&pdu).unwrap())
+    }
+
+    #[test]
+    fn recordings_replay_through_the_pipeline() {
+        use ironrdp_egfx::pdu::*;
+        let monitor = ironrdp_pdu::gcc::Monitor {
+            left: 0,
+            top: 0,
+            right: 63,
+            bottom: 47,
+            flags: ironrdp_pdu::gcc::MonitorFlags::PRIMARY,
+        };
+        let msgs = [
+            GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::SMALL_CACHE,
+            })),
+            GfxPdu::ResetGraphics(ResetGraphicsPdu { width: 64, height: 48, monitors: vec![monitor] }),
+            GfxPdu::CreateSurface(CreateSurfacePdu {
+                surface_id: 1,
+                width: 64,
+                height: 48,
+                pixel_format: PixelFormat::XRgb,
+            }),
+        ];
+        let mut file = CAPTURE_MAGIC.to_vec();
+        for m in msgs {
+            let w = wire(m);
+            file.extend_from_slice(&(w.len() as u32).to_le_bytes());
+            file.extend_from_slice(&w);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gfx.bin");
+        std::fs::write(&path, &file).unwrap();
+        let display = bastion_core::profile::DisplaySettings { h264: false, ..Default::default() };
+        let stats = replay_capture(&path, &display).unwrap();
+        assert_eq!(stats.messages, 3);
+
+        std::fs::write(&path, b"not a recording").unwrap();
+        assert!(replay_capture(&path, &display).is_err());
     }
 
     #[test]
