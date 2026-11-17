@@ -1,0 +1,17 @@
+[package]
+name = "bastion-camera"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ironrdp-rdpecam.workspace = true
+ironrdp-dvc.workspace = true
+v4l = "0.14"
+tracing.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+ironrdp-svc.workspace = true
+ironrdp-core.workspace = true
+ironrdp-pdu.workspace = true

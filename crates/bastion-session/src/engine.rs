@@ -57,6 +57,8 @@ pub struct ConnectParams {
     pub client_name: String,
     /// Audio device host; `None` = PulseAudio/PipeWire. Tests inject an in-memory host.
     pub audio_host: Option<Arc<dyn bastion_audio::AudioHost>>,
+    /// Camera host; `None` = V4L2. Tests inject an in-memory host.
+    pub camera_host: Option<Arc<dyn bastion_camera::CameraHost>>,
 }
 
 #[derive(Debug)]
@@ -628,6 +630,24 @@ fn build_connector(
             .with_dynamic_channel_factory(ironrdp_rdpsnd::client::DVC_CHANNEL_NAME, move || a.channel())
             .with_dynamic_channel_factory(ironrdp_rdpsnd::client::LOSSY_DVC_CHANNEL_NAME, move || b.lossy_channel());
     }
+    // Microphone and camera both push data produced on their own threads through this uplink.
+    if p.camera.enabled {
+        let host = ctx.params.camera_host.clone().unwrap_or_else(bastion_camera::default_host);
+        let tx = mic_tx.clone();
+        let uplink: bastion_camera::SampleUplink = Arc::new(move |id, msgs| {
+            tx.send((id, msgs)).map_err(|_| ironrdp_pdu::pdu_other_err!("camera uplink closed"))
+        });
+        match bastion_camera::camera_channels(host, uplink) {
+            Some(cams) => {
+                info!(cameras = ?cams.names, "Offering cameras to the remote computer");
+                drdynvc = cams.register(drdynvc);
+            }
+            None => {
+                info!("Camera redirection is on but no usable camera was found");
+                ctx.emit(Event::Notice("No webcam found to share with the remote computer.".into()));
+            }
+        }
+    }
     if p.audio.microphone {
         let opts = bastion_audio::CaptureOptions { device: p.audio.input_device.clone() };
         let mic_host = audio_host.clone();
@@ -726,7 +746,7 @@ fn build_connector(
             }
         }
     }
-    if !rdpdr_attached && (p.audio.playback || p.audio.microphone) {
+    if !rdpdr_attached && (p.audio.playback || p.audio.microphone || p.camera.enabled) {
         connector.attach_static_channel(ironrdp_rdpdr::Rdpdr::new(
             Box::new(ironrdp_rdpdr::NoopRdpdrBackend),
             ctx.params.client_name.clone(),

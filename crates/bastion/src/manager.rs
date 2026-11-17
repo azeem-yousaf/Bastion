@@ -504,6 +504,13 @@ impl Manager {
                 ui.add_enabled_ui(d.audio.microphone, |ui| {
                     device_combo(ui, "in", "Microphone", &mut d.audio.input_device, devices.as_ref().map(|l| &l.inputs[..]));
                 });
+                theme::section(ui, "Camera");
+                ui.checkbox(&mut d.camera.enabled, "Use this computer's webcams in the remote session");
+                ui.label(
+                    egui::RichText::new("All webcams are offered; the remote computer turns one on only when an app uses it.")
+                        .small()
+                        .color(theme::MUTED),
+                );
                 theme::section(ui, "Clipboard");
                 ui.checkbox(&mut d.clipboard.enabled, "Share the clipboard (text, rich text, images)");
                 ui.add_enabled_ui(d.clipboard.enabled, |ui| {
@@ -516,14 +523,16 @@ impl Manager {
                 ui.checkbox(&mut d.drive.enabled, "Share a local folder with the remote computer");
                 ui.add_enabled_ui(d.drive.enabled, |ui| {
                     form(ui, "drive", |ui| {
+                        // Label the text box itself (not the row) so screen readers name it.
                         field(ui, "Folder", |ui| {
                             ui.horizontal(|ui| {
-                                ui.add(egui::TextEdit::singleline(&mut d.drive.local_path).desired_width(260.0));
+                                let path = ui.add(egui::TextEdit::singleline(&mut d.drive.local_path).desired_width(260.0));
                                 if ui.button("Browse…").clicked() {
                                     pick_folder = true;
                                 }
+                                path
                             })
-                            .response
+                            .inner
                         });
                         field(ui, "Shown as", |ui| ui.add(egui::TextEdit::singleline(&mut d.drive.share_name)));
                     });

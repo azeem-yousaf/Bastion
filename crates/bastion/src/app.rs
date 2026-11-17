@@ -121,6 +121,7 @@ impl App {
                 keyboard_layout: kl,
                 client_name: cn,
                 audio_host: None,
+                camera_host: None,
             },
             self.waker(),
             self.manager.settings.grab_system_shortcuts,

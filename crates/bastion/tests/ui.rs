@@ -127,6 +127,30 @@ fn keep_active_interval_is_chosen_in_editor_and_saved() {
 }
 
 #[test]
+fn webcam_sharing_is_off_by_default_and_can_be_enabled() {
+    let f = fixture();
+    let mut h = harness(manager(&f));
+    h.run();
+    h.get_by_label("+  New connection").click();
+    h.run();
+    let inputs: Vec<_> = h.query_all_by_role(egui::accesskit::Role::TextInput).collect();
+    inputs[2].focus();
+    inputs[2].type_text("pc01");
+    h.run();
+
+    // No snapshot: this tab lists the machine's real audio devices.
+    h.get_by_label("Audio & devices").click();
+    h.run();
+    // One click turns it on, so it started off.
+    h.get_by_label("Use this computer's webcams in the remote session").click();
+    h.run();
+
+    h.get_by_label("Save").click();
+    h.run();
+    assert!(ProfileStore::load(&f.paths).unwrap().profiles()[0].camera.enabled);
+}
+
+#[test]
 fn saving_without_computer_shows_validation_error() {
     let f = fixture();
     let mut h = harness(manager(&f));

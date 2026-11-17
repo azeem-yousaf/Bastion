@@ -130,6 +130,14 @@ pub fn import(text: &str, fallback_name: &str) -> (Profile, Vec<String>) {
         p.audio.microphone = m == 1;
     }
 
+    // Cameras: `*` = all, otherwise a ';'-separated list of device ids (Windows-specific).
+    if let Some(c) = s("camerastoredirect").as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        p.camera.enabled = true;
+        if c != "*" {
+            warnings.push("The file lists specific cameras; Bastion shares all of this computer's webcams.".to_owned());
+        }
+    }
+
     // Clipboard.
     if let Some(v) = i("redirectclipboard") {
         p.clipboard.enabled = v == 1;
@@ -180,6 +188,16 @@ audiocapturemode:i:1\r\nredirectclipboard:i:1\r\ndrivestoredirect:s:*\r\n\r\n";
         assert!(p.audio.playback && p.audio.microphone && p.clipboard.enabled);
         assert!(!p.drive.enabled);
         assert!(warnings.iter().any(|w| w.contains("drive")));
+    }
+
+    #[test]
+    fn camera_redirection_is_imported() {
+        assert!(!import(SAMPLE, "x").0.camera.enabled);
+        let (p, w) = import("full address:s:pc01\r\ncamerastoredirect:s:*\r\n", "x");
+        assert!(p.camera.enabled && w.is_empty(), "{w:?}");
+        let (p, w) = import("full address:s:pc01\r\ncamerastoredirect:s:\\\\?\\usb#vid_046d\r\n", "x");
+        assert!(p.camera.enabled);
+        assert!(w.iter().any(|w| w.contains("all of this computer's webcams")), "{w:?}");
     }
 
     #[test]

@@ -23,6 +23,7 @@ ironrdp-egfx = "0.5"
 ironrdp-displaycontrol = "0.10"
 ironrdp-rdpsnd = "0.11"
 ironrdp-rdpeai = "0.2"
+ironrdp-rdpecam = "0.2"
 ironrdp-cliprdr = "0.9"
 ironrdp-cliprdr-format = "0.3"
 ironrdp-rdpdr = "0.9"
@@ -59,6 +60,7 @@ bastion-session = { path = "crates/bastion-session" }
 bastion-audio = { path = "crates/bastion-audio" }
 bastion-clipboard = { path = "crates/bastion-clipboard" }
 bastion-video = { path = "crates/bastion-video" }
+bastion-camera = { path = "crates/bastion-camera" }
 
 [profile.release]
 lto = "thin"

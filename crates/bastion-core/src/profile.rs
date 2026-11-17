@@ -25,6 +25,7 @@ pub struct Profile {
     pub audio: AudioSettings,
     pub clipboard: ClipboardSettings,
     pub drive: DriveSettings,
+    pub camera: CameraSettings,
     pub security: SecuritySettings,
     pub reconnect: ReconnectSettings,
     /// Nudge the remote mouse after this much local inactivity so the remote session (and apps
@@ -48,6 +49,7 @@ impl Default for Profile {
             audio: AudioSettings::default(),
             clipboard: ClipboardSettings::default(),
             drive: DriveSettings::default(),
+            camera: CameraSettings::default(),
             security: SecuritySettings::default(),
             reconnect: ReconnectSettings::default(),
             keep_active: KeepActive::default(),
@@ -242,6 +244,14 @@ impl Default for DriveSettings {
     fn default() -> Self {
         Self { enabled: false, local_path: String::new(), share_name: "Bastion".to_owned(), read_only: false }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct CameraSettings {
+    /// Offer every local webcam to the remote computer. Off by default: the remote side could
+    /// switch a camera on while the session is open.
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

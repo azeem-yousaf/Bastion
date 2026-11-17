@@ -111,6 +111,16 @@ fn connect_with_audio(
     trust: Arc<Mutex<TrustStore>>,
     audio_host: Option<Arc<dyn bastion_audio::AudioHost>>,
 ) -> SessionHandle {
+    connect_with_hosts(p, password, trust, audio_host, None)
+}
+
+fn connect_with_hosts(
+    p: Profile,
+    password: &str,
+    trust: Arc<Mutex<TrustStore>>,
+    audio_host: Option<Arc<dyn bastion_audio::AudioHost>>,
+    camera_host: Option<Arc<dyn bastion_camera::CameraHost>>,
+) -> SessionHandle {
     SessionHandle::spawn(
         ConnectParams {
             profile: p,
@@ -121,6 +131,7 @@ fn connect_with_audio(
             keyboard_layout: 0x0809,
             client_name: "bastion-test".into(),
             audio_host,
+            camera_host,
         },
         Arc::new(|| {}),
     )
@@ -281,6 +292,67 @@ fn keep_active_nudges_mouse_after_idle_interval() {
         log[nudge..].iter().any(|l| l == "MOUSE MOVE 100 200")
     });
 
+    h.send(Command::Disconnect);
+    assert!(!wait_disconnect(&h).1);
+}
+
+/// In-memory camera host: lists the given cameras; the test server never opens them.
+struct FakeCameras(Vec<bastion_camera::CameraInfo>);
+
+impl bastion_camera::CameraHost for FakeCameras {
+    fn cameras(&self) -> Vec<bastion_camera::CameraInfo> {
+        self.0.clone()
+    }
+    fn start(
+        &self,
+        _: &bastion_camera::CameraInfo,
+        _: bastion_camera::Mode,
+        _: bastion_camera::FrameCallback,
+    ) -> anyhow::Result<Box<dyn bastion_camera::RunningCapture>> {
+        anyhow::bail!("not used by the test server")
+    }
+}
+
+/// Camera redirection registers its channels without disturbing the session, and tells the user
+/// when there's no camera to share. (The RDPECAM message flow itself is tested in bastion-camera.)
+#[test]
+fn camera_redirection_connects_with_and_without_cameras() {
+    let server = Server::start();
+    let mut p = profile(server.port);
+    p.camera.enabled = true;
+
+    let none = Arc::new(FakeCameras(Vec::new()));
+    let h = connect_with_hosts(p.clone(), PASSWORD, pinned_trust(&server), None, Some(none));
+    wait_event(&h, |e| match e {
+        Event::Notice(n) if n.contains("No webcam") => Some(()),
+        _ => None,
+    });
+    wait_event(&h, |e| matches!(e, Event::Status(Status::Connected { .. })).then_some(()));
+    h.send(Command::Disconnect);
+    assert!(!wait_disconnect(&h).1);
+
+    let cam = bastion_camera::CameraInfo {
+        id: "fake0".into(),
+        name: "Fake Cam".into(),
+        modes: vec![bastion_camera::Mode {
+            format: bastion_camera::PixelFormat::Mjpeg,
+            width: 1280,
+            height: 720,
+            fps_num: 30,
+            fps_den: 1,
+        }],
+    };
+    let h = connect_with_hosts(p, PASSWORD, pinned_trust(&server), None, Some(Arc::new(FakeCameras(vec![cam]))));
+    wait_event(&h, |e| match e {
+        Event::Status(Status::Connected { .. }) => Some(()),
+        Event::Notice(n) => panic!("unexpected notice: {n}"),
+        _ => None,
+    });
+    // Input still flows normally.
+    let mut db = Database::new();
+    let a = Scancode::from_u8(false, 0x1E);
+    h.send(Command::Input(db.apply([Operation::KeyPressed(a), Operation::KeyReleased(a)])));
+    wait_until("key press with camera channels registered", || server.saw("KEY DOWN 30 false"));
     h.send(Command::Disconnect);
     assert!(!wait_disconnect(&h).1);
 }
