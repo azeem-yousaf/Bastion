@@ -69,6 +69,8 @@ pub struct Manager {
     keyring_ok: bool,
     /// Connected monitors (key, label) for the multi-monitor selection.
     monitors: Vec<(String, String)>,
+    /// Wake-on-LAN MAC address detection running in the background.
+    detect_mac: Option<Receiver<Result<bastion_core::wol::MacAddr, String>>>,
 }
 
 impl Manager {
@@ -101,6 +103,7 @@ impl Manager {
             waker,
             keyring_ok: secrets::keyring_available(),
             monitors: Vec::new(),
+            detect_mac: None,
         })
     }
 
@@ -196,6 +199,16 @@ impl Manager {
                 }
             }
         }
+        if let Some(rx) = &self.detect_mac
+            && let Ok(r) = rx.try_recv()
+        {
+            self.detect_mac = None;
+            match (r, self.draft.as_mut()) {
+                (Ok(mac), Some(d)) => d.wake.mac = mac.to_string(),
+                (Ok(_), None) => {}
+                (Err(e), _) => self.banner = Some((e, true)),
+            }
+        }
         if let Some(rx) = &self.devices
             && let Ok(r) = rx.try_recv()
         {
@@ -205,6 +218,32 @@ impl Manager {
                 Err(e) => self.banner = Some((format!("Could not list audio devices: {e}"), true)),
             }
         }
+    }
+
+    fn start_mac_detection(&mut self, host: String, port: u16) {
+        let (tx, rx) = channel();
+        let waker = self.waker.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(bastion_core::wol::detect_mac(&host, port));
+            waker();
+        });
+        self.detect_mac = Some(rx);
+    }
+
+    /// Sends the Wake-on-LAN packet for a saved connection.
+    pub fn wake(&mut self, id: Uuid) {
+        let Some(p) = self.profile(id) else { return };
+        let name = p.display_name().to_owned();
+        self.banner = Some(match p.wake.configured() {
+            None => ("Set the computer's MAC address first (Edit → General → Wake-on-LAN).".into(), true),
+            Some((mac, to)) => match bastion_core::wol::send(mac, to) {
+                Ok(()) => {
+                    tracing::info!(%mac, %to, "Sent Wake-on-LAN");
+                    (format!("Wake-up packet sent to {name}. It may take a minute to start."), false)
+                }
+                Err(e) => (format!("Could not send the wake-up packet: {e}"), true),
+            },
+        });
     }
 
     fn load_devices(&mut self) {
@@ -342,6 +381,11 @@ impl Manager {
                 if theme::primary_button(ui, "Connect").clicked() {
                     request = self.begin_connect(p.id);
                 }
+                if p.wake.configured().is_some()
+                    && ui.button("Wake").on_hover_text("Send a Wake-on-LAN packet to switch the computer on").clicked()
+                {
+                    self.wake(p.id);
+                }
                 if ui.button("Edit").clicked() {
                     self.draft = Some(p.clone());
                     self.draft_is_new = false;
@@ -396,6 +440,14 @@ impl Manager {
                     "None".into()
                 },
             );
+            row(
+                "Wake-on-LAN",
+                match p.wake.configured() {
+                    None => "Off".into(),
+                    Some((mac, _)) if p.wake.on_connect => format!("{mac}, wakes automatically when connecting"),
+                    Some((mac, _)) => mac.to_string(),
+                },
+            );
             if p.security.allow_insecure_tls {
                 ui.label(egui::RichText::new("Security").color(theme::MUTED));
                 ui.label(egui::RichText::new("⚠ Certificate checks disabled").color(theme::DANGER));
@@ -412,6 +464,8 @@ impl Manager {
         let mut delete = false;
         let mut pick_folder = false;
         let mut want_devices = false;
+        let mut detect = false;
+        let detecting = self.detect_mac.is_some();
         let devices = self.device_list.clone();
         let is_new = self.draft_is_new;
         let mut confirm_delete = self.confirm_delete;
@@ -486,6 +540,45 @@ impl Manager {
                 theme::section(ui, "Sign-in");
                 ui.add_enabled(keyring_ok, egui::Checkbox::new(&mut d.security.remember_password, "Remember password in the system keyring"))
                     .on_disabled_hover_text("No Secret Service (KWallet / GNOME Keyring) is available");
+                theme::section(ui, "Wake-on-LAN");
+                form(ui, "wake", |ui| {
+                    field(ui, "MAC address", |ui| {
+                        ui.horizontal(|ui| {
+                            let mac = ui.add(
+                                egui::TextEdit::singleline(&mut d.wake.mac).hint_text("Off — e.g. 00:11:22:33:44:55").desired_width(220.0),
+                            );
+                            let can_detect = !detecting && !d.host.trim().is_empty();
+                            let label = if detecting { "Detecting…" } else { "Detect" };
+                            if ui
+                                .add_enabled(can_detect, egui::Button::new(label))
+                                .on_hover_text("Look up the MAC address of the computer (it must be switched on and on this network)")
+                                .clicked()
+                            {
+                                detect = true;
+                            }
+                            mac
+                        })
+                        .inner
+                    });
+                });
+                ui.add_enabled_ui(!d.wake.mac.trim().is_empty(), |ui| {
+                    ui.checkbox(&mut d.wake.on_connect, "Wake the computer when connecting if it doesn't answer");
+                    egui::CollapsingHeader::new("Broadcast address").id_salt("wake-advanced").show(ui, |ui| {
+                        form(ui, "wake-adv", |ui| {
+                            field(ui, "Send to", |ui| {
+                                ui.add(egui::TextEdit::singleline(&mut d.wake.broadcast).hint_text("255.255.255.255 (this network)"))
+                            });
+                            field(ui, "UDP port", |ui| ui.add(egui::DragValue::new(&mut d.wake.port).range(1..=65535)));
+                        });
+                    });
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Switches the computer on from sleep or off. Works on the computer's local network, with Wake-on-LAN enabled in its BIOS/UEFI and network adapter.",
+                    )
+                    .small()
+                    .color(theme::MUTED),
+                );
             }
             Tab::Display => {
                 theme::section(ui, "Mode");
@@ -607,6 +700,10 @@ impl Manager {
         }
         if pick_folder {
             self.pick(Pick::ShareFolder);
+        }
+        if detect && let Some(d) = self.draft.as_ref() {
+            let (host, port) = (d.host.trim().to_owned(), d.port);
+            self.start_mac_detection(host, port);
         }
         if cancel {
             self.draft = None;

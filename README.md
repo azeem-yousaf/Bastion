@@ -23,6 +23,8 @@ connecting to Windows PCs through a **Remote Desktop Gateway**.
 - **Connection quality indicator** in the session bar: a green / amber / red dot with the
   latency; hover for packet loss, frame rate and bandwidth. A notice appears if the connection
   stays poor.
+- **Wake-on-LAN:** a *Wake* button per connection, and automatic waking when a sleeping
+  computer doesn't answer (enter its MAC address, or click *Detect* while it is on).
 - **Auto-reconnect** after network drops, using the server's reconnect cookie.
 - **.rdp import:** open company `.rdp` files directly, or double-click them in Dolphin.
 - **System shortcuts** (Alt+Tab, Super, Alt+F4) go to the remote PC while it has focus.
@@ -91,6 +93,10 @@ Configuration lives in `~/.config/bastion/` (mode 0700): `profiles.toml` and
   enabled.
 - **Video glitches**: run with `BASTION_NO_HWDEC=1` to force software decoding, or untick
   *H.264* in the connection's Display settings.
+- **Wake-on-LAN doesn't wake the computer**: enable Wake-on-LAN in its BIOS/UEFI and in the
+  network adapter's power settings (Windows: *Allow this device to wake the computer* and
+  *Only allow a magic packet…*). The packet is a local-network broadcast, so it can't cross a
+  router or an RD Gateway; on another subnet, set that subnet's broadcast address.
 - **More detail**: run with `BASTION_LOG=debug bastion`, or see the log folder (*Settings →
   Diagnostics → Open folder*).
 - **Slowness**: every 10 s while something is happening, the log gets one `bastion::metrics`

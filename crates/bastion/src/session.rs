@@ -450,6 +450,9 @@ impl Session {
                         Status::ConnectingGateway => Phase::Connecting("Connecting to RD Gateway…".into()),
                         Status::Connecting => Phase::Connecting("Connecting to remote computer…".into()),
                         Status::Authenticating => Phase::Connecting("Signing in…".into()),
+                        Status::Waking => {
+                            Phase::Connecting("Waking the remote computer… (this can take a minute)".into())
+                        }
                         Status::Connected { .. } => Phase::Connected,
                         Status::Reconnecting { attempt, max } => {
                             Phase::Reconnecting(format!("Connection lost. Reconnecting (attempt {attempt} of {max})…"))

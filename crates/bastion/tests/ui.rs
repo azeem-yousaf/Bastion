@@ -392,3 +392,59 @@ fn new_monitor_prompt_offers_multiple_monitors() {
     h.run();
     assert_eq!(h.state(), &vec![Action::UseNewMonitors, Action::DismissNewMonitors]);
 }
+
+#[test]
+fn wake_on_lan_mac_is_entered_validated_and_saved() {
+    let f = fixture();
+    let mut h = harness(manager(&f));
+    h.run();
+    h.get_by_label("+  New connection").click();
+    h.run();
+    let inputs: Vec<_> = h.query_all_by_role(egui::accesskit::Role::TextInput).collect();
+    inputs[2].focus();
+    inputs[2].type_text("pc01");
+    h.run();
+
+    h.get_by_label("MAC address").focus();
+    h.get_by_label("MAC address").type_text("00-11-22");
+    h.run();
+    h.get_by_label("Save").click();
+    h.run();
+    assert!(h.query_by_label_contains("Wake-on-LAN: \"00-11-22\" is not a MAC address").is_some());
+    assert!(ProfileStore::load(&f.paths).unwrap().profiles().is_empty());
+
+    h.get_by_label("MAC address").focus();
+    h.get_by_label("MAC address").type_text("-33-44-55");
+    h.run();
+    h.snapshot("editor_general_wake_on_lan");
+    h.get_by_label("Save").click();
+    h.run();
+    let store = ProfileStore::load(&f.paths).unwrap();
+    let p = &store.profiles()[0];
+    assert_eq!(p.wake.mac, "00-11-22-33-44-55");
+    assert!(p.wake.on_connect, "waking on connect is on by default once a MAC is set");
+}
+
+#[test]
+fn wake_button_sends_the_magic_packet() {
+    let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    rx.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+    let f = fixture();
+    let mut store = ProfileStore::load(&f.paths).unwrap();
+    let mut p = bastion_core::Profile { name: "Desktop".into(), host: "desktop".into(), ..Default::default() };
+    p.wake.mac = "00:11:22:33:44:55".into();
+    p.wake.broadcast = "127.0.0.1".into();
+    p.wake.port = rx.local_addr().unwrap().port();
+    store.upsert(p).unwrap();
+    let mut h = harness(manager(&f));
+    h.run();
+    assert!(h.query_by_label_contains("00:11:22:33:44:55, wakes automatically").is_some());
+    h.get_by_label("Wake").click();
+    h.run();
+    let mut buf = [0u8; 200];
+    let n = rx.recv(&mut buf).expect("magic packet");
+    let mac = "00:11:22:33:44:55".parse().unwrap();
+    assert_eq!(&buf[..n], &bastion_core::wol::magic_packet(mac));
+    assert!(h.query_by_label_contains("Wake-up packet sent to Desktop").is_some());
+    h.snapshot("details_wake_sent");
+}

@@ -81,8 +81,16 @@ pub enum Status {
     ConnectingGateway,
     Connecting,
     Authenticating,
-    Connected { width: u16, height: u16 },
-    Reconnecting { attempt: u32, max: u32 },
+    /// The computer didn't answer; Wake-on-LAN packets are being sent while it starts.
+    Waking,
+    Connected {
+        width: u16,
+        height: u16,
+    },
+    Reconnecting {
+        attempt: u32,
+        max: u32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -420,7 +428,9 @@ async fn connect(
 ) -> Result<(ConnectionResult, Framed, Option<MicRx>), ConnectFailure> {
     let fut = connect_inner(ctx, layout, cliprdr, cookie);
     tokio::pin!(fut);
-    let timeout = tokio::time::sleep(CONNECT_TIMEOUT * 3);
+    // Waking a computer adds up to two minutes before the connection itself starts.
+    let wake = if ctx.params.profile.wake.configured().is_some() { Duration::from_secs(130) } else { Duration::ZERO };
+    let timeout = tokio::time::sleep(CONNECT_TIMEOUT * 3 + wake);
     tokio::pin!(timeout);
     loop {
         tokio::select! {
@@ -454,6 +464,15 @@ async fn connect_inner(
     // 1. Transport: RD Gateway tunnel or direct TCP.
     let (stream, client_addr): (Erased, SocketAddr) = if let Some(gw) = &p.gateway {
         ctx.emit(Event::Status(Status::ConnectingGateway));
+        if p.wake.on_connect
+            && let Some((mac, to)) = p.wake.configured()
+        {
+            // Only helps when this computer is on the remote computer's network; harmless otherwise.
+            match bastion_core::wol::send(mac, to) {
+                Ok(()) => debug!(%mac, "Sent Wake-on-LAN before connecting through the gateway"),
+                Err(e) => debug!(error = %e, "Could not send Wake-on-LAN"),
+            }
+        }
         let endpoint = gw.endpoint();
         let verifier = Arc::new(PinningVerifier::new(
             ctx.params.trust.clone(),
@@ -517,20 +536,51 @@ async fn connect_inner(
     } else {
         ctx.emit(Event::Status(Status::Connecting));
         let target = (p.host.trim(), p.port);
-        let tcp = match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(target)).await {
-            Err(_) => {
-                return Err(ConnectFailure::Error {
-                    message: format!("Timed out connecting to {}:{}.", p.host, p.port),
-                    retryable: true,
-                });
+        let wake = p.wake.on_connect.then(|| p.wake.configured()).flatten();
+        let tcp = if let Some((mac, to)) = wake {
+            use crate::wake::{WakeError, WakePlan, connect_waking};
+            let woken = connect_waking(
+                WakePlan::new(mac, to),
+                || tokio::net::TcpStream::connect(target),
+                || ctx.emit(Event::Status(Status::Waking)),
+            )
+            .await;
+            match woken {
+                Ok(s) => s,
+                Err(WakeError::Refused(e)) => {
+                    return Err(ConnectFailure::Error {
+                        message: format!("Cannot reach {}:{}: {e}", p.host, p.port),
+                        retryable: true,
+                    });
+                }
+                Err(WakeError::NoAnswer { waited }) => {
+                    return Err(ConnectFailure::Error {
+                        message: format!(
+                            "{} did not wake up within {} seconds. Check that Wake-on-LAN is enabled in its \
+                             BIOS/UEFI and network adapter settings, and that you are on the same network.",
+                            p.host.trim(),
+                            waited.as_secs()
+                        ),
+                        retryable: true,
+                    });
+                }
             }
-            Ok(Err(e)) => {
-                return Err(ConnectFailure::Error {
-                    message: format!("Cannot reach {}:{}: {e}", p.host, p.port),
-                    retryable: true,
-                });
+        } else {
+            match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(target)).await {
+                Err(_) => {
+                    return Err(ConnectFailure::Error {
+                        message: format!("Timed out connecting to {}:{}.", p.host, p.port),
+                        retryable: true,
+                    });
+                }
+                Ok(Err(e)) => {
+                    return Err(ConnectFailure::Error {
+                        message: format!("Cannot reach {}:{}: {e}", p.host, p.port),
+                        retryable: true,
+                    });
+                }
+                Ok(Ok(s)) => s,
             }
-            Ok(Ok(s)) => s,
         };
         let _ = tcp.set_nodelay(true);
         ctx.link.set_connection(crate::link::TcpProbe::new(std::os::fd::AsFd::as_fd(&tcp)), false);

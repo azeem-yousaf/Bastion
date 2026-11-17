@@ -31,6 +31,8 @@ pub struct Profile {
     /// Nudge the remote mouse after this much local inactivity so the remote session (and apps
     /// like Teams) don't go idle/away.
     pub keep_active: KeepActive,
+    /// Wake-on-LAN (off while no MAC address is set).
+    pub wake: WakeSettings,
     /// Optional free-form folder/group for organising the connection list.
     pub group: String,
 }
@@ -53,6 +55,7 @@ impl Default for Profile {
             security: SecuritySettings::default(),
             reconnect: ReconnectSettings::default(),
             keep_active: KeepActive::default(),
+            wake: WakeSettings::default(),
             group: String::new(),
         }
     }
@@ -82,6 +85,14 @@ impl Profile {
             }
             if gw.port == 0 {
                 problems.push("Gateway port must be between 1 and 65535.".to_owned());
+            }
+        }
+        if !self.wake.mac.trim().is_empty() {
+            if let Err(e) = self.wake.mac.parse::<crate::wol::MacAddr>() {
+                problems.push(format!("Wake-on-LAN: {e}"));
+            }
+            if let Err(e) = crate::wol::target(&self.wake.broadcast, self.wake.port) {
+                problems.push(format!("Wake-on-LAN broadcast address: {e}"));
             }
         }
         if self.drive.enabled {
@@ -269,6 +280,35 @@ pub struct SecuritySettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
+pub struct WakeSettings {
+    /// MAC address of the remote computer's network card; empty = Wake-on-LAN off.
+    pub mac: String,
+    /// Where the packet is broadcast; empty = the local network (255.255.255.255).
+    pub broadcast: String,
+    pub port: u16,
+    /// Wake the computer automatically when connecting (directly) and it doesn't answer.
+    pub on_connect: bool,
+}
+
+impl Default for WakeSettings {
+    fn default() -> Self {
+        Self { mac: String::new(), broadcast: String::new(), port: crate::wol::DEFAULT_PORT, on_connect: true }
+    }
+}
+
+impl WakeSettings {
+    /// The MAC address and destination, when Wake-on-LAN is configured (and valid).
+    pub fn configured(&self) -> Option<(crate::wol::MacAddr, std::net::SocketAddr)> {
+        let mac = self.mac.trim();
+        if mac.is_empty() {
+            return None;
+        }
+        Some((mac.parse().ok()?, crate::wol::target(&self.broadcast, self.port).ok()?))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct ReconnectSettings {
     pub enabled: bool,
     pub max_attempts: u32,
@@ -357,6 +397,27 @@ mod tests {
         assert_eq!(toml::from_str::<Profile>(&s).unwrap().keep_active, KeepActive::Min5);
         assert_eq!(KeepActive::Secs30.interval(), Some(std::time::Duration::from_secs(30)));
         assert_eq!(KeepActive::Off.interval(), None);
+    }
+
+    #[test]
+    fn wake_on_lan_is_off_until_a_mac_is_set_and_is_validated() {
+        let old: Profile = toml::from_str("host = \"pc01\"").unwrap();
+        assert_eq!(old.wake, WakeSettings::default());
+        assert_eq!(old.wake.configured(), None);
+
+        let mut p = Profile { host: "pc01".into(), ..Default::default() };
+        p.wake.mac = "00-11-22-33-44-55".into();
+        assert!(p.validate().is_empty());
+        let (mac, to) = p.wake.configured().unwrap();
+        assert_eq!(mac.to_string(), "00:11:22:33:44:55");
+        assert_eq!(to, "255.255.255.255:9".parse().unwrap());
+
+        p.wake.mac = "00:11:22".into();
+        assert!(p.validate().iter().any(|e| e.starts_with("Wake-on-LAN")), "{:?}", p.validate());
+        assert_eq!(p.wake.configured(), None);
+        p.wake.mac = "00:11:22:33:44:55".into();
+        p.wake.broadcast = "lan".into();
+        assert!(p.validate().iter().any(|e| e.contains("broadcast")));
     }
 
     #[test]

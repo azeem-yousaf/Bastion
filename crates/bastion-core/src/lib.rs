@@ -7,6 +7,7 @@ pub mod rdpfile;
 pub mod secrets;
 pub mod store;
 pub mod trust;
+pub mod wol;
 
 pub use paths::AppPaths;
 pub use profile::Profile;

@@ -469,6 +469,47 @@ fn unreachable_host_reports_error() {
     assert!(error && reason.contains("127.0.0.1"), "{reason}");
 }
 
+fn wake_profile(port: u16, rx: &std::net::UdpSocket) -> Profile {
+    let mut p = profile(port);
+    p.wake.mac = "00:11:22:33:44:55".into();
+    p.wake.broadcast = "127.0.0.1".into();
+    p.wake.port = rx.local_addr().unwrap().port();
+    p
+}
+
+#[test]
+fn wake_on_lan_is_not_sent_to_a_computer_that_answers() {
+    let server = Server::start();
+    let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    rx.set_nonblocking(true).unwrap();
+    let h = connect(wake_profile(server.port, &rx), PASSWORD, pinned_trust(&server));
+    wait_event(&h, |e| match e {
+        Event::Status(Status::Waking) => panic!("an awake computer must not be woken"),
+        Event::Status(Status::Connected { .. }) => Some(()),
+        _ => None,
+    });
+    assert!(rx.recv(&mut [0u8; 200]).is_err(), "no magic packet");
+    h.send(Command::Disconnect);
+    wait_disconnect(&h);
+}
+
+#[test]
+fn wake_on_lan_wakes_a_computer_that_does_not_answer() {
+    let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    rx.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    // TEST-NET-1 (RFC 5737): never answers, like a computer that is asleep.
+    let mut p = wake_profile(3389, &rx);
+    p.host = "192.0.2.1".into();
+    let h = connect(p, PASSWORD, Arc::new(Mutex::new(TrustStore::in_memory())));
+    wait_event(&h, |e| matches!(e, Event::Status(Status::Waking)).then_some(()));
+    let mut buf = [0u8; 200];
+    let n = rx.recv(&mut buf).expect("magic packet");
+    assert_eq!(&buf[..n], &bastion_core::wol::magic_packet("00:11:22:33:44:55".parse().unwrap()));
+    // Still trying (the computer gets two minutes to start); the user can cancel.
+    h.send(Command::Disconnect);
+    wait_disconnect(&h);
+}
+
 /// Records everything "played" so the test can verify the remote audio stream bit-exactly.
 #[derive(Clone, Default)]
 struct RecordingHost(Arc<Mutex<Vec<i16>>>);
