@@ -1048,14 +1048,6 @@ impl Session {
                 self.grabbed = true;
                 self.hide_bars();
             }
-            Action::HideBar => {
-                // Closing a pinned bar unpins it.
-                if self.pin_bar {
-                    self.pin_bar = false;
-                    self.pin_changed = Some(false);
-                }
-                self.hide_bars();
-            }
             Action::PinBar(pin) => {
                 self.pin_bar = pin;
                 self.pin_window = pin.then_some(id);
@@ -1093,7 +1085,6 @@ pub enum Action {
     ToggleFullscreen,
     Minimize,
     Grab,
-    HideBar,
     /// Keep the session bar visible (true) or let it hide again (false).
     PinBar(bool),
     Refresh,
@@ -1284,9 +1275,6 @@ pub fn session_bar(
                         };
                         if ui.selectable_label(pinned, pin_label).on_hover_text(pin_hint).clicked() {
                             actions.push(Action::PinBar(!pinned));
-                        }
-                        if ui.small_button("×").on_hover_text("Hide").clicked() {
-                            actions.push(Action::HideBar);
                         }
                     });
                 });

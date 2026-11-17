@@ -54,7 +54,7 @@ desktop keyring such as KWallet or GNOME Keyring.
 | Recapture the keyboard | Click inside the remote desktop |
 
 In full screen, move the mouse to the top edge to reveal the session bar. Click *Pin* on it to keep
-it visible (remembered for later sessions); *Unpin* or × lets it hide again.
+it visible (remembered for later sessions); *Unpin* lets it hide again.
 
 ## Security model
 
