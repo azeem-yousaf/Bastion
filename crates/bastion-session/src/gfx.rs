@@ -201,6 +201,12 @@ pub struct ReplayStats {
     pub bytes: usize,
     /// Wall-clock time spent in the pipeline and compositing (excludes reading the file).
     pub busy: Duration,
+    /// FNV-1a hash of the final framebuffer, to compare pipelines pixel for pixel.
+    pub frame_checksum: u64,
+    /// Final framebuffer size.
+    pub frame_size: (u32, u32),
+    /// FNV-1a hash over every updated region's pixels, in order, across the whole replay.
+    pub updates_checksum: u64,
 }
 
 /// Replays a recording through the same pipeline and compositing as a live session, recording
@@ -230,6 +236,7 @@ pub fn replay_capture(
     client.start(1).map_err(|e| anyhow::anyhow!("start: {e}"))?;
     let mut busy = Duration::ZERO;
     let mut bytes = 0;
+    let mut updates_checksum = 0xcbf2_9ce4_8422_2325_u64;
     for msg in &messages {
         bytes += msg.len();
         let started = Instant::now();
@@ -243,10 +250,24 @@ pub fn replay_capture(
         let _ = reset.swap(false, Ordering::Relaxed);
         composite(&mut client, &shared);
         busy += started.elapsed();
-        // The renderer would take the dirty list; keep it from growing across the replay.
-        shared.frame.lock().dirty.clear();
+        // The renderer would take the dirty list: hash what it would upload, then clear it.
+        let mut f = shared.frame.lock();
+        let stride = f.width as usize * 4;
+        for r in std::mem::take(&mut f.dirty) {
+            for row in r.y..r.y + r.h {
+                let start = row as usize * stride + r.x as usize * 4;
+                for &b in &f.data[start..start + r.w as usize * 4] {
+                    updates_checksum = (updates_checksum ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+                }
+            }
+        }
     }
-    Ok(ReplayStats { messages: messages.len(), bytes, busy })
+    let f = shared.frame.lock();
+    let frame_checksum =
+        f.data.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
+    let frame_size = (f.width, f.height);
+    drop(f);
+    Ok(ReplayStats { messages: messages.len(), bytes, busy, frame_checksum, frame_size, updates_checksum })
 }
 
 fn reply(shared: &GfxShared, channel_id: u32, msgs: Vec<DvcMessage>) {
@@ -309,9 +330,18 @@ pub(crate) fn gfx_client(
             // with CPU-decoded codecs (60–90 ms per update while video played). With V10.x
             // Windows chooses AVC420 or AVC444 itself.
             yuv420_planes: true,
+            // Software first (faster for remote-desktop streams), hardware if it can't keep up.
+            adaptive: true,
         })
         .map_err(|e| warn!(error = %e, "H.264 decoding unavailable"))
         .ok()
+        .map(|mut d| {
+            if let Some(r) = &reset {
+                // A graphics stream reset makes the server start over with a keyframe.
+                d.set_keyframe_request(r.clone());
+            }
+            d
+        })
     });
     let decoder = decoder.flatten();
     let planes = decoder.as_ref().map(bastion_video::FfmpegH264Decoder::yuv420_switch);
@@ -385,6 +415,11 @@ impl GfxHandler {
 }
 
 impl GraphicsPipelineHandler for GfxHandler {
+    /// Only the codec is read (for metrics), so decoders may skip copying pixels for us.
+    fn wants_bitmap_data(&self) -> bool {
+        false
+    }
+
     fn on_bitmap_updated(&mut self, update: &ironrdp_egfx::client::BitmapUpdate) {
         let seen = self.codecs.load(Ordering::Relaxed);
         if let Some(bit) = codec_bit(update.codec_id, seen & codec_bits::PROGRESSIVE != 0) {

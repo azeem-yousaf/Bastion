@@ -20,6 +20,10 @@ fn main() -> anyhow::Result<()> {
             stats.bytes as f64 / 1e6,
             stats.busy.as_secs_f64() * 1e3
         );
+        println!(
+            "  final frame {}x{} checksum {:016x}, all updates checksum {:016x}",
+            stats.frame_size.0, stats.frame_size.1, stats.frame_checksum, stats.updates_checksum
+        );
         if let Some(r) = bastion_metrics::collect(stats.busy.max(Duration::from_millis(1))) {
             for part in r
                 .line

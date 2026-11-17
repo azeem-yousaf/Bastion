@@ -3,3 +3,5 @@ tools/test-server/target/
 vendor/*/target/
 *.png.diff.png
 *.new.png
+*.diff.png
+*.old.png

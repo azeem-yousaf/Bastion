@@ -4,6 +4,12 @@
 //! decoder (slice-threaded). If the hardware path fails mid-stream, the decoder transparently
 //! re-opens in software mode and waits for the next IDR frame.
 //!
+//! In adaptive mode (what sessions use) it starts in *software*: measured on a real session,
+//! remote-desktop H.264 (2560×1440, mostly small changes) took 1.5 ms per frame in software on
+//! a 14-core CPU against 9 ms for NVDEC plus 5 ms to copy each frame back to system memory. If
+//! software decoding can't keep up, it switches to hardware at the next IDR frame and asks for
+//! one through the keyframe request flag.
+//!
 //! The decoder is configured for low delay: every input access unit yields its own picture
 //! (no reordering), which AVC444 relies on.
 
@@ -13,6 +19,7 @@ use std::ffi::c_int;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use ffmpeg_next::ffi;
 use ironrdp_egfx::decode::{DecodedFrame, DecoderError, DecoderResult, H264Decoder, Yuv420Frame};
@@ -41,12 +48,57 @@ pub struct DecoderOptions {
     /// Return YUV planes to the pipeline (enables AVC444). Costs a slower RGBA conversion
     /// inside IronRDP for AVC420 streams, so it is off unless AVC444 quality is wanted.
     pub yuv420_planes: bool,
+    /// Start in software and move to hardware (if `prefer_hardware`) only when software
+    /// decoding is too slow. Without it, hardware is used from the start when preferred.
+    pub adaptive: bool,
 }
 
 impl Default for DecoderOptions {
     fn default() -> Self {
-        Self { prefer_hardware: true, yuv420_planes: false }
+        Self { prefer_hardware: true, yuv420_planes: false, adaptive: false }
     }
+}
+
+/// Average software decode time (ms per frame) above which adaptive mode moves to hardware.
+pub const ADAPTIVE_SWITCH_MS: f64 = 16.0;
+/// Frames observed before adaptive mode may decide.
+const ADAPTIVE_MIN_FRAMES: u32 = 30;
+
+/// Adaptive-mode bookkeeping (see the module docs).
+#[derive(Debug, Default)]
+struct Adaptive {
+    /// Exponential moving average of software decode time, in ms.
+    avg_ms: f64,
+    frames: u32,
+    /// Waiting for an IDR frame to switch to hardware.
+    switch_pending: bool,
+    /// Set to ask the server for a keyframe.
+    keyframe_request: Option<Arc<AtomicBool>>,
+}
+
+impl Adaptive {
+    /// Records one software decode; returns true when it is time to switch.
+    fn observe(&mut self, ms: f64) -> bool {
+        self.frames += 1;
+        self.avg_ms = if self.frames == 1 { ms } else { self.avg_ms * 0.9 + ms * 0.1 };
+        !self.switch_pending && self.frames >= ADAPTIVE_MIN_FRAMES && self.avg_ms > ADAPTIVE_SWITCH_MS
+    }
+}
+
+/// Whether an Annex B access unit contains an IDR slice (NAL unit type 5).
+pub fn contains_idr(annex_b: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < annex_b.len() {
+        if annex_b[i] == 0 && annex_b[i + 1] == 0 && annex_b[i + 2] == 1 {
+            if annex_b[i + 3] & 0x1F == 5 {
+                return true;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 /// Creates the best available decoder, or `None` if FFmpeg has no H.264 decoder at all
@@ -165,6 +217,8 @@ pub struct FfmpegH264Decoder {
     sw_frame: Frame,
     input: Vec<u8>,
     hw_failures: u32,
+    /// `Some` while adaptive mode may still move to hardware.
+    adaptive: Option<Adaptive>,
     /// What `supports_yuv420` answers; see [`FfmpegH264Decoder::yuv420_switch`].
     planes: Arc<AtomicBool>,
 }
@@ -174,7 +228,9 @@ unsafe impl Send for FfmpegH264Decoder {}
 
 impl FfmpegH264Decoder {
     pub fn new(opts: DecoderOptions) -> DecoderResult<Self> {
-        let ctx = Self::open_best(opts.prefer_hardware)?;
+        let hw_allowed = opts.prefer_hardware && std::env::var_os("BASTION_NO_HWDEC").is_none();
+        let adaptive = (opts.adaptive && hw_allowed).then(Adaptive::default);
+        let ctx = Self::open_best(opts.prefer_hardware && adaptive.is_none())?;
         info!(accel = ctx.accel.name(), "H.264 decoder ready");
         Ok(Self {
             ctx,
@@ -182,7 +238,36 @@ impl FfmpegH264Decoder {
             sw_frame: Frame::new(),
             input: Vec::new(),
             hw_failures: 0,
+            adaptive,
             planes: Arc::new(AtomicBool::new(opts.yuv420_planes)),
+        })
+    }
+
+    /// Flag the decoder sets to ask the server for a keyframe (adaptive mode, before switching
+    /// to hardware). The session turns it into a graphics stream reset.
+    pub fn set_keyframe_request(&mut self, flag: Arc<AtomicBool>) {
+        if let Some(a) = self.adaptive.as_mut() {
+            a.keyframe_request = Some(flag);
+        }
+    }
+
+    /// Adaptive mode: move to hardware decoding at the next IDR frame, and ask the server for
+    /// one. Does nothing outside adaptive mode or once switched.
+    pub fn switch_to_hardware_at_next_keyframe(&mut self) {
+        if let Some(a) = self.adaptive.as_mut() {
+            a.switch_pending = true;
+            if let Some(flag) = &a.keyframe_request {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Opens a hardware decoder, if any works.
+    fn open_hardware() -> Option<Context> {
+        [Accel::Cuda, Accel::Vaapi].into_iter().find_map(|accel| {
+            Context::open(accel)
+                .map_err(|e| debug!(accel = accel.name(), error = %e, "Hardware decoder unavailable"))
+                .ok()
         })
     }
 
@@ -230,9 +315,31 @@ impl FfmpegH264Decoder {
             self.input.extend_from_slice(data);
         }
         let payload_len = self.input.len();
+        if self.adaptive.as_ref().is_some_and(|a| a.switch_pending) && contains_idr(&self.input) {
+            // A keyframe: the hardware decoder can start here without artefacts.
+            match Self::open_hardware() {
+                Some(ctx) => {
+                    info!(accel = ctx.accel.name(), "Switched H.264 decoding to hardware");
+                    self.ctx = ctx;
+                }
+                None => warn!("Software H.264 decoding is slow, but no hardware decoder is available"),
+            }
+            self.adaptive = None;
+        }
         self.input.resize(payload_len + ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize, 0);
 
+        let started = Instant::now();
         let r = bastion_metrics::VIDEO_DECODE.time(|| self.send_and_receive(payload_len));
+        if r.is_ok()
+            && let Some(a) = self.adaptive.as_mut()
+            && a.observe(started.elapsed().as_secs_f64() * 1e3)
+        {
+            info!(
+                avg_ms = format!("{:.1}", a.avg_ms),
+                "Software H.264 decoding can't keep up; switching to hardware at the next keyframe"
+            );
+            self.switch_to_hardware_at_next_keyframe();
+        }
         if r.is_ok() {
             bastion_metrics::VIDEO_FRAMES.incr();
         }
@@ -409,5 +516,36 @@ impl H264Decoder for FfmpegH264Decoder {
 
     fn reset(&mut self) {
         unsafe { ffi::avcodec_flush_buffers(self.ctx.ctx) };
+    }
+}
+
+#[cfg(test)]
+mod adaptive_tests {
+    use super::*;
+
+    #[test]
+    fn switches_only_after_enough_slow_frames() {
+        let mut a = Adaptive::default();
+        for _ in 0..ADAPTIVE_MIN_FRAMES - 1 {
+            assert!(!a.observe(40.0), "never before {ADAPTIVE_MIN_FRAMES} frames");
+        }
+        assert!(a.observe(40.0));
+    }
+
+    #[test]
+    fn fast_software_decoding_stays_in_software() {
+        let mut a = Adaptive::default();
+        for i in 0..500 {
+            // Occasional slow frames (a burst of motion) don't trigger a switch.
+            let ms = if i % 50 == 0 { 30.0 } else { 2.0 };
+            assert!(!a.observe(ms), "frame {i}");
+        }
+    }
+
+    #[test]
+    fn idr_detection() {
+        assert!(contains_idr(&[0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x65, 9]));
+        assert!(!contains_idr(&[0, 0, 0, 1, 0x41, 1, 2, 3]), "P slice");
+        assert!(!contains_idr(&[]));
     }
 }

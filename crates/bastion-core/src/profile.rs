@@ -175,7 +175,7 @@ pub struct DisplaySettings {
     pub follow_local_scale: bool,
     /// Allow H.264/AVC (GFX) codecs. Falls back to RemoteFX/planar when off.
     pub h264: bool,
-    /// Prefer hardware (NVDEC/VAAPI) decode when available.
+    /// Allow hardware (NVDEC/VAAPI) decoding when software decoding can't keep up.
     pub hardware_decode: bool,
     /// Monitors (connector names such as `DP-1`) used in multi-monitor mode. Empty = all.
     pub monitors: Vec<String>,

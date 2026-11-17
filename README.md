@@ -9,9 +9,11 @@ connecting to Windows PCs through a **Remote Desktop Gateway**.
   is available in the remote session. Devices are chosen by name (PipeWire/PulseAudio).
 - **Clipboard sync:** text, rich text (HTML), images, and files.
 - **RD Gateway** (HTTPS / WebSocket transport, NTLM/Negotiate) or direct connections.
-- **Efficient graphics:** H.264/AVC via the RDP graphics pipeline, with **hardware
-  decoding** (NVDEC on NVIDIA, VAAPI elsewhere) and automatic software fallback. Only
-  changed screen regions are uploaded to the GPU.
+- **Efficient graphics:** the RDP graphics pipeline decoded off the session thread: H.264/AVC
+  in software on all cores (faster than a GPU round trip for remote-desktop content), switching
+  to **hardware decoding** (NVDEC on NVIDIA, VAAPI elsewhere) when video gets too heavy;
+  RemoteFX Progressive tiles decoded in parallel. Only changed screen regions are copied and
+  uploaded to the GPU.
 - **Dynamic resolution:** resize the window and the remote desktop follows, including HiDPI
   scaling.
 - **Multi-monitor:** full screen across every monitor (or the ones you pick per connection), one

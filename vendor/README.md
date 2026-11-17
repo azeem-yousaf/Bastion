@@ -24,5 +24,37 @@ Result: 252 ms → 27 ms for the full frame, bit-identical output
 (`cargo run --release -p bastion-session --example progressive_bench`). IronRDP's own test
 suite passes, plus `parallel_region_decode_matches_sequential` (run by `ci.sh`).
 
-To upgrade: copy the new release here, re-apply `ironrdp-graphics.patch`, regenerate it, and
-run `./ci.sh` and the benchmark.
+### ZGFX decompression
+
+Every graphics-channel message is ZGFX (RDP 8 bulk) compressed. IronRDP decoded tokens by
+comparing bit prefixes against its token table one `bitvec` slice at a time and wrote history
+byte by byte: ~12 MB/s, which made up most of ClearCodec's per-message cost on a real session.
+The patch adds a table-driven decoder (`zgfx::fast`: 9-bit lookup table built from
+`TOKEN_TABLE`, 64-bit bit reader, matches copied from the output or history, history appended
+once per segment). The original stays as the test reference.
+
+Result on a recorded session (1,855 messages, 51 MB out): 2,084 ms → 163 ms, identical output
+(`fast_decoder_matches_reference_on_compressed_streams`; with a recording,
+`BASTION_ZGFX_CAPTURE=… cargo test --release --manifest-path vendor/ironrdp-graphics/Cargo.toml
+--lib fast_decoder_matches_reference_on_capture -- --ignored`).
+
+## ironrdp-egfx 0.5.0 — AVC420 without the intermediate copy
+
+Each AVC420 region was copied out of the decoded frame into a `Vec` (for the handler's
+`BitmapUpdate::data`) and then blitted into the surface. The patch adds
+`GraphicsPipelineHandler::wants_bitmap_data` (default `true`, unchanged behaviour); when a
+handler returns `false` (Bastion's does), regions are blitted straight from the frame
+(`Compositor::apply_bitmap_from`). ~1.6 ms per 2560×1440 frame. Surfaces are byte-identical
+either way (`avc420_direct_blit_matches_copy_path`).
+
+## Verifying the whole pipeline
+
+`examples/gfx_replay.rs` replays a recording (`BASTION_GFX_CAPTURE`) and prints a checksum of
+every region updated over the session. With `BASTION_NO_HWDEC=1` (deterministic software
+decoding) it matched the unpatched pipeline exactly on a real session.
+
+## Upgrading
+
+Copy the new release here, re-apply `<crate>.patch`, regenerate it against the pristine crate,
+and run `./ci.sh`, the benchmarks and a recorded replay (compare checksums with the previous
+build).

@@ -505,7 +505,8 @@ impl Manager {
                 ui.checkbox(&mut d.display.follow_local_scale, "Use this computer's display scaling (HiDPI)");
                 theme::section(ui, "Performance");
                 ui.checkbox(&mut d.display.h264, "H.264 video codec (lower bandwidth, smoother video)");
-                ui.add_enabled(d.display.h264, egui::Checkbox::new(&mut d.display.hardware_decode, "Hardware decoding (NVDEC / VAAPI)"));
+                ui.add_enabled(d.display.h264, egui::Checkbox::new(&mut d.display.hardware_decode, "Hardware decoding (NVDEC / VAAPI) when software can't keep up"))
+                    .on_hover_text("Remote-desktop video usually decodes faster on the CPU; the graphics card takes over for heavy video");
             }
             Tab::Devices => {
                 want_devices = true;

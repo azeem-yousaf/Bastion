@@ -63,7 +63,8 @@ fn to_avc(unit: &[u8]) -> Vec<u8> {
 }
 
 fn software() -> FfmpegH264Decoder {
-    let d = FfmpegH264Decoder::new(DecoderOptions { prefer_hardware: false, yuv420_planes: true }).unwrap();
+    let d = FfmpegH264Decoder::new(DecoderOptions { prefer_hardware: false, yuv420_planes: true, adaptive: false })
+        .unwrap();
     assert_eq!(d.accel(), Accel::Software);
     d
 }
@@ -120,7 +121,9 @@ fn garbage_input_errors_without_panicking() {
 fn every_frame_matches_between_software_and_hardware() {
     // Runs on machines with NVDEC/VAAPI; on others both paths are software and it still passes.
     let mut sw = software();
-    let Ok(mut hw) = FfmpegH264Decoder::new(DecoderOptions { prefer_hardware: true, yuv420_planes: false }) else {
+    let Ok(mut hw) =
+        FfmpegH264Decoder::new(DecoderOptions { prefer_hardware: true, yuv420_planes: false, adaptive: false })
+    else {
         return;
     };
     eprintln!("hardware path: {}", hw.accel().name());
@@ -161,4 +164,35 @@ fn yuv420_switch_controls_supports_yuv420() {
     assert!(d.supports_yuv420());
     d.yuv420_switch().store(false, std::sync::atomic::Ordering::Relaxed);
     assert!(!d.supports_yuv420());
+}
+
+#[test]
+fn adaptive_decoder_starts_in_software_and_moves_to_hardware_at_a_keyframe() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let units = access_units(TESTSRC);
+    let mut d =
+        FfmpegH264Decoder::new(DecoderOptions { prefer_hardware: true, yuv420_planes: false, adaptive: true }).unwrap();
+    assert_eq!(d.accel(), Accel::Software, "adaptive mode starts in software");
+    let keyframe = Arc::new(AtomicBool::new(false));
+    d.set_keyframe_request(keyframe.clone());
+    let reference = d.decode(&units[0]).unwrap();
+
+    d.switch_to_hardware_at_next_keyframe();
+    assert!(keyframe.load(Ordering::Relaxed), "asks the server for a keyframe");
+    d.decode(&units[1]).unwrap();
+    assert_eq!(d.accel(), Accel::Software, "no switch on a P frame");
+
+    // The IDR frame again: the switch happens here (if this machine has a hardware decoder).
+    let after = d.decode(&units[0]).unwrap();
+    let hardware_available =
+        FfmpegH264Decoder::new(DecoderOptions { prefer_hardware: true, yuv420_planes: false, adaptive: false })
+            .is_ok_and(|h| h.accel() != Accel::Software);
+    if hardware_available {
+        assert_ne!(d.accel(), Accel::Software, "moved to hardware at the keyframe");
+    }
+    // Either way the picture is the same.
+    let diff = reference.data().iter().zip(after.data()).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+    assert!(diff <= 3, "picture changed by {diff} levels across the switch");
 }

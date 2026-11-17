@@ -20,6 +20,7 @@ step "Tests"
 cargo test --workspace
 
 step "Patched IronRDP crates (vendor/)"
-cargo test --quiet --manifest-path vendor/ironrdp-graphics/Cargo.toml --lib progressive
+cargo test --quiet --manifest-path vendor/ironrdp-graphics/Cargo.toml --lib -- progressive zgfx
+cargo test --quiet --manifest-path vendor/ironrdp-egfx/Cargo.toml --lib
 
 printf '\n\033[1;32mAll checks passed.\033[0m\n'
