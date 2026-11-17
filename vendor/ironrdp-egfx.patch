@@ -1,0 +1,210 @@
+diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs_info.json' '--exclude=.cargo-ok' ironrdp-egfx-0.5.0/src/client.rs vendor/ironrdp-egfx/src/client.rs
+--- ironrdp-egfx-0.5.0/src/client.rs	2006-07-24 02:21:28.000000000 +0100
++++ vendor/ironrdp-egfx/src/client.rs	2026-11-17 17:02:04.391453700 +0000
+@@ -320,6 +320,14 @@
+     /// surface ID, destination rectangle, and RGBA pixel data.
+     fn on_bitmap_updated(&mut self, _update: &BitmapUpdate) {}
+ 
++    /// Whether [`Self::on_bitmap_updated`] reads [`BitmapUpdate::data`].
++    ///
++    /// Bastion patch: when `false`, codecs that decode into a frame buffer (AVC420) blit
++    /// straight into the surface and pass an empty `data`, saving a copy of every region.
++    fn wants_bitmap_data(&self) -> bool {
++        true
++    }
++
+     /// Called when a logical frame is complete
+     ///
+     /// All bitmap updates between the corresponding `StartFrame`
+@@ -1290,9 +1298,24 @@
+         // the `emit_update` closure on the uncompressed path).
+         let compositor = &mut self.compositor;
+         let handler = &mut self.handler;
+-        let mut emit_avc420 = |destination_rectangle: ExclusiveRectangle, data: Vec<u8>| {
++        let want_data = handler.wants_bitmap_data();
++        let frame_stride = usize::try_from(frame.width()).unwrap_or(usize::MAX).saturating_mul(4);
++        // Bastion patch: blit each region straight from the decoded frame into the surface;
++        // the handler gets a copy only if it reads the pixels.
++        let mut emit_avc420 = |destination_rectangle: ExclusiveRectangle, source: (u16, u16), data: Option<Vec<u8>>| {
+             let width = destination_rectangle.right - destination_rectangle.left;
+             let height = destination_rectangle.bottom - destination_rectangle.top;
++            let source_region = ExclusiveRectangle {
++                left: source.0,
++                top: source.1,
++                right: source.0 + width,
++                bottom: source.1 + height,
++            };
++            let data = match data {
++                Some(d) => d,
++                None if want_data => copy_frame_region(frame.data(), frame.width(), &source_region),
++                None => Vec::new(),
++            };
+             let update = BitmapUpdate {
+                 surface_id,
+                 destination_rectangle,
+@@ -1301,7 +1324,13 @@
+                 width,
+                 height,
+             };
+-            compositor.apply_bitmap(update.surface_id, &update.destination_rectangle, &update.data);
++            compositor.apply_bitmap_from(
++                update.surface_id,
++                &update.destination_rectangle,
++                frame.data(),
++                frame_stride,
++                source,
++            );
+             handler.on_bitmap_updated(&update);
+         };
+ 
+@@ -1309,8 +1338,16 @@
+             // No region metadata: fall back to the single bounding-box update,
+             // copying from the frame origin. This matches the pre-#2042 behavior
+             // for streams that legitimately omit regionRects.
+-            let cropped_data = crop_decoded_frame(frame.data(), frame.width(), frame.height(), dest_width, dest_height);
+-            emit_avc420(dest_rect.clone(), cropped_data);
++            // Clamped like `crop_decoded_frame`: never read past the decoded frame.
++            let w = dest_width.min(u16::try_from(frame.width()).unwrap_or(u16::MAX));
++            let h = dest_height.min(u16::try_from(frame.height()).unwrap_or(u16::MAX));
++            let dest = ExclusiveRectangle {
++                left: dest_rect.left,
++                top: dest_rect.top,
++                right: dest_rect.left + w,
++                bottom: dest_rect.top + h,
++            };
++            emit_avc420(dest, (0, 0), None);
+             return Ok(());
+         }
+ 
+@@ -1353,8 +1390,9 @@
+ 
+             // Copy pixels (x, y) -> (x, y): the source in the decoded frame is the
+             // region's own top-left, not the frame origin.
+-            let data = copy_frame_region(frame.data(), frame.width(), &clipped);
+-            emit_avc420(clipped, data);
++            // Pixels (x, y) -> (x, y): the source is the region's own top-left.
++            let source = (clipped.left, clipped.top);
++            emit_avc420(clipped, source, None);
+         }
+         Ok(())
+     }
+@@ -3558,6 +3596,53 @@
+         }
+     }
+ 
++    /// Bastion patch: blitting AVC420 regions straight from the decoded frame (when the
++    /// handler opts out of pixel data) must leave the surface exactly as the copy path does,
++    /// for region updates and for the no-region fallback.
++    #[test]
++    fn avc420_direct_blit_matches_copy_path() {
++        const SURFACE: u16 = 100;
++        struct NoData;
++        impl GraphicsPipelineHandler for NoData {
++            fn wants_bitmap_data(&self) -> bool {
++                false
++            }
++        }
++        let rect = |left, top, right, bottom| ExclusiveRectangle { left, top, right, bottom };
++        let run = |handler: Box<dyn GraphicsPipelineHandler>| -> Vec<u8> {
++            let mut client =
++                GraphicsPipelineClient::new(handler, Some(Box::new(CoordinateDecoder { width: 64, height: 64 })));
++            client
++                .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
++                    surface_id: SURFACE,
++                    width: SURFACE,
++                    height: SURFACE,
++                    pixel_format: PixelFormat::XRgb,
++                }))
++                .expect("create surface");
++            for (dest, regions) in [
++                (rect(0, 0, 48, 48), vec![rect(0, 0, 16, 16), rect(32, 32, 48, 48)]),
++                (rect(50, 60, 90, 90), vec![]),
++                (rect(0, 0, 64, 64), vec![rect(5, 7, 61, 33)]),
++            ] {
++                client
++                    .handle_pdu(GfxPdu::WireToSurface1(crate::pdu::WireToSurface1Pdu {
++                        surface_id: SURFACE,
++                        codec_id: Codec1Type::Avc420,
++                        pixel_format: PixelFormat::XRgb,
++                        destination_rectangle: dest,
++                        bitmap_data: encode_avc420_wire(&regions),
++                    }))
++                    .expect("decode avc420");
++            }
++            client.compositor.surface_pixels(SURFACE).expect("surface").to_vec()
++        };
++        let with_copy = run(Box::new(TestHandler));
++        let direct = run(Box::new(NoData));
++        assert!(with_copy.iter().any(|&b| b != 0), "something was drawn");
++        assert!(with_copy == direct, "direct blit differs from the copy path");
++    }
++
+     /// A partial AVC420 update must draw each region rectangle from its OWN
+     /// (x, y) in the decoded frame, as a separate surface update -- not blit
+     /// one bounding-box block copied from the frame origin.
+diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs_info.json' '--exclude=.cargo-ok' ironrdp-egfx-0.5.0/src/compositor.rs vendor/ironrdp-egfx/src/compositor.rs
+--- ironrdp-egfx-0.5.0/src/compositor.rs	2006-07-24 02:21:28.000000000 +0100
++++ vendor/ironrdp-egfx/src/compositor.rs	2026-11-17 17:02:04.388453700 +0000
+@@ -479,6 +479,48 @@
+         self.record_dirty(surface_id, x, y, w, h);
+     }
+ 
++    /// A surface's RGBA pixels (tests).
++    #[cfg(test)]
++    pub(crate) fn surface_pixels(&self, surface_id: u16) -> Option<&[u8]> {
++        self.surfaces.get(&surface_id).map(|s| s.data.as_slice())
++    }
++
++    /// Bastion patch: like [`Self::apply_bitmap`], but reads the `dest`-sized block at
++    /// `source` (x, y) of a larger RGBA8888 buffer with `src_stride` bytes per row, so a
++    /// decoded frame can be blitted without first copying the region out of it.
++    pub(crate) fn apply_bitmap_from(
++        &mut self,
++        surface_id: u16,
++        dest: &ExclusiveRectangle,
++        src: &[u8],
++        src_stride: usize,
++        source: (u16, u16),
++    ) {
++        let x = dest.left;
++        let y = dest.top;
++        let w = dest.right.saturating_sub(dest.left);
++        let h = dest.bottom.saturating_sub(dest.top);
++        if let Some(surface) = self.surfaces.get_mut(&surface_id) {
++            let offset = usize::from(source.1)
++                .saturating_mul(src_stride)
++                .saturating_add(usize::from(source.0) * BYTES_PER_PIXEL);
++            let src = src.get(offset..).unwrap_or(&[]);
++            if surface.has_alpha && surface.window.is_some() {
++                // Rare (window-mapped surfaces): reuse the tight-buffer path.
++                let mut tight = Vec::with_capacity(usize::from(w) * usize::from(h) * BYTES_PER_PIXEL);
++                for row in 0..usize::from(h) {
++                    let start = row * src_stride;
++                    let end = start + usize::from(w) * BYTES_PER_PIXEL;
++                    tight.extend_from_slice(src.get(start..end).unwrap_or(&[]));
++                }
++                blit_color_region(surface.canvas_mut(), x, y, w, h, &tight);
++            } else {
++                blit_region_strided(surface.canvas_mut(), x, y, w, h, src, src_stride);
++            }
++        }
++        self.record_dirty(surface_id, x, y, w, h);
++    }
++
+     /// Replace the alpha channel of a surface sub-rectangle with an `ALPHACODEC_BITMAP_STREAM`
+     /// (an `RDPGFX_CODECID_ALPHA` `WireToSurface1`), leaving its color channels untouched
+     /// (MS-RDPEGFX 3.3.5.1).
+@@ -1077,8 +1119,12 @@
+ /// Write a tightly-packed RGBA8888 buffer into a sub-rectangle of a canvas,
+ /// clipping to the canvas bounds.
+ fn blit_region(dst: CanvasMut<'_>, x: u16, y: u16, w: u16, h: u16, src: &[u8]) {
++    blit_region_strided(dst, x, y, w, h, src, usize::from(w) * BYTES_PER_PIXEL);
++}
++
++/// [`blit_region`] from a source with `src_stride` bytes per row (Bastion patch).
++fn blit_region_strided(dst: CanvasMut<'_>, x: u16, y: u16, w: u16, h: u16, src: &[u8], src_stride: usize) {
+     let dst_stride = usize::from(dst.width) * BYTES_PER_PIXEL;
+-    let src_stride = usize::from(w) * BYTES_PER_PIXEL;
+     let copy_cols = usize::from(w).min(usize::from(dst.width).saturating_sub(usize::from(x)));
+     let copy_rows = usize::from(h).min(usize::from(dst.height).saturating_sub(usize::from(y)));
+     let copy_bytes = copy_cols * BYTES_PER_PIXEL;

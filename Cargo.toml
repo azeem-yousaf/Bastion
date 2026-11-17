@@ -76,3 +76,4 @@ opt-level = 2
 # Local patches to upstream crates (see vendor/README.md).
 [patch.crates-io]
 ironrdp-graphics = { path = "vendor/ironrdp-graphics" }
+ironrdp-egfx = { path = "vendor/ironrdp-egfx" }
