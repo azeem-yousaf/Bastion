@@ -1,6 +1,6 @@
 diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs_info.json' '--exclude=.cargo-ok' ironrdp-egfx-0.5.0/src/client.rs vendor/ironrdp-egfx/src/client.rs
 --- ironrdp-egfx-0.5.0/src/client.rs	2006-07-24 02:21:28.000000000 +0100
-+++ vendor/ironrdp-egfx/src/client.rs	2026-11-17 17:02:04.391453700 +0000
++++ vendor/ironrdp-egfx/src/client.rs	2026-11-17 21:31:40.024028700 +0000
 @@ -320,6 +320,14 @@
      /// surface ID, destination rectangle, and RGBA pixel data.
      fn on_bitmap_updated(&mut self, _update: &BitmapUpdate) {}
@@ -16,7 +16,150 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
      /// Called when a logical frame is complete
      ///
      /// All bitmap updates between the corresponding `StartFrame`
-@@ -1290,9 +1298,24 @@
+@@ -675,22 +683,27 @@
+             .decompress(payload, &mut self.decompressed_buffer)
+             .map_err(|e| decode_err!(e))?;
+ 
+-        // Decode all PDUs before dispatch while the cursor borrows the buffer.
+-        let mut pdus = Vec::new();
+-        {
+-            let mut cursor = ReadCursor::new(self.decompressed_buffer.as_slice());
+-            while !cursor.is_empty() {
+-                let pdu: GfxPdu = decode_cursor(&mut cursor).map_err(|e| decode_err!(e))?;
+-                pdus.push(pdu);
+-            }
+-        }
++        // Bastion patch: a per-message allowance for pixel work that costs the peer nothing
++        // to request (see `Compositor::begin_message`).
++        self.compositor.begin_message();
++
++        // Bastion patch: decode and dispatch one PDU at a time. Collecting every PDU first
++        // held a `Vec<GfxPdu>` many times the size of the decompressed message (which may be
++        // 256 MiB of ten-byte PDUs). The buffer is taken out of `self` for the duration so
++        // the cursor can borrow it while the handlers borrow `self`.
++        let buffer = core::mem::take(&mut self.decompressed_buffer);
++        let result = self.dispatch_pdus(&buffer);
++        self.decompressed_buffer = buffer;
++        result
++    }
+ 
++    fn dispatch_pdus(&mut self, decompressed: &[u8]) -> PduResult<Vec<DvcMessage>> {
+         let mut responses: Vec<DvcMessage> = Vec::new();
+-        for pdu in pdus {
+-            let pdu_responses = self.handle_pdu(pdu)?;
+-            responses.extend(pdu_responses);
++        let mut cursor = ReadCursor::new(decompressed);
++        while !cursor.is_empty() {
++            let pdu: GfxPdu = decode_cursor(&mut cursor).map_err(|e| decode_err!(e))?;
++            responses.extend(self.handle_pdu(pdu)?);
+         }
+-
+         Ok(responses)
+     }
+ 
+@@ -869,7 +882,7 @@
+         let cap = match cap.parsed() {
+             Ok(Some(typed)) => typed,
+             Ok(None) => {
+-                warn!(
++                warn_throttled!(
+                     version = cap.version.0,
+                     "Server confirmed an unknown EGFX capability version; proceeding with defaults"
+                 );
+@@ -881,7 +894,7 @@
+             }
+             Err(e) if self.state == ClientState::Resetting => return Err(decode_err!(e)),
+             Err(e) => {
+-                warn!(error = %e, "Failed to parse server's EGFX capabilities confirmation");
++                warn_throttled!(error = %e, "Failed to parse server's EGFX capabilities confirmation");
+                 self.negotiated_caps = None;
+                 self.codec_caps = CodecCapabilities::default();
+                 self.compositor.set_small_bitmap_cache(self.codec_caps.small_cache);
+@@ -955,7 +968,7 @@
+ 
+     fn handle_create_surface(&mut self, surface_id: u16, width: u16, height: u16, pixel_format: PixelFormat) {
+         if width == 0 || height == 0 {
+-            warn!(surface_id, width, height, "Ignoring CreateSurface with zero dimensions");
++            warn_throttled!(surface_id, width, height, "Ignoring CreateSurface with zero dimensions");
+             return;
+         }
+ 
+@@ -984,7 +997,7 @@
+             debug!(surface_id, "Surface deleted");
+             self.handler.on_surface_deleted(surface_id);
+         } else {
+-            warn!(surface_id, "DeleteSurface for unknown surface");
++            warn_throttled!(surface_id, "DeleteSurface for unknown surface");
+         }
+     }
+ 
+@@ -1003,7 +1016,7 @@
+             debug!(surface_id, origin_x, origin_y, "Surface mapped to output");
+             self.handler.on_surface_mapped(surface_id, origin_x, origin_y);
+         } else {
+-            warn!(surface_id, "MapSurfaceToOutput for unknown surface");
++            warn_throttled!(surface_id, "MapSurfaceToOutput for unknown surface");
+         }
+     }
+ 
+@@ -1020,7 +1033,7 @@
+                 .map_surface_to_window(surface_id, window_id, mapped, target);
+             debug!(surface_id, window_id, ?mapped, ?target, "Surface mapped to window");
+         } else {
+-            warn!(surface_id, "MapSurfaceToWindow for unknown surface");
++            warn_throttled!(surface_id, "MapSurfaceToWindow for unknown surface");
+         }
+     }
+ 
+@@ -1047,7 +1060,7 @@
+             self.handler
+                 .on_surface_mapped(pdu.surface_id, pdu.output_origin_x, pdu.output_origin_y);
+         } else {
+-            warn!(
++            warn_throttled!(
+                 surface_id = pdu.surface_id,
+                 "MapSurfaceToScaledOutput for unknown surface"
+             );
+@@ -1063,7 +1076,7 @@
+         // Validate rectangle ordering (left <= right, top <= bottom)
+         let rect = &pdu.destination_rectangle;
+         if rect.left > rect.right || rect.top > rect.bottom {
+-            warn!(
++            warn_throttled!(
+                 left = rect.left,
+                 top = rect.top,
+                 right = rect.right,
+@@ -1077,7 +1090,7 @@
+         // uses exclusive `right`/`bottom`, so a full-surface update has
+         // `right == surface.width` and `bottom == surface.height`, which is valid.
+         if rect.right > surface.width || rect.bottom > surface.height {
+-            warn!(
++            warn_throttled!(
+                 surface_id = pdu.surface_id,
+                 rect_right = rect.right,
+                 rect_bottom = rect.bottom,
+@@ -1128,6 +1141,20 @@
+             .ok_or_else(|| pdu_other_err!("unknown surface in WireToSurface2"))?;
+         let (surface_width, surface_height) = (surface.width, surface.height);
+ 
++        // Bastion patch: the Progressive decoder keeps about 61 KB per tile it has seen. Only
++        // feed it surfaces the compositor holds a canvas for (it refuses oversized and
++        // over-budget ones, and the decoded tiles would be discarded anyway), so a surface's
++        // tile grid is bounded by pixels that really exist.
++        if !self.compositor.has_surface(pdu.surface_id) {
++            self.drop_update(
++                pdu.codec_id,
++                pdu.surface_id,
++                pdu.bitmap_data.len(),
++                &"the surface has no canvas",
++            );
++            return Ok(());
++        }
++
+         let tiles = match self.progressive_decoder.decode_bitmap(
+             pdu.surface_id,
+             pdu.codec_context_id,
+@@ -1290,9 +1317,24 @@
          // the `emit_update` closure on the uncompressed path).
          let compositor = &mut self.compositor;
          let handler = &mut self.handler;
@@ -42,7 +185,7 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
              let update = BitmapUpdate {
                  surface_id,
                  destination_rectangle,
-@@ -1301,7 +1324,13 @@
+@@ -1301,7 +1343,13 @@
                  width,
                  height,
              };
@@ -57,7 +200,7 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
              handler.on_bitmap_updated(&update);
          };
  
-@@ -1309,8 +1338,16 @@
+@@ -1309,8 +1357,16 @@
              // No region metadata: fall back to the single bounding-box update,
              // copying from the frame origin. This matches the pre-#2042 behavior
              // for streams that legitimately omit regionRects.
@@ -76,7 +219,16 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
              return Ok(());
          }
  
-@@ -1353,8 +1390,9 @@
+@@ -1328,7 +1384,7 @@
+                 // no trace if a server's coordinate convention ever disagreed
+                 // with the surface/frame bounds -- the same undebuggable class of
+                 // rendering defect this change fixes.
+-                warn!(
++                warn_throttled!(
+                     surface_id,
+                     region_left = region.left,
+                     region_top = region.top,
+@@ -1353,8 +1409,9 @@
  
              // Copy pixels (x, y) -> (x, y): the source in the decoded frame is the
              // region's own top-left, not the frame origin.
@@ -88,7 +240,65 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
          }
          Ok(())
      }
-@@ -3558,6 +3596,53 @@
+@@ -1797,7 +1854,7 @@
+     /// [3.3.5.17]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/df29d040-f74b-4002-92ed-f0903b8402c3
+     fn handle_cache_import_reply(&mut self, pdu: &CacheImportReplyPdu) {
+         let Some(offered) = self.offered_cache_keys.take() else {
+-            warn!("CacheImportReply without a pending CacheImportOffer; ignoring it");
++            warn_throttled!("CacheImportReply without a pending CacheImportOffer; ignoring it");
+             return;
+         };
+         let Some(store) = self.persistent_cache.as_mut() else {
+@@ -2121,7 +2178,7 @@
+     #[expect(clippy::as_conversions, reason = "dst_stride * rows bounded by frame dimensions")]
+     let expected_len = (dst_stride as usize).saturating_mul(rows as usize);
+     if cropped.len() < expected_len {
+-        tracing::warn!(
++        warn_throttled!(
+             expected = expected_len,
+             actual = cropped.len(),
+             "Decoded frame data truncated during crop"
+@@ -3329,6 +3386,39 @@
+         assert_eq!(client.dropped_updates, 1);
+     }
+ 
++    /// Bastion patch: the Progressive decoder keeps per-tile state, so it must only see
++    /// surfaces the compositor holds a canvas for. A surface the compositor refused (here:
++    /// over its per-edge limit) is still in the client's map; its updates are dropped.
++    #[test]
++    fn progressive_updates_for_a_surface_without_a_canvas_never_reach_the_decoder() {
++        let mut client = progressive_client();
++        client
++            .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
++                surface_id: 2,
++                width: 32768,
++                height: 32768,
++                pixel_format: PixelFormat::XRgb,
++            }))
++            .unwrap();
++        assert!(client.get_surface(2).is_some(), "the client still tracks the surface");
++        assert!(!client.compositor.has_surface(2), "the compositor refused it");
++
++        let wire = |client: &mut GraphicsPipelineClient, surface_id| {
++            client.handle_pdu(GfxPdu::WireToSurface2(WireToSurface2Pdu {
++                surface_id,
++                codec_id: crate::pdu::Codec2Type::RemoteFxProgressive,
++                codec_context_id: 7,
++                pixel_format: PixelFormat::XRgb,
++                bitmap_data: progressive_context_stream(true),
++            }))
++        };
++        wire(&mut client, 2).unwrap();
++        assert_eq!(client.dropped_updates(), 1, "refused before decoding");
++        // A surface with a canvas decodes the same stream.
++        wire(&mut client, 1).unwrap();
++        assert_eq!(client.dropped_updates(), 1);
++    }
++
+     #[test]
+     fn progressive_context_survives_graphics_reset() {
+         let updates = Arc::new(Mutex::new(Vec::new()));
+@@ -3558,6 +3648,53 @@
          }
      }
  
@@ -144,8 +354,75 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
      /// one bounding-box block copied from the frame origin.
 diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs_info.json' '--exclude=.cargo-ok' ironrdp-egfx-0.5.0/src/compositor.rs vendor/ironrdp-egfx/src/compositor.rs
 --- ironrdp-egfx-0.5.0/src/compositor.rs	2006-07-24 02:21:28.000000000 +0100
-+++ vendor/ironrdp-egfx/src/compositor.rs	2026-11-17 17:02:04.388453700 +0000
-@@ -479,6 +479,48 @@
++++ vendor/ironrdp-egfx/src/compositor.rs	2026-11-17 21:18:35.238785000 +0000
+@@ -50,6 +50,23 @@
+ /// single-surface case (16384*16384*4) impossible to reach.
+ const MAX_COMPOSITOR_BYTES: usize = 256 * 1024 * 1024;
+ 
++/// Bastion patch: pixels one graphics message may have written by commands whose cost is not
++/// tied to the message's size: `SolidFill` rectangles, `SurfaceToSurface` and `CacheToSurface`
++/// destination points, `SurfaceToCache` copies and AVC420 region rectangles.
++///
++/// Each of those costs the peer a few bytes (less after ZGFX) and the client up to a whole
++/// surface, as many times as the peer cares to repeat it: one small message could keep the
++/// graphics thread writing for hours. 2^30 pixels is sixteen repaints of the largest surface
++/// set the budget allows and over a hundred of a 4K desktop, in a single message; a real one
++/// paints its surface about once. Past the allowance such commands are skipped until the next
++/// message.
++const MAX_MESSAGE_PIXEL_WORK: u64 = 1 << 30;
++
++/// Bastion patch: charged per queued update on top of its pixels, for the `Vec` and the
++/// struct around them. Without it a 1x1 update costs the budget 4 bytes and the heap about
++/// 64, so the queue could outgrow its ceiling many times over.
++const UPDATE_OVERHEAD: usize = 64;
++
+ /// A rectangular region of the graphics output whose pixels changed within a frame.
+ ///
+ /// `region` is in output space (after a surface-to-output mapping), using the
+@@ -233,6 +250,8 @@
+     small_bitmap_cache: bool,
+     /// Window deltas from completed frames, awaiting drain.
+     ready_windows: Vec<WindowUpdate>,
++    /// Pixels written in the current message by commands under [`MAX_MESSAGE_PIXEL_WORK`].
++    message_work: u64,
+ }
+ 
+ impl Compositor {
+@@ -245,6 +264,33 @@
+         };
+     }
+ 
++    /// Start a new graphics message: its pixel-work allowance is whole again (Bastion patch).
++    pub(crate) fn begin_message(&mut self) {
++        self.message_work = 0;
++    }
++
++    /// Whether the compositor holds a canvas for the surface (Bastion patch).
++    pub(crate) fn has_surface(&self, id: u16) -> bool {
++        self.surfaces.contains_key(&id)
++    }
++
++    /// Account for writing a `w` by `h` block at `(x, y)` of a `width` by `height` canvas
++    /// against [`MAX_MESSAGE_PIXEL_WORK`]; `false` if the message has used its allowance.
++    fn spend_work(&mut self, (width, height): (u16, u16), x: u16, y: u16, w: u16, h: u16) -> bool {
++        let cols = u64::from(w.min(width.saturating_sub(x)));
++        let rows = u64::from(h.min(height.saturating_sub(y)));
++        let total = self.message_work.saturating_add(cols * rows);
++        if total > MAX_MESSAGE_PIXEL_WORK {
++            warn_throttled!(
++                limit = MAX_MESSAGE_PIXEL_WORK,
++                "Graphics message exceeds its pixel-work allowance; skipping the rest of its fills and copies"
++            );
++            return false;
++        }
++        self.message_work = total;
++        true
++    }
++
+     pub(crate) fn materializable_output_size(width: u32, height: u32) -> Option<(u16, u16)> {
+         let width = u16::try_from(width).ok()?;
+         let height = u16::try_from(height).ok()?;
+@@ -479,6 +525,54 @@
          self.record_dirty(surface_id, x, y, w, h);
      }
  
@@ -170,6 +447,12 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
 +        let y = dest.top;
 +        let w = dest.right.saturating_sub(dest.left);
 +        let h = dest.bottom.saturating_sub(dest.top);
++        // One decoded frame may list any number of region rectangles, each a blit.
++        if let Some(size) = self.surfaces.get(&surface_id).map(|s| (s.width, s.height)) {
++            if !self.spend_work(size, x, y, w, h) {
++                return;
++            }
++        }
 +        if let Some(surface) = self.surfaces.get_mut(&surface_id) {
 +            let offset = usize::from(source.1)
 +                .saturating_mul(src_stride)
@@ -194,7 +477,132 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
      /// Replace the alpha channel of a surface sub-rectangle with an `ALPHACODEC_BITMAP_STREAM`
      /// (an `RDPGFX_CODECID_ALPHA` `WireToSurface1`), leaving its color channels untouched
      /// (MS-RDPEGFX 3.3.5.1).
-@@ -1077,8 +1119,12 @@
+@@ -543,6 +637,11 @@
+             let y = rect.top;
+             let w = rect.right.saturating_sub(rect.left);
+             let h = rect.bottom.saturating_sub(rect.top);
++            if let Some(size) = self.surfaces.get(&surface_id).map(|s| (s.width, s.height)) {
++                if !self.spend_work(size, x, y, w, h) {
++                    return;
++                }
++            }
+             if let Some(surface) = self.surfaces.get_mut(&surface_id) {
+                 fill_region(surface.canvas_mut(), x, y, w, h, px);
+             }
+@@ -579,8 +678,28 @@
+             .bottom
+             .saturating_sub(src_rect.top)
+             .min(src.height.saturating_sub(src_rect.top));
++        let src_size = (src.width, src.height);
++        if !self.spend_work(src_size, src_rect.left, src_rect.top, w, h) {
++            return;
++        }
++        // Re-borrowed: charging the work needed `&mut self`.
++        let Some(src) = self.surfaces.get(&src_id) else {
++            return;
++        };
+         let tile = copy_region(&src.data, src.width, src_rect.left, src_rect.top, w, h);
+ 
++        // Points that fit the message's work allowance; the rest are skipped.
++        let mut painted = dst_points.len();
++        if let Some(dst_size) = self.surfaces.get(&dst_id).map(|s| (s.width, s.height)) {
++            for (index, point) in dst_points.iter().enumerate() {
++                if !self.spend_work(dst_size, point.x, point.y, w, h) {
++                    painted = index;
++                    break;
++                }
++            }
++        }
++        let dst_points = &dst_points[..painted];
++
+         if let Some(dst) = self.surfaces.get_mut(&dst_id) {
+             for point in dst_points {
+                 blit_region(dst.canvas_mut(), point.x, point.y, w, h, &tile);
+@@ -625,6 +744,11 @@
+         }
+         let len = usize::from(w) * usize::from(h) * BYTES_PER_PIXEL;
+ 
++        // `w` and `h` are already clamped to the surface, so this charges the copy exactly.
++        if !self.spend_work((w, h), 0, 0, w, h) {
++            return;
++        }
++
+         // Charged before `copy_region`, not around the insert: the copy is the
+         // allocation, so checking afterwards would still let a peer drive the
+         // transient the budget exists to prevent. The cache shares the surfaces'
+@@ -722,11 +846,24 @@
+         tile.last_used = now;
+         let (w, h) = (tile.width, tile.height);
+ 
++        // Bastion patch: charge the blits against the message's work allowance first (which
++        // needs `&mut self`), then paint the points that fit.
++        let mut painted = dst_points.len();
++        if let Some(size) = self.surfaces.get(&surface_id).map(|s| (s.width, s.height)) {
++            for (index, point) in dst_points.iter().enumerate() {
++                if !self.spend_work(size, point.x, point.y, w, h) {
++                    painted = index;
++                    break;
++                }
++            }
++        }
++        let dst_points = &dst_points[..painted];
++
+         // `cache` and `surfaces` are disjoint fields, so the tile stays borrowed
+         // across the blits rather than being copied to satisfy the borrow checker.
+         // Recording is what needs all of `&mut self`, so it follows in its own loop
+         // once the tile borrow has ended.
+-        if let Some(surface) = self.surfaces.get_mut(&surface_id) {
++        if let (Some(tile), Some(surface)) = (self.cache.get(&cache_slot), self.surfaces.get_mut(&surface_id)) {
+             for point in dst_points {
+                 blit_region(surface.canvas_mut(), point.x, point.y, w, h, &tile.data);
+             }
+@@ -761,7 +898,7 @@
+     /// Take all committed output updates, leaving the pending set empty.
+     pub(crate) fn drain_output(&mut self) -> Vec<OutputUpdate> {
+         let drained = core::mem::take(&mut self.ready);
+-        let released = drained.iter().map(|update| update.data.len()).sum();
++        let released = drained.iter().map(|update| update.data.len() + UPDATE_OVERHEAD).sum();
+         self.release(released);
+         drained
+     }
+@@ -769,7 +906,7 @@
+     /// Take all committed window updates, leaving the pending set empty.
+     pub(crate) fn drain_window_updates(&mut self) -> Vec<WindowUpdate> {
+         let drained = core::mem::take(&mut self.ready_windows);
+-        let released = drained.iter().map(|update| update.data.len()).sum();
++        let released = drained.iter().map(|update| update.data.len() + UPDATE_OVERHEAD).sum();
+         self.release(released);
+         drained
+     }
+@@ -834,11 +971,11 @@
+         let Some(len) = pixel_data_len(w, h) else {
+             return;
+         };
+-        if !self.charge(len) {
++        if !self.charge(len + UPDATE_OVERHEAD) {
+             return;
+         }
+         let Some(surface) = self.surfaces.get(&dirty.surface_id) else {
+-            self.release(len);
++            self.release(len + UPDATE_OVERHEAD);
+             return;
+         };
+         let output_rect = ExclusiveRectangle {
+@@ -895,11 +1032,11 @@
+         let Some(len) = pixel_data_len(w, h) else {
+             return;
+         };
+-        if len == 0 || !self.charge(len) {
++        if len == 0 || !self.charge(len + UPDATE_OVERHEAD) {
+             return;
+         }
+         let Some(surface) = self.surfaces.get(&dirty.surface_id) else {
+-            self.release(len);
++            self.release(len + UPDATE_OVERHEAD);
+             return;
+         };
+         let mut data = if window.target_width == window.mapped_width && window.target_height == window.mapped_height {
+@@ -1077,8 +1214,12 @@
  /// Write a tightly-packed RGBA8888 buffer into a sub-rectangle of a canvas,
  /// clipping to the canvas bounds.
  fn blit_region(dst: CanvasMut<'_>, x: u16, y: u16, w: u16, h: u16, src: &[u8]) {
@@ -208,3 +616,183 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
      let copy_cols = usize::from(w).min(usize::from(dst.width).saturating_sub(usize::from(x)));
      let copy_rows = usize::from(h).min(usize::from(dst.height).saturating_sub(usize::from(y)));
      let copy_bytes = copy_cols * BYTES_PER_PIXEL;
+@@ -1966,6 +2107,87 @@
+         assert_eq!(c.allocated_bytes, MAX_COMPOSITOR_BYTES);
+     }
+ 
++    /// Bastion patch: fills and copies that cost the peer nothing to repeat are limited per
++    /// message; past the allowance they are skipped, and the next message starts afresh.
++    #[test]
++    fn repeated_fills_and_copies_stop_at_the_message_work_allowance() {
++        let red = Color {
++            b: 0,
++            g: 0,
++            r: 255,
++            xa: 0,
++        };
++        let is_red = |c: &Compositor, id: u16, x: usize, y: usize| {
++            let surface = &c.surfaces[&id];
++            surface.data[(y * usize::from(surface.width) + x) * BYTES_PER_PIXEL] == 255
++        };
++        let mut c = Compositor::default();
++        c.reset(64, 64);
++        c.create_surface(1, 64, 64);
++        c.create_surface(2, 64, 64);
++        c.begin_message();
++
++        // Rectangles are charged for the pixels they really cover (clipped to the surface).
++        c.solid_fill(1, &red, &[rect(60, 60, 65535, 65535)]);
++        assert_eq!(c.message_work, 16);
++
++        // Room for 100 more pixels: the 8x8 fill fits, the next 8x8 does not, and nothing
++        // after it in the same PDU is painted either.
++        c.message_work = MAX_MESSAGE_PIXEL_WORK - 100;
++        c.solid_fill(1, &red, &[rect(0, 0, 8, 8), rect(8, 0, 16, 8), rect(16, 0, 17, 1)]);
++        assert!(is_red(&c, 1, 7, 7));
++        assert!(!is_red(&c, 1, 8, 0) && !is_red(&c, 1, 16, 0));
++        assert_eq!(c.message_work, MAX_MESSAGE_PIXEL_WORK - 36);
++
++        // The same allowance covers every repeatable command: 36 pixels are left.
++        let points = |n: u16| -> Vec<Point> { (0..n).map(|i| Point { x: i * 4, y: 32 }).collect() };
++        c.surface_to_surface(1, 2, &rect(0, 0, 2, 2), &points(16)); // 4 for the read, 8 points fit
++        assert!(is_red(&c, 2, 28, 32) && !is_red(&c, 2, 32, 32));
++        assert_eq!(c.message_work, MAX_MESSAGE_PIXEL_WORK);
++        c.surface_to_cache(1, 1, 0, &rect(0, 0, 4, 4));
++        assert!(c.cache.is_empty(), "no allowance left for the copy");
++        c.apply_bitmap_from(2, &rect(0, 0, 4, 4), &[255; 64], 16, (0, 0));
++        assert!(!is_red(&c, 2, 0, 0));
++
++        // The next message has its allowance back.
++        c.begin_message();
++        c.surface_to_cache(1, 1, 0, &rect(0, 0, 4, 4));
++        c.cache_to_surface(1, 2, &points(3));
++        assert!(is_red(&c, 2, 8, 32 + 3));
++        c.message_work = MAX_MESSAGE_PIXEL_WORK - 16;
++        c.cache_to_surface(1, 2, &[Point { x: 0, y: 0 }, Point { x: 4, y: 0 }]);
++        assert!(is_red(&c, 2, 3, 3) && !is_red(&c, 2, 4, 0));
++        c.begin_message();
++        c.apply_bitmap_from(2, &rect(4, 0, 8, 4), &[255; 64], 16, (0, 0));
++        assert!(is_red(&c, 2, 4, 0));
++    }
++
++    /// Bastion patch: a queued update is charged for its bookkeeping as well as its pixels,
++    /// so millions of 1x1 updates cannot hold many times the budget on the heap.
++    #[test]
++    fn tiny_updates_are_charged_for_their_overhead() {
++        let mut c = Compositor::default();
++        c.reset(64, 64);
++        c.create_surface(1, 64, 64);
++        c.map_surface(1, 0, 0);
++        c.end_frame();
++        let _ = c.drain_output();
++        let idle = c.allocated_bytes;
++
++        let black = Color {
++            b: 0,
++            g: 0,
++            r: 0,
++            xa: 0,
++        };
++        let pixels: Vec<_> = (0..10u16).map(|i| rect(i * 2, 0, i * 2 + 1, 1)).collect();
++        c.solid_fill(1, &black, &pixels);
++        c.end_frame();
++        assert_eq!(c.allocated_bytes - idle, 10 * (BYTES_PER_PIXEL + UPDATE_OVERHEAD));
++        assert_eq!(c.drain_output().len(), 10);
++        assert_eq!(c.allocated_bytes, idle);
++    }
++
+     /// Draining hands the pixels to the consumer, so the queue's charge returns to
+     /// the budget rather than ratcheting it upward frame after frame.
+     #[test]
+diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs_info.json' '--exclude=.cargo-ok' ironrdp-egfx-0.5.0/src/lib.rs vendor/ironrdp-egfx/src/lib.rs
+--- ironrdp-egfx-0.5.0/src/lib.rs	2006-07-24 02:21:28.000000000 +0100
++++ vendor/ironrdp-egfx/src/lib.rs	2026-11-17 21:18:35.240784900 +0000
+@@ -4,6 +4,43 @@
+ /// EGFX dynamic virtual channel name per MS-RDPEGFX
+ pub const CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
+ 
++/// Bastion patch: `tracing::warn!` for conditions the peer can trigger once per PDU (or per
++/// rectangle). A graphics message expands to as much as 256 MiB of PDUs, so an unconditional
++/// warning lets a few bytes on the wire write millions of log lines. Each call site logs its
++/// 1st, 2nd, 4th, 8th, ... occurrence, with the running count.
++macro_rules! warn_throttled {
++    ($($arg:tt)+) => {{
++        static OCCURRENCES: ::core::sync::atomic::AtomicU64 = ::core::sync::atomic::AtomicU64::new(0);
++        if let Some(occurrences) = $crate::throttled_occurrence(&OCCURRENCES) {
++            ::tracing::warn!(occurrences, $($arg)+);
++        }
++    }};
++}
++
++/// Counts one occurrence at a [`warn_throttled`] call site; `Some(count)` when it is one to log.
++#[doc(hidden)]
++pub fn throttled_occurrence(occurrences: &core::sync::atomic::AtomicU64) -> Option<u64> {
++    let count = occurrences
++        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
++        .wrapping_add(1);
++    count.is_power_of_two().then_some(count)
++}
++
++#[cfg(test)]
++mod throttle_tests {
++    /// Bastion patch: a call site reached ten million times (one decompressed message of
++    /// minimal PDUs) logs 24 lines, not ten million.
++    #[test]
++    fn a_call_site_logs_logarithmically_often() {
++        let occurrences = core::sync::atomic::AtomicU64::new(0);
++        let logged: Vec<u64> = (0..10_000_000u32)
++            .filter_map(|_| super::throttled_occurrence(&occurrences))
++            .collect();
++        assert_eq!(logged.len(), 24);
++        assert_eq!(logged[..4], [1, 2, 4, 8]);
++    }
++}
++
+ pub mod avc444;
+ pub mod cache;
+ pub mod client;
+diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs_info.json' '--exclude=.cargo-ok' ironrdp-egfx-0.5.0/src/pdu/avc.rs vendor/ironrdp-egfx/src/pdu/avc.rs
+--- ironrdp-egfx-0.5.0/src/pdu/avc.rs	2006-07-24 02:21:28.000000000 +0100
++++ vendor/ironrdp-egfx/src/pdu/avc.rs	2026-11-17 21:19:58.631388400 +0000
+@@ -7,7 +7,6 @@
+     Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_fixed_part_size,
+     ensure_size, invalid_field_err,
+ };
+-use tracing::warn;
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct QuantQuality {
+@@ -498,11 +497,11 @@
+         offset += 4;
+ 
+         let Some(end) = offset.checked_add(nal_len) else {
+-            warn!(nal_len, offset, "AVC NAL length overflow, discarding remaining data");
++            warn_throttled!(nal_len, offset, "AVC NAL length overflow, discarding remaining data");
+             break;
+         };
+         if end > data.len() {
+-            warn!(
++            warn_throttled!(
+                 nal_len,
+                 offset,
+                 data_len = data.len(),
+diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs_info.json' '--exclude=.cargo-ok' ironrdp-egfx-0.5.0/src/pdu/cmd.rs vendor/ironrdp-egfx/src/pdu/cmd.rs
+--- ironrdp-egfx-0.5.0/src/pdu/cmd.rs	2006-07-24 02:21:28.000000000 +0100
++++ vendor/ironrdp-egfx/src/pdu/cmd.rs	2026-11-17 21:17:02.743223700 +0000
+@@ -9,7 +9,6 @@
+ use ironrdp_pdu::gcc::Monitor;
+ use ironrdp_pdu::geometry::ExclusiveRectangle;
+ use ironrdp_pdu::{DecodeError, cast_length, ensure_size, read_padding, write_padding};
+-use tracing::warn;
+ 
+ use super::{Color, PixelFormat, Point};
+ 
+@@ -199,7 +198,7 @@
+         let cmdid = src.read_u16();
+         let flags = src.read_u16(); /* flags */
+         if flags != 0 {
+-            warn!(?flags, "invalid GFX flag");
++            warn_throttled!(?flags, "invalid GFX flag");
+         }
+         let pdu_length = src.read_u32();
+ 

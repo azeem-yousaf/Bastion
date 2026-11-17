@@ -683,22 +683,27 @@ impl GraphicsPipelineClient {
             .decompress(payload, &mut self.decompressed_buffer)
             .map_err(|e| decode_err!(e))?;
 
-        // Decode all PDUs before dispatch while the cursor borrows the buffer.
-        let mut pdus = Vec::new();
-        {
-            let mut cursor = ReadCursor::new(self.decompressed_buffer.as_slice());
-            while !cursor.is_empty() {
-                let pdu: GfxPdu = decode_cursor(&mut cursor).map_err(|e| decode_err!(e))?;
-                pdus.push(pdu);
-            }
-        }
+        // Bastion patch: a per-message allowance for pixel work that costs the peer nothing
+        // to request (see `Compositor::begin_message`).
+        self.compositor.begin_message();
 
+        // Bastion patch: decode and dispatch one PDU at a time. Collecting every PDU first
+        // held a `Vec<GfxPdu>` many times the size of the decompressed message (which may be
+        // 256 MiB of ten-byte PDUs). The buffer is taken out of `self` for the duration so
+        // the cursor can borrow it while the handlers borrow `self`.
+        let buffer = core::mem::take(&mut self.decompressed_buffer);
+        let result = self.dispatch_pdus(&buffer);
+        self.decompressed_buffer = buffer;
+        result
+    }
+
+    fn dispatch_pdus(&mut self, decompressed: &[u8]) -> PduResult<Vec<DvcMessage>> {
         let mut responses: Vec<DvcMessage> = Vec::new();
-        for pdu in pdus {
-            let pdu_responses = self.handle_pdu(pdu)?;
-            responses.extend(pdu_responses);
+        let mut cursor = ReadCursor::new(decompressed);
+        while !cursor.is_empty() {
+            let pdu: GfxPdu = decode_cursor(&mut cursor).map_err(|e| decode_err!(e))?;
+            responses.extend(self.handle_pdu(pdu)?);
         }
-
         Ok(responses)
     }
 
@@ -877,7 +882,7 @@ impl GraphicsPipelineClient {
         let cap = match cap.parsed() {
             Ok(Some(typed)) => typed,
             Ok(None) => {
-                warn!(
+                warn_throttled!(
                     version = cap.version.0,
                     "Server confirmed an unknown EGFX capability version; proceeding with defaults"
                 );
@@ -889,7 +894,7 @@ impl GraphicsPipelineClient {
             }
             Err(e) if self.state == ClientState::Resetting => return Err(decode_err!(e)),
             Err(e) => {
-                warn!(error = %e, "Failed to parse server's EGFX capabilities confirmation");
+                warn_throttled!(error = %e, "Failed to parse server's EGFX capabilities confirmation");
                 self.negotiated_caps = None;
                 self.codec_caps = CodecCapabilities::default();
                 self.compositor.set_small_bitmap_cache(self.codec_caps.small_cache);
@@ -963,7 +968,7 @@ impl GraphicsPipelineClient {
 
     fn handle_create_surface(&mut self, surface_id: u16, width: u16, height: u16, pixel_format: PixelFormat) {
         if width == 0 || height == 0 {
-            warn!(surface_id, width, height, "Ignoring CreateSurface with zero dimensions");
+            warn_throttled!(surface_id, width, height, "Ignoring CreateSurface with zero dimensions");
             return;
         }
 
@@ -992,7 +997,7 @@ impl GraphicsPipelineClient {
             debug!(surface_id, "Surface deleted");
             self.handler.on_surface_deleted(surface_id);
         } else {
-            warn!(surface_id, "DeleteSurface for unknown surface");
+            warn_throttled!(surface_id, "DeleteSurface for unknown surface");
         }
     }
 
@@ -1011,7 +1016,7 @@ impl GraphicsPipelineClient {
             debug!(surface_id, origin_x, origin_y, "Surface mapped to output");
             self.handler.on_surface_mapped(surface_id, origin_x, origin_y);
         } else {
-            warn!(surface_id, "MapSurfaceToOutput for unknown surface");
+            warn_throttled!(surface_id, "MapSurfaceToOutput for unknown surface");
         }
     }
 
@@ -1028,7 +1033,7 @@ impl GraphicsPipelineClient {
                 .map_surface_to_window(surface_id, window_id, mapped, target);
             debug!(surface_id, window_id, ?mapped, ?target, "Surface mapped to window");
         } else {
-            warn!(surface_id, "MapSurfaceToWindow for unknown surface");
+            warn_throttled!(surface_id, "MapSurfaceToWindow for unknown surface");
         }
     }
 
@@ -1055,7 +1060,7 @@ impl GraphicsPipelineClient {
             self.handler
                 .on_surface_mapped(pdu.surface_id, pdu.output_origin_x, pdu.output_origin_y);
         } else {
-            warn!(
+            warn_throttled!(
                 surface_id = pdu.surface_id,
                 "MapSurfaceToScaledOutput for unknown surface"
             );
@@ -1071,7 +1076,7 @@ impl GraphicsPipelineClient {
         // Validate rectangle ordering (left <= right, top <= bottom)
         let rect = &pdu.destination_rectangle;
         if rect.left > rect.right || rect.top > rect.bottom {
-            warn!(
+            warn_throttled!(
                 left = rect.left,
                 top = rect.top,
                 right = rect.right,
@@ -1085,7 +1090,7 @@ impl GraphicsPipelineClient {
         // uses exclusive `right`/`bottom`, so a full-surface update has
         // `right == surface.width` and `bottom == surface.height`, which is valid.
         if rect.right > surface.width || rect.bottom > surface.height {
-            warn!(
+            warn_throttled!(
                 surface_id = pdu.surface_id,
                 rect_right = rect.right,
                 rect_bottom = rect.bottom,
@@ -1135,6 +1140,20 @@ impl GraphicsPipelineClient {
             .get(&pdu.surface_id)
             .ok_or_else(|| pdu_other_err!("unknown surface in WireToSurface2"))?;
         let (surface_width, surface_height) = (surface.width, surface.height);
+
+        // Bastion patch: the Progressive decoder keeps about 61 KB per tile it has seen. Only
+        // feed it surfaces the compositor holds a canvas for (it refuses oversized and
+        // over-budget ones, and the decoded tiles would be discarded anyway), so a surface's
+        // tile grid is bounded by pixels that really exist.
+        if !self.compositor.has_surface(pdu.surface_id) {
+            self.drop_update(
+                pdu.codec_id,
+                pdu.surface_id,
+                pdu.bitmap_data.len(),
+                &"the surface has no canvas",
+            );
+            return Ok(());
+        }
 
         let tiles = match self.progressive_decoder.decode_bitmap(
             pdu.surface_id,
@@ -1365,7 +1384,7 @@ impl GraphicsPipelineClient {
                 // no trace if a server's coordinate convention ever disagreed
                 // with the surface/frame bounds -- the same undebuggable class of
                 // rendering defect this change fixes.
-                warn!(
+                warn_throttled!(
                     surface_id,
                     region_left = region.left,
                     region_top = region.top,
@@ -1835,7 +1854,7 @@ impl GraphicsPipelineClient {
     /// [3.3.5.17]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/df29d040-f74b-4002-92ed-f0903b8402c3
     fn handle_cache_import_reply(&mut self, pdu: &CacheImportReplyPdu) {
         let Some(offered) = self.offered_cache_keys.take() else {
-            warn!("CacheImportReply without a pending CacheImportOffer; ignoring it");
+            warn_throttled!("CacheImportReply without a pending CacheImportOffer; ignoring it");
             return;
         };
         let Some(store) = self.persistent_cache.as_mut() else {
@@ -2159,7 +2178,7 @@ fn crop_decoded_frame(
     #[expect(clippy::as_conversions, reason = "dst_stride * rows bounded by frame dimensions")]
     let expected_len = (dst_stride as usize).saturating_mul(rows as usize);
     if cropped.len() < expected_len {
-        tracing::warn!(
+        warn_throttled!(
             expected = expected_len,
             actual = cropped.len(),
             "Decoded frame data truncated during crop"
@@ -3365,6 +3384,39 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(client.dropped_updates, 1);
+    }
+
+    /// Bastion patch: the Progressive decoder keeps per-tile state, so it must only see
+    /// surfaces the compositor holds a canvas for. A surface the compositor refused (here:
+    /// over its per-edge limit) is still in the client's map; its updates are dropped.
+    #[test]
+    fn progressive_updates_for_a_surface_without_a_canvas_never_reach_the_decoder() {
+        let mut client = progressive_client();
+        client
+            .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: 2,
+                width: 32768,
+                height: 32768,
+                pixel_format: PixelFormat::XRgb,
+            }))
+            .unwrap();
+        assert!(client.get_surface(2).is_some(), "the client still tracks the surface");
+        assert!(!client.compositor.has_surface(2), "the compositor refused it");
+
+        let wire = |client: &mut GraphicsPipelineClient, surface_id| {
+            client.handle_pdu(GfxPdu::WireToSurface2(WireToSurface2Pdu {
+                surface_id,
+                codec_id: crate::pdu::Codec2Type::RemoteFxProgressive,
+                codec_context_id: 7,
+                pixel_format: PixelFormat::XRgb,
+                bitmap_data: progressive_context_stream(true),
+            }))
+        };
+        wire(&mut client, 2).unwrap();
+        assert_eq!(client.dropped_updates(), 1, "refused before decoding");
+        // A surface with a canvas decodes the same stream.
+        wire(&mut client, 1).unwrap();
+        assert_eq!(client.dropped_updates(), 1);
     }
 
     #[test]

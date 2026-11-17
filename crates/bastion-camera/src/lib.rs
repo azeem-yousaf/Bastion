@@ -9,6 +9,7 @@
 //! re-encoded.
 
 mod backend;
+mod ratelimit;
 mod v4l2;
 
 use std::sync::Arc;
@@ -76,6 +77,12 @@ pub fn default_host() -> Arc<dyn CameraHost> {
 const MAX_YUYV_PIXELS: u32 = 640 * 480;
 /// Largest MJPG frame we offer; beyond 1080p only costs bandwidth for a video call.
 const MAX_MJPG_HEIGHT: u32 = 1080;
+/// Widest MJPG frame we offer (covers ultra-wide 1080p sensors); also keeps pixel counts small.
+const MAX_MJPG_WIDTH: u32 = 4096;
+/// Largest single frame handed to the session. A 1080p JPEG is a few hundred kB and a V4L2 MJPG
+/// buffer about 4 MB; anything larger is a misbehaving device and would only balloon memory and
+/// the uplink.
+pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ADVERTISED_MODES: usize = 32;
 /// Video calls run at 30 fps; faster modes (some webcams do 60–120) only cost bandwidth.
 const TARGET_FPS: f64 = 30.0;
@@ -100,10 +107,11 @@ pub fn advertised_modes(all: &[Mode]) -> Vec<Mode> {
     let mut best: Vec<Mode> = Vec::new();
     for m in all {
         let allowed = match m.format {
-            PixelFormat::Mjpeg => m.height <= MAX_MJPG_HEIGHT,
-            PixelFormat::Yuyv => !has_mjpg && m.width * m.height <= MAX_YUYV_PIXELS,
+            PixelFormat::Mjpeg => m.height <= MAX_MJPG_HEIGHT && m.width <= MAX_MJPG_WIDTH,
+            // 64-bit: the driver's numbers are not trusted to fit a u32 product.
+            PixelFormat::Yuyv => !has_mjpg && u64::from(m.width) * u64::from(m.height) <= u64::from(MAX_YUYV_PIXELS),
         };
-        if !allowed || m.width == 0 || m.height == 0 || m.fps_num == 0 {
+        if !allowed || m.width == 0 || m.height == 0 || m.fps_num == 0 || m.fps_den == 0 {
             continue;
         }
         match best.iter_mut().find(|b| (b.format, b.width, b.height) == (m.format, m.width, m.height)) {
@@ -113,7 +121,7 @@ pub fn advertised_modes(all: &[Mode]) -> Vec<Mode> {
         }
     }
     let rank = |m: &Mode| {
-        let pixels = m.width * m.height;
+        let pixels = u64::from(m.width) * u64::from(m.height);
         let target = 1280 * 720;
         // At or above 720p first (closest first), then below (largest first).
         if pixels >= target { (0, pixels - target) } else { (1, target - pixels) }
@@ -166,6 +174,17 @@ mod tests {
         use PixelFormat::*;
         let got = advertised_modes(&[m(Yuyv, 1280, 720, 10), m(Yuyv, 640, 480, 30), m(Yuyv, 320, 240, 30)]);
         assert_eq!(got, [m(Yuyv, 640, 480, 30), m(Yuyv, 320, 240, 30)]);
+    }
+
+    #[test]
+    fn absurd_driver_modes_are_dropped_without_overflowing() {
+        use PixelFormat::*;
+        // 65536 × 65536 wraps to 0 pixels in 32 bits, which used to pass the YUYV size limit.
+        let wraps = m(Yuyv, 65_536, 65_536, 30);
+        let wide = m(Mjpeg, u32::MAX, 1080, 30);
+        let no_rate = Mode { fps_den: 0, ..m(Mjpeg, 1280, 720, 30) };
+        assert!(advertised_modes(&[wraps, wide, no_rate]).is_empty());
+        assert_eq!(advertised_modes(&[wraps, wide, no_rate, m(Mjpeg, 2560, 1080, 30)]), [m(Mjpeg, 2560, 1080, 30)]);
     }
 
     #[test]

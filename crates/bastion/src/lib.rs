@@ -9,5 +9,6 @@ pub mod manager;
 pub mod monitors;
 pub mod quality;
 pub mod session;
+pub mod single;
 pub mod theme;
 pub mod tray;

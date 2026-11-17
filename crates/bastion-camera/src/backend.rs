@@ -8,8 +8,9 @@ use ironrdp_rdpecam::{
     MediaFormat, MediaType, RedirectedDevice, SampleDelivery, SampleSink, SampleUplink, StartStreamInfo,
     StreamDescription,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
+use crate::ratelimit::gated;
 use crate::{CameraHost, CameraInfo, Mode, PixelFormat, RunningCapture, advertised_modes};
 
 /// The only stream we expose: the colour video stream.
@@ -43,6 +44,10 @@ struct Delivery {
 impl Delivery {
     fn offer(&mut self, frame: Vec<u8>) {
         let Some(sink) = &self.sink else { return };
+        if frame.len() > crate::MAX_FRAME_BYTES {
+            bastion_metrics::CAMERA_DROPPED.incr();
+            return;
+        }
         let len = frame.len() as u64;
         self.pending = match sink.send_sample(STREAM, frame.clone()) {
             SampleDelivery::NotRequested | SampleDelivery::Failed => Some(frame),
@@ -76,9 +81,9 @@ impl RdpCamera {
 
     fn stop(&mut self) {
         // Drop the sink first so a frame racing the shutdown isn't sent.
-        *self.delivery.lock().unwrap() = Delivery::default();
+        *self.delivery.lock().unwrap_or_else(|p| p.into_inner()) = Delivery::default();
         if self.capture.take().is_some() {
-            info!(camera = %self.camera.name, "Remote stopped the camera");
+            gated!(info, camera = %self.camera.name, "Remote stopped the camera");
         }
     }
 }
@@ -121,21 +126,29 @@ impl CameraBackend for RdpCamera {
 
         // A V4L2 device streams one format at a time, so the old capture must stop before the new
         // one opens. If the new one then fails, the server gets an error and the camera is off.
-        let previous = (self.capture.take(), std::mem::take(&mut *self.delivery.lock().unwrap()));
+        let previous =
+            (self.capture.take(), std::mem::take(&mut *self.delivery.lock().unwrap_or_else(|p| p.into_inner())));
         let delivery = Arc::new(Mutex::new(Delivery { sink: Some(sink), pending: None }));
         let d = delivery.clone();
-        let on_frame = Box::new(move |frame: &[u8]| d.lock().unwrap().offer(frame.to_vec()));
+        let on_frame = Box::new(move |frame: &[u8]| {
+            // Checked before copying: an oversized frame is never even duplicated.
+            if frame.len() > crate::MAX_FRAME_BYTES {
+                bastion_metrics::CAMERA_DROPPED.incr();
+                return;
+            }
+            d.lock().unwrap_or_else(|p| p.into_inner()).offer(frame.to_vec());
+        });
         drop(previous.0);
         match self.host.start(&self.camera, mode, on_frame) {
             Ok(capture) => {
-                info!(camera = %self.camera.name, ?mode, "Remote started the camera");
+                gated!(info, camera = %self.camera.name, ?mode, "Remote started the camera");
                 self.capture = Some(capture);
                 self.delivery = delivery;
                 self.current = mode;
                 Ok(())
             }
             Err(e) => {
-                warn!(camera = %self.camera.name, error = format!("{e:#}"), "Could not start the camera");
+                gated!(warn, camera = %self.camera.name, error = format!("{e:#}"), "Could not start the camera");
                 Err(ErrorCode::InvalidRequest)
             }
         }
@@ -150,7 +163,7 @@ impl CameraBackend for RdpCamera {
         if stream_index != STREAM {
             return;
         }
-        let mut d = self.delivery.lock().unwrap();
+        let mut d = self.delivery.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(frame) = d.pending.take() {
             d.offer(frame);
         }

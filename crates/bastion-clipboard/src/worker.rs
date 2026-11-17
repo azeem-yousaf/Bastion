@@ -17,16 +17,16 @@ use ironrdp_cliprdr::pdu::{
     FileContentsRequest, FileContentsResponse, FileDescriptor, FormatDataResponse,
 };
 use ironrdp_cliprdr_native::data_control::find_mime_match;
-use tempfile::TempDir;
 use tracing::{debug, info, warn};
 
 use crate::convert::{
-    self, LOCAL_IMAGE_TYPES, LOCAL_TEXT_TYPES, LocalKind, MIME_GNOME_FILES, MIME_HTML, MIME_PNG, MIME_TEXT_PLAIN,
-    MIME_TEXT_UTF8, MIME_URI_LIST, MIME_UTF8_STRING,
+    self, LOCAL_IMAGE_TYPES, LOCAL_TEXT_TYPES, LocalKind, MIME_BASTION_REMOTE, MIME_GNOME_FILES, MIME_HTML,
+    MIME_PASSWORD_HINT, MIME_PNG, MIME_TEXT_PLAIN, MIME_TEXT_UTF8, MIME_URI_LIST, MIME_UTF8_STRING,
 };
-use crate::files::download::{Download, DownloadError, Step};
+use crate::files::download::{Download, DownloadDir, DownloadError, Step};
 use crate::files::local::LocalFileList;
 use crate::files::{self, Limits};
+use crate::flow::{Budget, FlowControl};
 use crate::os::{OfferItem, OsClipboard, Transfer};
 use crate::uri;
 
@@ -42,6 +42,8 @@ const KEEP_DOWNLOADS: usize = 2;
 const ECHO_WINDOW: Duration = Duration::from_secs(3);
 /// Max bytes served per FileContents range request.
 const MAX_SERVE_CHUNK: u32 = 8 * 1024 * 1024;
+/// Server data requests held back while the response budget is used up; more are refused.
+const MAX_DEFERRED: usize = 16;
 
 /// Work items for the worker thread.
 pub(crate) enum Command {
@@ -54,6 +56,8 @@ pub(crate) enum Command {
     FormatListResponse(bool),
     RemoteCopy(Vec<ClipboardFormat>),
     FormatDataRequest(ClipboardFormatId),
+    /// A format data request beyond the request queue limit: answer with a failure.
+    RefuseFormatData,
     /// `None` = failure response (or over the size limit).
     FormatDataResponse(Option<Vec<u8>>),
     RemoteFileList {
@@ -61,6 +65,8 @@ pub(crate) enum Command {
         clip_data_id: Option<u32>,
     },
     FileContentsRequest(FileContentsRequest),
+    /// A file contents request (by stream ID) beyond the request queue limit.
+    RefuseFileContents(u32),
     FileContentsResponse {
         stream_id: u32,
         data: Option<Vec<u8>>,
@@ -86,6 +92,8 @@ impl core::fmt::Debug for Command {
             Self::FormatListResponse(_) => "FormatListResponse",
             Self::RemoteCopy(_) => "RemoteCopy",
             Self::FormatDataRequest(_) => "FormatDataRequest",
+            Self::RefuseFormatData => "RefuseFormatData",
+            Self::RefuseFileContents(_) => "RefuseFileContents",
             Self::FormatDataResponse(_) => "FormatDataResponse",
             Self::RemoteFileList { .. } => "RemoteFileList",
             Self::FileContentsRequest(_) => "FileContentsRequest",
@@ -111,6 +119,8 @@ pub(crate) struct Config {
     pub(crate) paste_timeout: Duration,
     /// A file download with no progress for this long is abandoned.
     pub(crate) download_stall_timeout: Duration,
+    /// Request/response accounting shared with the backend and the session.
+    pub(crate) flow: FlowControl,
 }
 
 impl Config {
@@ -121,6 +131,7 @@ impl Config {
             download_base: None,
             paste_timeout: Duration::from_secs(10),
             download_stall_timeout: Duration::from_secs(90),
+            flow: FlowControl::default(),
         }
     }
 
@@ -208,6 +219,8 @@ impl RemoteFormats {
         }
     }
 
+    /// What to put on the local clipboard for this remote offer. A non-empty offer always
+    /// carries [`MIME_BASTION_REMOTE`], which tells other sessions not to forward it.
     fn local_offer(&self) -> Vec<OfferItem> {
         let mut items = Vec::new();
         if self.file_list.is_some() {
@@ -224,6 +237,9 @@ impl RemoteFormats {
         }
         if self.image.is_some() {
             items.push(OfferItem::delayed(MIME_PNG));
+        }
+        if !items.is_empty() {
+            items.push(OfferItem { mime: MIME_BASTION_REMOTE.to_owned(), data: Some(b"1".to_vec()) });
         }
         items
     }
@@ -250,10 +266,17 @@ enum FileJob {
     },
     Done {
         paths: Vec<PathBuf>,
-        dir: TempDir,
+        dir: DownloadDir,
     },
     /// Failed for good (limits); a retry would fail the same way.
     Failed,
+}
+
+/// A server request that is answered with clipboard or file data.
+#[derive(Debug)]
+enum DataRequest {
+    Format(ClipboardFormatId),
+    File(FileContentsRequest),
 }
 
 pub(crate) struct Worker<O, P> {
@@ -272,7 +295,7 @@ pub(crate) struct Worker<O, P> {
     in_flight: VecDeque<InFlight>,
     file_job: FileJob,
     file_waiters: Vec<Transfer>,
-    kept_downloads: VecDeque<TempDir>,
+    kept_downloads: VecDeque<DownloadDir>,
     download_base: Option<PathBuf>,
     next_stream_id: u32,
     local_files: Option<Arc<LocalFileList>>,
@@ -280,6 +303,10 @@ pub(crate) struct Worker<O, P> {
     loops: LoopDetector,
     last_remote_delivery: Option<Instant>,
     epoch: Instant,
+    /// Response bytes handed to the session and not yet written.
+    budget: Budget,
+    /// Data requests waiting for room in `budget`, oldest first.
+    deferred: VecDeque<DataRequest>,
 }
 
 impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
@@ -288,9 +315,14 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
             window_ms: u64::try_from(ECHO_WINDOW.as_millis()).unwrap_or(3000),
             ..LoopDetectionConfig::default()
         });
+        if let Some(base) = &config.download_base {
+            files::register_base(base);
+        }
         Self {
             os,
             proxy,
+            budget: Budget::new(config.flow.shared()),
+            deferred: VecDeque::new(),
             download_base: config.download_base.clone(),
             config,
             channel: Channel::Down,
@@ -314,7 +346,9 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
 
     pub(crate) fn run(mut self, receiver: &Receiver<Command>) {
         loop {
-            match receiver.recv_timeout(Duration::from_millis(100)) {
+            // Requests waiting for the session to write earlier responses are retried quickly.
+            let wait = if self.deferred.is_empty() { Duration::from_millis(100) } else { Budget::POLL };
+            match receiver.recv_timeout(wait) {
                 Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
                 Ok(command) => self.handle(command),
                 Err(RecvTimeoutError::Timeout) => {}
@@ -337,6 +371,7 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
     }
 
     fn send(&self, message: ClipboardMessage) {
+        self.budget.charge(FlowControl::cost(&message));
         self.proxy.send_clipboard_message(message);
     }
 
@@ -370,10 +405,24 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
                 }
             }
             Command::RemoteCopy(formats) => self.remote_copy(&formats),
-            Command::FormatDataRequest(format) => self.render_local(format),
+            Command::FormatDataRequest(format) => {
+                self.budget.request_handled();
+                self.data_request(DataRequest::Format(format));
+            }
+            Command::RefuseFormatData => {
+                self.budget.request_handled();
+                self.send(ClipboardMessage::SendFormatData(FormatDataResponse::new_error()));
+            }
             Command::FormatDataResponse(data) => self.format_data_response(data),
             Command::RemoteFileList { files, clip_data_id } => self.remote_file_list(&files, clip_data_id),
-            Command::FileContentsRequest(request) => self.serve_file_contents(&request),
+            Command::FileContentsRequest(request) => {
+                self.budget.request_handled();
+                self.data_request(DataRequest::File(request));
+            }
+            Command::RefuseFileContents(stream_id) => {
+                self.budget.request_handled();
+                self.send(ClipboardMessage::SendFileContentsResponse(FileContentsResponse::new_error(stream_id)));
+            }
             Command::FileContentsResponse { stream_id, data } => self.file_contents_response(stream_id, data),
             Command::Lock(id) => {
                 if let Some(list) = &self.local_files
@@ -399,6 +448,8 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
         self.invalidate();
         // A new channel answers nothing sent on the old one.
         self.in_flight.clear();
+        self.deferred.clear();
+        self.budget.reset(Instant::now());
         self.channel = Channel::Down;
         self.caps = ClipboardGeneralCapabilityFlags::empty();
         if self.remote.take().is_some() {
@@ -435,6 +486,7 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
     }
 
     pub(crate) fn tick(&mut self, now: Instant) {
+        self.serve_deferred(now);
         for request in &mut self.in_flight {
             if request.deadline <= now && !request.waiters.is_empty() {
                 debug!("Remote did not answer a paste in time");
@@ -463,9 +515,10 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
         // Initialization-state FormatList must go through initiate_copy (it carries the
         // capabilities); a file list is announced once the channel is ready.
         let mimes = self.os.mime_types();
-        let formats = if self.remote.is_some() { Vec::new() } else { self.local_formats(&mimes) };
+        let withheld = self.withheld(&mimes).is_some();
+        let formats = if self.remote.is_some() || withheld { Vec::new() } else { self.local_formats(&mimes) };
         self.local_files = None;
-        self.local_dirty = self.config.files && self.local_file_paths(&mimes).is_some();
+        self.local_dirty = self.config.files && !withheld && self.local_file_paths(&mimes).is_some();
         self.channel = Channel::Initializing;
         self.send(ClipboardMessage::SendInitiateCopy(formats));
     }
@@ -483,6 +536,31 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
             return;
         }
         self.advertise_local();
+    }
+
+    /// Why the current local selection must not reach the remote, if it must not:
+    ///
+    /// * it is the remote clipboard of another Bastion session. Announcing it would hand one
+    ///   server's data to another without the user pasting anything (and reading its file list
+    ///   would make that session download the files);
+    /// * a password manager marked it as a secret.
+    ///
+    /// Nothing but the (tiny) hint is read from the selection to decide this.
+    fn withheld(&mut self, mimes: &[String]) -> Option<&'static str> {
+        if self.os.is_owner() {
+            return None;
+        }
+        if mimes.iter().any(|m| m == MIME_BASTION_REMOTE) {
+            return Some("it is another session's remote clipboard");
+        }
+        if mimes.iter().any(|m| m == MIME_PASSWORD_HINT) {
+            // Fail closed: a hint that cannot be read counts as "secret".
+            let public = matches!(self.os.read(MIME_PASSWORD_HINT), Ok(Some(hint)) if hint.trim_ascii() != b"secret");
+            if !public {
+                return Some("a password manager marked it as secret");
+            }
+        }
+        None
     }
 
     /// Whether the new local selection is just a clipboard manager re-publishing what we put
@@ -529,6 +607,14 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
 
     fn advertise_local(&mut self) {
         let mimes = self.os.mime_types();
+        if let Some(reason) = self.withheld(&mimes) {
+            // An empty list also retracts whatever we announced before, so the remote cannot
+            // go on requesting formats that would now be rendered from this selection.
+            debug!(reason, "Not announcing the local clipboard to the remote");
+            self.local_files = None;
+            self.send(ClipboardMessage::SendInitiateCopy(Vec::new()));
+            return;
+        }
         if self.is_echo(&mimes) {
             debug!("Local clipboard change echoes remote data; not re-announcing it");
             return;
@@ -557,8 +643,68 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
         self.send(ClipboardMessage::SendInitiateCopy(formats));
     }
 
+    /// Whether `paths` are files downloaded from a remote clipboard, by this session or any
+    /// other one (a session must not re-export what another session's remote sent).
     fn is_our_download(&self, paths: &[PathBuf]) -> bool {
         self.download_base.as_ref().is_some_and(|base| LocalFileList::top_level_within(paths, base))
+            || files::are_downloads(paths)
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Serving the remote's data requests
+    // -----------------------------------------------------------------------------------------
+
+    /// Whether answering `request` produces more than a few bytes.
+    fn is_bulk(request: &DataRequest) -> bool {
+        match request {
+            DataRequest::Format(_) => true,
+            DataRequest::File(request) => !request.flags.contains(FileContentsFlags::SIZE),
+        }
+    }
+
+    /// Serves a data request now if earlier responses have been written out, holds it back
+    /// (a few) or refuses it (the rest) otherwise. The server chooses how many requests it
+    /// sends and each is answered with up to megabytes, so answering all of them at once would
+    /// queue an unbounded amount of memory behind the socket.
+    fn data_request(&mut self, request: DataRequest) {
+        if !Self::is_bulk(&request) {
+            self.serve(request);
+            return;
+        }
+        let now = Instant::now();
+        self.serve_deferred(now);
+        if self.deferred.is_empty() && self.budget.has_room(now) {
+            self.serve(request);
+        } else if self.deferred.len() < MAX_DEFERRED {
+            self.deferred.push_back(request);
+        } else {
+            self.refuse(&request);
+        }
+    }
+
+    fn serve_deferred(&mut self, now: Instant) {
+        while !self.deferred.is_empty() && self.budget.has_room(now) {
+            if let Some(request) = self.deferred.pop_front() {
+                self.serve(request);
+            }
+        }
+    }
+
+    fn serve(&mut self, request: DataRequest) {
+        match request {
+            DataRequest::Format(format) => self.render_local(format),
+            DataRequest::File(request) => self.serve_file_contents(&request),
+        }
+    }
+
+    fn refuse(&mut self, request: &DataRequest) {
+        let message = match request {
+            DataRequest::Format(_) => ClipboardMessage::SendFormatData(FormatDataResponse::new_error()),
+            DataRequest::File(request) => {
+                ClipboardMessage::SendFileContentsResponse(FileContentsResponse::new_error(request.stream_id))
+            }
+        };
+        self.send(message);
     }
 
     fn read_first(&mut self, candidates: &[&str]) -> Result<(String, Vec<u8>), String> {
@@ -578,6 +724,11 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
         let result = (|| -> Result<Vec<u8>, String> {
             if self.remote.is_some() {
                 return Err("local clipboard holds the remote's data".to_owned());
+            }
+            // Checked again here: the selection may have changed since it was announced.
+            let mimes = self.os.mime_types();
+            if let Some(reason) = self.withheld(&mimes) {
+                return Err(format!("local clipboard is withheld: {reason}"));
             }
             let out = match format {
                 ClipboardFormatId::CF_UNICODETEXT => {
@@ -790,8 +941,14 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
             self.last_remote_delivery = Some(Instant::now());
             self.cache.insert(kind, bytes.clone());
         }
-        for waiter in request.waiters {
+        // The last waiter takes the buffer instead of another copy of it.
+        let mut waiters = request.waiters;
+        let last = waiters.pop();
+        for waiter in waiters {
             waiter.finish(decoded.clone());
+        }
+        if let Some(waiter) = last {
+            waiter.finish(decoded);
         }
     }
 
@@ -810,6 +967,7 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
             None => match files::download_base() {
                 Ok(base) => {
                     files::sweep_stale(&base);
+                    files::register_base(&base);
                     self.download_base = Some(base.clone());
                     base
                 }

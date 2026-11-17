@@ -8,6 +8,8 @@ use uuid::Uuid;
 
 pub const DEFAULT_RDP_PORT: u16 = 3389;
 pub const DEFAULT_GATEWAY_PORT: u16 = 443;
+/// Largest desktop width/height RDP supports (MS-RDPBCGR); also the limit for window sizes.
+pub const MAX_DESKTOP_SIZE: u16 = 8192;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -94,6 +96,9 @@ impl Profile {
             if let Err(e) = crate::wol::target(&self.wake.broadcast, self.wake.port) {
                 problems.push(format!("Wake-on-LAN broadcast address: {e}"));
             }
+        }
+        if self.display.width > MAX_DESKTOP_SIZE || self.display.height > MAX_DESKTOP_SIZE {
+            problems.push(format!("Window size can be at most {MAX_DESKTOP_SIZE} x {MAX_DESKTOP_SIZE}."));
         }
         if self.drive.enabled {
             if self.drive.local_path.trim().is_empty() {
@@ -383,6 +388,16 @@ mod tests {
         assert!(!p.validate().is_empty());
         let p = Profile { host: "pc01".into(), ..Default::default() };
         assert!(p.validate().is_empty());
+    }
+
+    #[test]
+    fn oversized_window_is_rejected() {
+        let mut p = Profile { host: "pc01".into(), ..Default::default() };
+        p.display.width = MAX_DESKTOP_SIZE;
+        p.display.height = MAX_DESKTOP_SIZE;
+        assert!(p.validate().is_empty());
+        p.display.height = u16::MAX;
+        assert!(p.validate().iter().any(|e| e.contains("8192 x 8192")), "{:?}", p.validate());
     }
 
     #[test]

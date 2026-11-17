@@ -18,7 +18,9 @@ use bastion_core::trust::{EndpointKind, TrustStore};
 use ironrdp_cliprdr::CliprdrClient;
 use ironrdp_cliprdr::backend::{ClipboardMessage, ClipboardMessageProxy, CliprdrBackendFactory};
 use ironrdp_connector::connection_activation::ConnectionActivationState;
-use ironrdp_connector::{ClientConnector, ConnectionResult, Credentials, DesktopSize, ServerName};
+use ironrdp_connector::{
+    ClientConnector, ClientConnectorState, ConnectionResult, Credentials, DesktopSize, ServerName,
+};
 use ironrdp_core::WriteBuf;
 use ironrdp_displaycontrol::client::DisplayControlClient;
 use ironrdp_dvc::DrdynvcClient;
@@ -34,7 +36,7 @@ use ironrdp_svc::SvcMessage;
 use ironrdp_tokio::{FramedWrite as _, single_sequence_step_read, split_tokio_framed};
 use smallvec::SmallVec;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::frame::{Rect, SharedFrame};
@@ -130,6 +132,9 @@ pub struct SessionHandle {
     input_queued: Arc<bastion_metrics::Stamp>,
     /// Connection quality measurements (for the UI's indicator).
     pub link: Arc<crate::link::LinkStats>,
+    /// Set on disconnect so the engine gives up even while it is stuck in a socket write or a
+    /// re-activation the remote computer never finishes (those cannot look at the command queue).
+    cancel: watch::Sender<bool>,
 }
 
 impl SessionHandle {
@@ -140,7 +145,9 @@ impl SessionHandle {
         let input_queued = Arc::new(bastion_metrics::Stamp::default());
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let link = Arc::new(crate::link::LinkStats::default());
+        let (cancel_tx, cancel_rx) = watch::channel(false);
         let ctx = EngineCtx {
+            cancel: cancel_rx,
             link: link.clone(),
             params,
             cmd_tx: cmd_tx.clone(),
@@ -165,7 +172,16 @@ impl SessionHandle {
                 rt.block_on(run(ctx, cmd_rx));
             })
             .expect("spawn session thread");
-        Self { cmd: cmd_tx, input: input_tx, events: ev_rx, frame, thread: Some(thread), input_queued, link }
+        Self {
+            cmd: cmd_tx,
+            input: input_tx,
+            events: ev_rx,
+            frame,
+            thread: Some(thread),
+            input_queued,
+            link,
+            cancel: cancel_tx,
+        }
     }
 
     pub fn send(&self, cmd: Command) {
@@ -173,6 +189,10 @@ impl SessionHandle {
             Command::Input(events) => {
                 self.input_queued.mark();
                 let _ = self.input.send(events);
+            }
+            Command::Disconnect => {
+                let _ = self.cmd.send(Command::Disconnect);
+                let _ = self.cancel.send(true);
             }
             other => {
                 let _ = self.cmd.send(other);
@@ -192,6 +212,7 @@ impl SessionHandle {
 impl Drop for SessionHandle {
     fn drop(&mut self) {
         let _ = self.cmd.send(Command::Disconnect);
+        let _ = self.cancel.send(true);
         if let Some(t) = self.thread.take() {
             // Give the graceful shutdown a moment; never block the UI for long.
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -212,6 +233,8 @@ struct EngineCtx {
     /// Set once the graphics pipeline owns the shared frame (see `gfx::GfxShared::active`).
     gfx_active: Arc<AtomicBool>,
     link: Arc<crate::link::LinkStats>,
+    /// Becomes true (or its sender goes away) once the user disconnected; see [`bounded`].
+    cancel: watch::Receiver<bool>,
     input_tx: mpsc::UnboundedSender<InputEvents>,
     /// Owned by the running session's input task (locked for its lifetime).
     input_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<InputEvents>>>,
@@ -249,6 +272,127 @@ enum SessionEnd {
 
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(10);
 
+/// A session that stayed up this long counts as a working connection again. Anything shorter is
+/// treated as one more failed reconnect attempt, so a server (or middlebox) that accepts the
+/// sign-in and then drops the connection cannot keep Bastion re-authenticating forever.
+const STABLE_SESSION: Duration = Duration::from_secs(30);
+
+/// The reconnect attempt number after a session that lasted `lasted` was lost. `previous` is the
+/// attempt that produced that session (0 for the first connection).
+fn attempt_after_drop(previous: u32, lasted: Duration) -> u32 {
+    if lasted >= STABLE_SESSION { 1 } else { previous.saturating_add(1) }
+}
+
+/// The largest desktop side Bastion ever asks for (see `build_connector`), and so the largest it
+/// accepts from the remote computer.
+const MAX_DESKTOP_SIDE: u16 = 8192;
+
+/// The remote computer chooses the final desktop size; it is checked before anything is
+/// allocated for it (a 65535 x 65535 desktop would need 17 GB).
+fn check_desktop_size(width: u16, height: u16) -> Result<(), String> {
+    if width == 0 || height == 0 || width > MAX_DESKTOP_SIDE || height > MAX_DESKTOP_SIDE {
+        warn!(width, height, "Remote computer reported an unsupported desktop size");
+        return Err("The remote computer reported an unsupported desktop size.".to_owned());
+    }
+    Ok(())
+}
+
+/// Shown when the remote computer (or someone in between) picks a security protocol without
+/// Network Level Authentication.
+const NLA_REQUIRED: &str = "The remote computer did not agree to Network Level Authentication (NLA). \
+                            Bastion never sends your password without it, so the connection was stopped.";
+
+/// Whether the X.224 negotiation ended with CredSSP (NLA) selected.
+///
+/// The connector advertises TLS as well as CredSSP (as Windows clients do), and the server's
+/// answer arrives in clear text before TLS. Without this check a server — or anyone on the
+/// path — could select TLS-only, and the connector would then put the password in the Client
+/// Info PDU for a server that never proved it knows the account.
+fn nla_selected(state: &ClientConnectorState) -> bool {
+    use ironrdp_pdu::nego::SecurityProtocol as P;
+    matches!(
+        state,
+        ClientConnectorState::EnhancedSecurityUpgrade { selected_protocol }
+            if selected_protocol.intersects(P::HYBRID | P::HYBRID_EX)
+    )
+}
+
+/// How long one socket write may take before the connection is considered dead (the remote
+/// computer stopped reading).
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The goodbye sent on disconnect is best effort; it must not delay closing.
+const SHUTDOWN_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Debug, PartialEq, Eq)]
+enum Interrupted {
+    /// The user disconnected (or the session handle is gone).
+    Cancelled,
+    TimedOut,
+}
+
+/// Runs `fut`, giving up when the user disconnects or `limit` passes. A future that is ready
+/// wins, so an ordinary write still goes out after Disconnect was requested.
+async fn bounded<T>(
+    cancel: &mut watch::Receiver<bool>,
+    limit: Duration,
+    fut: impl Future<Output = T>,
+) -> Result<T, Interrupted> {
+    tokio::select! {
+        biased;
+        v = fut => Ok(v),
+        () = cancelled(cancel) => Err(Interrupted::Cancelled),
+        () = tokio::time::sleep(limit) => Err(Interrupted::TimedOut),
+    }
+}
+
+async fn cancelled(cancel: &mut watch::Receiver<bool>) {
+    // An error means the session handle was dropped, which is a disconnect as well.
+    let _ = cancel.wait_for(|stop| *stop).await;
+}
+
+/// Lets a message through at most once per interval; used where a hostile server could
+/// otherwise make Bastion log on every packet.
+struct LogGate {
+    last: Mutex<Option<std::time::Instant>>,
+    suppressed: std::sync::atomic::AtomicU64,
+}
+
+impl LogGate {
+    const INTERVAL: Duration = Duration::from_secs(10);
+
+    const fn new() -> Self {
+        Self { last: Mutex::new(None), suppressed: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    /// `Some(events since the last message, this one included)` when a message may be logged.
+    fn pass(&self) -> Option<u64> {
+        let seen = self.suppressed.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        let now = std::time::Instant::now();
+        if last.is_some_and(|t| now.duration_since(t) < Self::INTERVAL) {
+            return None;
+        }
+        *last = Some(now);
+        self.suppressed.fetch_sub(seen, Ordering::Relaxed);
+        Some(seen)
+    }
+}
+
+/// Zeroes a password copy that had to be a plain `String` for an IronRDP API.
+fn wipe(s: &mut String) {
+    drop(Secret::new(std::mem::take(s)));
+}
+
+/// The gateway connection target, whose password copy is wiped when it goes out of scope
+/// (also when connecting is cancelled half-way). Deliberately not `Debug`.
+struct GwTarget(ironrdp_mstsgu::GwConnectTarget);
+
+impl Drop for GwTarget {
+    fn drop(&mut self) {
+        wipe(&mut self.0.gw_pass);
+    }
+}
+
 async fn run(ctx: EngineCtx, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
     let p = &ctx.params.profile;
     info!(host = %p.host, port = p.port, gateway = p.gateway.as_ref().map(|g| g.host.as_str()), "Starting session");
@@ -271,6 +415,7 @@ async fn run(ctx: EngineCtx, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
         None
     };
     let cliprdr_factory = clipboard.as_ref().map(|c| c.backend_factory());
+    let clip_flow = clipboard.as_ref().map(|c| c.flow_control());
 
     let mut layout = ctx.params.layout.normalized();
     let mut cookie: Option<ServerAutoReconnect> = None;
@@ -289,6 +434,10 @@ async fn run(ctx: EngineCtx, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
         }
 
         let result = connect(&ctx, &layout, cliprdr_factory.as_deref(), cookie.clone(), &mut cmd_rx).await;
+        if result.is_err() {
+            // Nothing may keep a failed connection's socket open (e.g. during a certificate prompt).
+            ctx.link.clear_connection();
+        }
         let (conn, framed, mic_rx) = match result {
             Ok(v) => v,
             Err(ConnectFailure::Cancelled) => break ("Disconnected.".to_owned(), false),
@@ -318,11 +467,17 @@ async fn run(ctx: EngineCtx, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
         };
 
         ever_connected = true;
-        attempt = 0;
-        match active_session(&ctx, conn, framed, &mut cmd_rx, mic_rx, &mut cookie, &layout).await {
+        let session_started = std::time::Instant::now();
+        let end =
+            active_session(&ctx, conn, framed, &mut cmd_rx, mic_rx, &mut cookie, &layout, clip_flow.as_ref()).await;
+        // The latency probe holds a duplicate of the socket; drop it so the connection really
+        // closes now, not when the UI lets go of the session.
+        ctx.link.clear_connection();
+        match end {
             SessionEnd::ReconnectWithLayout(new) => {
                 info!("Reconnecting to apply new desktop size");
                 layout = new;
+                attempt = 0;
                 cookie = cookie.take();
             }
             SessionEnd::UserClosed => break ("Disconnected.".to_owned(), false),
@@ -334,8 +489,18 @@ async fn run(ctx: EngineCtx, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
                 if max_attempts == 0 {
                     break (format!("Connection lost: {msg}"), true);
                 }
-                warn!(%msg, "Connection lost; will auto-reconnect");
-                attempt = 1;
+                // `attempt` is not reset by a successful connect: only a session that stayed up
+                // starts the count again, so accept-then-drop cycles run out of attempts too.
+                attempt = attempt_after_drop(attempt, session_started.elapsed());
+                if attempt > max_attempts {
+                    break (
+                        format!(
+                            "Connection lost: {msg}. It kept dropping right after reconnecting, so Bastion stopped trying."
+                        ),
+                        true,
+                    );
+                }
+                warn!(%msg, attempt, "Connection lost; will auto-reconnect");
             }
         }
     };
@@ -373,7 +538,134 @@ trait AsyncReadWrite: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Sync + Unpin> AsyncReadWrite for T {}
 type Erased = Box<dyn AsyncReadWrite>;
 type Framed = ironrdp_tokio::TokioFramed<Erased>;
-type MicRx = mpsc::UnboundedReceiver<(u32, Vec<SvcMessage>)>;
+
+/// Packets queued for the microphone uplink before new ones are dropped. Capture threads keep
+/// producing when the session loop cannot write (slow link, or a server that stopped reading);
+/// a packet is at most 192 kB, typically 10–20 ms of audio.
+const MIC_UPLINK_CAPACITY: usize = 64;
+
+type UplinkItem = (u32, Vec<SvcMessage>);
+
+/// Data produced on other threads for the session loop to send: microphone packets (bounded
+/// here) and camera samples (bounded by the server's sample requests).
+struct MicRx {
+    mic: mpsc::Receiver<UplinkItem>,
+    camera: mpsc::UnboundedReceiver<UplinkItem>,
+}
+
+impl MicRx {
+    async fn recv(&mut self) -> Option<UplinkItem> {
+        tokio::select! {
+            Some(m) = self.mic.recv() => Some(m),
+            Some(m) = self.camera.recv() => Some(m),
+            else => None,
+        }
+    }
+}
+
+struct UplinkTx {
+    mic: mpsc::Sender<UplinkItem>,
+    camera: mpsc::UnboundedSender<UplinkItem>,
+}
+
+fn uplink() -> (UplinkTx, MicRx) {
+    let (mic_tx, mic_rx) = mpsc::channel(MIC_UPLINK_CAPACITY);
+    let (cam_tx, cam_rx) = mpsc::unbounded_channel();
+    (UplinkTx { mic: mic_tx, camera: cam_tx }, MicRx { mic: mic_rx, camera: cam_rx })
+}
+
+static MIC_DROP_LOG: LogGate = LogGate::new();
+static MIC_BUSY_LOG: LogGate = LogGate::new();
+
+/// The microphone's way into the session loop: never blocks the capture thread and never
+/// queues more than [`MIC_UPLINK_CAPACITY`] packets — the newest is dropped instead.
+fn mic_uplink(tx: mpsc::Sender<UplinkItem>) -> ironrdp_rdpeai::client::DvcUplink {
+    use mpsc::error::TrySendError;
+    Box::new(move |id, msgs| match tx.try_send((id, msgs)) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => {
+            if let Some(dropped) = MIC_DROP_LOG.pass() {
+                warn!(dropped, "Microphone audio dropped: the connection is not keeping up");
+            }
+            Ok(())
+        }
+        Err(TrySendError::Closed(_)) => Err(ironrdp_pdu::pdu_other_err!("microphone uplink closed")),
+    })
+}
+
+/// Lets only one AUDIO_INPUT channel of a session record at a time.
+///
+/// The server may open the channel any number of times, and every open one would otherwise
+/// start its own capture thread and sound-server connection.
+struct SingleCapture<H> {
+    inner: H,
+    /// Shared by all of the session's channel instances: true while one of them records.
+    busy: Arc<AtomicBool>,
+    holding: bool,
+}
+
+impl<H> SingleCapture<H> {
+    fn new(inner: H, busy: Arc<AtomicBool>) -> Self {
+        Self { inner, busy, holding: false }
+    }
+
+    fn release(&mut self) {
+        if std::mem::take(&mut self.holding) {
+            self.busy.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl<H> Drop for SingleCapture<H> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl<H: ironrdp_rdpeai::client::RdpeaiCaptureHandler> ironrdp_rdpeai::client::RdpeaiCaptureHandler
+    for SingleCapture<H>
+{
+    fn supported_formats(&self) -> &[ironrdp_rdpeai::AudioFormat] {
+        self.inner.supported_formats()
+    }
+
+    fn choose_formats(&self, server_formats: &[ironrdp_rdpeai::AudioFormat]) -> Vec<ironrdp_rdpeai::AudioFormat> {
+        self.inner.choose_formats(server_formats)
+    }
+
+    fn open(
+        &mut self,
+        capture_format: &ironrdp_rdpeai::AudioFormat,
+        encode_format: &ironrdp_rdpeai::AudioFormat,
+        packet_size: usize,
+        sink: ironrdp_rdpeai::client::AudioPacketSink,
+    ) -> i32 {
+        use ironrdp_rdpeai::pdu::OpenReplyPdu;
+        if !self.holding {
+            if self.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                if let Some(refused) = MIC_BUSY_LOG.pass() {
+                    warn!(refused, "Refused a second microphone stream for the same session");
+                }
+                return OpenReplyPdu::E_FAIL;
+            }
+            self.holding = true;
+        }
+        let result = self.inner.open(capture_format, encode_format, packet_size, sink);
+        if result != OpenReplyPdu::S_OK {
+            self.release();
+        }
+        result
+    }
+
+    fn set_format(&mut self, encode_format: &ironrdp_rdpeai::AudioFormat, packet_size: usize) -> bool {
+        self.inner.set_format(encode_format, packet_size)
+    }
+
+    fn close(&mut self) {
+        self.inner.close();
+        self.release();
+    }
+}
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -491,26 +783,30 @@ async fn connect_inner(
             };
             (user, ctx.params.gateway_password.as_ref().map(|s| s.expose().to_owned()).unwrap_or_default())
         };
-        let target = ironrdp_mstsgu::GwConnectTarget {
+        // IronRDP wants the password as a plain `String` (and keeps its own copies for the
+        // tunnel's lifetime); ours is wiped as soon as this function is done with it.
+        let target = GwTarget(ironrdp_mstsgu::GwConnectTarget {
             gw_endpoint: endpoint.clone(),
             gw_user,
             gw_pass,
             smart_card: None,
             server: p.host.trim().to_owned(),
-        };
+        });
         let (validation, callback) = if insecure {
             (ironrdp_tls::CertificateValidation::DangerouslyAcceptInvalidCertificate, None)
         } else {
             (ironrdp_tls::CertificateValidation::Strict, Some(verifier.gateway_callback()))
         };
         let gw = ironrdp_mstsgu::GwClient::connect_with_port_and_certificate_validation(
-            &target,
+            &target.0,
             &ctx.params.client_name,
             p.port,
             validation,
             callback,
         );
-        let (client, addr) = match tokio::time::timeout(CONNECT_TIMEOUT, gw).await {
+        let connected = tokio::time::timeout(CONNECT_TIMEOUT, gw).await;
+        drop(target);
+        let (client, addr) = match connected {
             Err(_) => {
                 return Err(ConnectFailure::Error {
                     message: format!("Timed out reaching gateway {endpoint}."),
@@ -591,8 +887,8 @@ async fn connect_inner(
     phases.transport = started.elapsed();
     // 2. RDP negotiation, TLS (with our verifier), CredSSP/NLA, capability exchange.
     ctx.emit(Event::Status(Status::Connecting));
-    let (mic_tx, mic_rx) = mpsc::unbounded_channel();
-    let mut connector = build_connector(ctx, layout, client_addr, cliprdr, mic_tx);
+    let (uplink_tx, mic_rx) = uplink();
+    let mut connector = build_connector(ctx, layout, client_addr, cliprdr, uplink_tx);
     if let Some(c) = cookie {
         connector = connector.with_auto_reconnect_cookie(c);
     }
@@ -605,6 +901,14 @@ async fn connect_inner(
     let t = std::time::Instant::now();
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await.map_err(err)?;
     phases.negotiate = t.elapsed();
+    // Before TLS and long before any credentials: NLA or nothing.
+    let nla_required = || {
+        error!("Security negotiation ended without Network Level Authentication; refusing to send credentials");
+        ConnectFailure::Error { message: NLA_REQUIRED.into(), retryable: false }
+    };
+    if !nla_selected(&connector.state) {
+        return Err(nla_required());
+    }
     let (stream, leftover) = framed.into_inner();
     if !leftover.is_empty() {
         return Err(ConnectFailure::Error {
@@ -626,6 +930,10 @@ async fn connect_inner(
         .map_err(|e| cert_failure(&rejected, format!("TLS handshake with the remote computer failed: {e}")))?;
     phases.tls = t.elapsed();
     let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+    if !connector.should_perform_credssp() {
+        // Second line of defence: the connector itself must be about to run CredSSP.
+        return Err(nla_required());
+    }
     let mut framed: Framed = ironrdp_tokio::TokioFramed::new(Box::new(tls) as Erased);
 
     ctx.emit(Event::Status(Status::Authenticating));
@@ -719,7 +1027,7 @@ fn build_connector(
     layout: &DesktopLayout,
     client_addr: SocketAddr,
     cliprdr: Option<&(dyn CliprdrBackendFactory + Send)>,
-    mic_tx: mpsc::UnboundedSender<(u32, Vec<SvcMessage>)>,
+    uplink: UplinkTx,
 ) -> ClientConnector {
     let p = &ctx.params.profile;
     let primary = layout.primary();
@@ -757,7 +1065,7 @@ fn build_connector(
     // Microphone and camera both push data produced on their own threads through this uplink.
     if p.camera.enabled {
         let host = ctx.params.camera_host.clone().unwrap_or_else(bastion_camera::default_host);
-        let tx = mic_tx.clone();
+        let tx = uplink.camera;
         let uplink: bastion_camera::SampleUplink = Arc::new(move |id, msgs| {
             tx.send((id, msgs)).map_err(|_| ironrdp_pdu::pdu_other_err!("camera uplink closed"))
         });
@@ -775,13 +1083,15 @@ fn build_connector(
     if p.audio.microphone {
         let opts = bastion_audio::CaptureOptions { device: p.audio.input_device.clone() };
         let mic_host = audio_host.clone();
+        let mic_tx = uplink.mic;
+        let recording = Arc::new(AtomicBool::new(false));
         drdynvc = drdynvc.with_dynamic_channel_factory(ironrdp_rdpeai::CHANNEL_NAME, move || {
-            let tx = mic_tx.clone();
             ironrdp_rdpeai::client::RdpeaiClient::new(
-                Box::new(bastion_audio::PulseCapture::with_host(mic_host.clone(), opts.clone())),
-                Box::new(move |id, msgs| {
-                    tx.send((id, msgs)).map_err(|_| ironrdp_pdu::pdu_other_err!("microphone uplink closed"))
-                }),
+                Box::new(SingleCapture::new(
+                    bastion_audio::PulseCapture::with_host(mic_host.clone(), opts.clone()),
+                    recording.clone(),
+                )),
+                mic_uplink(mic_tx.clone()),
             )
         });
     }
@@ -896,7 +1206,16 @@ fn drive_channel(p: &Profile, client_name: &str) -> anyhow::Result<ironrdp_rdpdr
         .with_drives(Some(drives.into_iter().map(|d| d.into_parts()).collect())))
 }
 
-/// Copies the changed rectangle from the decoder image into the shared framebuffer.
+/// Shown (after "Connection lost:") when a write could not complete in [`WRITE_TIMEOUT`].
+const WRITE_STALLED: &str = "the remote computer stopped accepting data";
+
+/// The user-facing text for a session-level protocol error. IronRDP's detailed form contains
+/// source file paths, so it goes to the log only.
+fn protocol_error(e: &ironrdp_session::SessionError) -> String {
+    error!(error = %format!("{e:#}"), "Protocol error");
+    "The remote computer sent data Bastion could not understand. See the log for details.".to_owned()
+}
+
 type Writer = ironrdp_tokio::TokioFramed<tokio::io::WriteHalf<Erased>>;
 
 /// Aborts a spawned task when the session loop exits (on any path).
@@ -916,6 +1235,8 @@ struct InputTask {
     link: Arc<crate::link::LinkStats>,
     /// Copies of the written input for keep-active (only when it is enabled).
     seen: Option<mpsc::UnboundedSender<InputEvents>>,
+    /// Tells the session loop that a write timed out (the stream is then unusable).
+    stalled: Arc<tokio::sync::Notify>,
 }
 
 /// Writes user input to the socket as soon as it arrives.
@@ -957,10 +1278,19 @@ async fn input_task(t: InputTask) {
             continue;
         }
         let started = std::time::Instant::now();
-        if let Err(e) = t.writer.lock().await.write_all(&bytes).await {
-            // The session loop notices the broken connection on its next read.
-            debug!(error = %e, "Input write failed");
-            return;
+        let write = async { t.writer.lock().await.write_all(&bytes).await };
+        match tokio::time::timeout(WRITE_TIMEOUT, write).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                // The session loop notices the broken connection on its next read.
+                debug!(error = %e, "Input write failed");
+                return;
+            }
+            Err(_) => {
+                // The remote computer stopped reading; a half-written frame cannot be recovered.
+                t.stalled.notify_one();
+                return;
+            }
         }
         bastion_metrics::NET_WRITE.since(started);
         bastion_metrics::NET_TX.add(bytes.len() as u64);
@@ -1027,6 +1357,7 @@ fn publish(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // per-connection state the loop owns or borrows
 async fn active_session(
     ctx: &EngineCtx,
     conn: ConnectionResult,
@@ -1035,6 +1366,7 @@ async fn active_session(
     mic_rx: Option<MicRx>,
     cookie: &mut Option<ServerAutoReconnect>,
     layout: &DesktopLayout,
+    clip_flow: Option<&bastion_clipboard::FlowControl>,
 ) -> SessionEnd {
     let (mut reader, writer) = split_tokio_framed(framed);
     // Shared with the input task; each write holds the lock only for that write.
@@ -1042,6 +1374,11 @@ async fn active_session(
     let input_paused = Arc::new(AtomicBool::new(false));
     let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<InputEvents>();
     let size = conn.desktop_size;
+    if let Err(message) = check_desktop_size(size.width, size.height) {
+        return SessionEnd::Fatal(message);
+    }
+    let mut cancel = ctx.cancel.clone();
+    let write_stalled = Arc::new(tokio::sync::Notify::new());
     let mut image = DecodedImage::new(PixelFormat::RgbA32, size.width, size.height);
     let activation = conn.activation_factory;
     let (refresh_rect, suppress_output) = (conn.refresh_rect_support, conn.suppress_output_support);
@@ -1072,6 +1409,7 @@ async fn active_session(
         paused: input_paused.clone(),
         link: ctx.link.clone(),
         seen: keep_active.is_some().then_some(seen_tx),
+        stalled: write_stalled.clone(),
     })));
     // Only polled when keep-active is enabled; the far-future fallback is never reached.
     let idle_deadline = |k: &Option<KeepActive>| {
@@ -1083,8 +1421,13 @@ async fn active_session(
             let bytes: Vec<u8> = $bytes;
             if !bytes.is_empty() {
                 let started = std::time::Instant::now();
-                if let Err(e) = writer.lock().await.write_all(&bytes).await {
-                    return SessionEnd::NetworkError(format!("write failed: {e}"));
+                let write = async { writer.lock().await.write_all(&bytes).await };
+                match bounded(&mut cancel, WRITE_TIMEOUT, write).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return SessionEnd::NetworkError(format!("write failed: {e}")),
+                    // Disconnect wins over a write the remote computer is not accepting.
+                    Err(Interrupted::Cancelled) => return SessionEnd::UserClosed,
+                    Err(Interrupted::TimedOut) => return SessionEnd::NetworkError(WRITE_STALLED.into()),
                 }
                 bastion_metrics::NET_WRITE.since(started);
                 bastion_metrics::NET_TX.add(bytes.len() as u64);
@@ -1096,7 +1439,7 @@ async fn active_session(
         ($e:expr) => {
             match $e {
                 Ok(v) => v,
-                Err(e) => return SessionEnd::Fatal(format!("Protocol error: {e:#}")),
+                Err(e) => return SessionEnd::Fatal(protocol_error(&e)),
             }
         };
     }
@@ -1116,6 +1459,7 @@ async fn active_session(
                 bastion_metrics::RDP_PROCESS.since(started);
                 out
             }
+            () = write_stalled.notified() => return SessionEnd::NetworkError(WRITE_STALLED.into()),
             Some((_, msgs)) = async { match mic_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {
                 write_frame!(session_try!(stage.encode_dvc_messages(msgs)));
                 Vec::new()
@@ -1132,7 +1476,8 @@ async fn active_session(
                         let out = stage.graceful_shutdown().unwrap_or_default();
                         for o in out {
                             if let ActiveStageOutput::ResponseFrame(f) = o {
-                                let _ = writer.lock().await.write_all(&f).await;
+                                let goodbye = async { writer.lock().await.write_all(&f).await };
+                                let _ = tokio::time::timeout(SHUTDOWN_WRITE_TIMEOUT, goodbye).await;
                             }
                         }
                         return SessionEnd::UserClosed;
@@ -1162,6 +1507,9 @@ async fn active_session(
                         }
                     }
                     Command::Clipboard(msg) => {
+                        // Tells the clipboard worker when this response has really left for the
+                        // socket (or was dropped), so it bounds what it queues behind a slow link.
+                        let _sent = clip_flow.map(|f| f.track(&msg));
                         let Some(c) = stage.get_svc_processor_mut::<CliprdrClient>() else { continue };
                         let msgs = match msg {
                             ClipboardMessage::SendInitiateCopy(f) => c.initiate_copy(&f),
@@ -1252,10 +1600,20 @@ async fn active_session(
                     input_paused.store(true, Ordering::Release);
                     let mut seq = activation.create();
                     let mut buf = WriteBuf::new();
+                    // The server decides how long this takes; Disconnect and a deadline bound it.
+                    let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
                     loop {
-                        let written = match single_sequence_step_read(&mut reader, &mut seq, &mut buf).await {
-                            Ok(w) => w,
-                            Err(e) => return SessionEnd::NetworkError(format!("reactivation: {e}")),
+                        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        let step = single_sequence_step_read(&mut reader, &mut seq, &mut buf);
+                        let written = match bounded(&mut cancel, left, step).await {
+                            Ok(Ok(w)) => w,
+                            Ok(Err(e)) => return SessionEnd::NetworkError(format!("reactivation: {e}")),
+                            Err(Interrupted::Cancelled) => return SessionEnd::UserClosed,
+                            Err(Interrupted::TimedOut) => {
+                                return SessionEnd::NetworkError(
+                                    "the remote computer did not finish re-activating the session".into(),
+                                );
+                            }
                         };
                         if written.size().is_some() {
                             write_frame!(buf.filled().to_vec());
@@ -1268,6 +1626,9 @@ async fn active_session(
                             ..
                         } = seq.connection_activation_state()
                         {
+                            if let Err(message) = check_desktop_size(desktop_size.width, desktop_size.height) {
+                                return SessionEnd::Fatal(message);
+                            }
                             image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
                             stage.reactivate(
                                 seq.io_channel_id(),
@@ -1306,5 +1667,265 @@ async fn active_session(
                 other => debug!(output = ?std::mem::discriminant(&other), "Unhandled session output"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ironrdp_pdu::nego::SecurityProtocol;
+    use ironrdp_rdpeai::client::RdpeaiCaptureHandler;
+    use ironrdp_rdpeai::pdu::OpenReplyPdu;
+    use ironrdp_rdpeai::{AudioFormat, WaveFormat};
+
+    use super::*;
+
+    #[test]
+    fn server_chosen_desktop_sizes_are_bounded() {
+        assert!(check_desktop_size(1920, 1080).is_ok());
+        assert!(check_desktop_size(1, 1).is_ok());
+        assert!(check_desktop_size(MAX_DESKTOP_SIDE, MAX_DESKTOP_SIDE).is_ok());
+        for (w, h) in [(0, 0), (0, 600), (800, 0), (65535, 1), (1, 65535), (65535, 65535), (8193, 1080), (1920, 8193)] {
+            let message = check_desktop_size(w, h).expect_err("must be refused");
+            assert!(message.contains("unsupported desktop size"), "{message}");
+        }
+    }
+
+    #[test]
+    fn only_a_negotiation_that_selected_credssp_counts_as_nla() {
+        let selected =
+            |selected_protocol: SecurityProtocol| ClientConnectorState::EnhancedSecurityUpgrade { selected_protocol };
+        assert!(nla_selected(&selected(SecurityProtocol::HYBRID)));
+        assert!(nla_selected(&selected(SecurityProtocol::HYBRID_EX)));
+        assert!(nla_selected(&selected(SecurityProtocol::SSL | SecurityProtocol::HYBRID)));
+        // The downgrade: TLS only, standard RDP security, or anything else without CredSSP.
+        assert!(!nla_selected(&selected(SecurityProtocol::SSL)));
+        assert!(!nla_selected(&selected(SecurityProtocol::empty())));
+        assert!(!nla_selected(&selected(SecurityProtocol::RDSAAD)));
+        // Any other connector state is not a completed negotiation.
+        assert!(!nla_selected(&ClientConnectorState::Consumed));
+        assert!(!nla_selected(&ClientConnectorState::BasicSettingsExchangeSendInitial {
+            selected_protocol: SecurityProtocol::HYBRID
+        }));
+        assert!(!NLA_REQUIRED.contains(".rs"), "{NLA_REQUIRED}");
+    }
+
+    #[test]
+    fn short_lived_sessions_use_up_reconnect_attempts() {
+        // A server that accepts and then drops: every cycle is one more attempt.
+        let mut attempt = 0;
+        for expected in 1..=5 {
+            attempt = attempt_after_drop(attempt, Duration::from_millis(300));
+            assert_eq!(attempt, expected);
+        }
+        assert_eq!(attempt_after_drop(19, STABLE_SESSION - Duration::from_millis(1)), 20);
+        assert_eq!(attempt_after_drop(u32::MAX, Duration::ZERO), u32::MAX);
+        // A session that really worked starts the count again.
+        assert_eq!(attempt_after_drop(19, STABLE_SESSION), 1);
+        assert_eq!(attempt_after_drop(0, Duration::from_secs(3600)), 1);
+    }
+
+    /// A session writer whose peer never reads (and has a 16-byte receive buffer).
+    fn stuck_writer() -> (tokio::sync::Mutex<Writer>, tokio::io::DuplexStream) {
+        let (ours, theirs) = tokio::io::duplex(16);
+        let framed: Framed = ironrdp_tokio::TokioFramed::new(Box::new(ours) as Erased);
+        let (_reader, writer) = split_tokio_framed(framed);
+        (tokio::sync::Mutex::new(writer), theirs)
+    }
+
+    #[tokio::test]
+    async fn disconnect_interrupts_a_write_the_peer_is_not_reading() {
+        let (writer, _peer) = stuck_writer();
+        let (cancel_tx, mut cancel) = watch::channel(false);
+        let bytes = vec![0u8; 4096];
+        let started = std::time::Instant::now();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = cancel_tx.send(true);
+        });
+        let write = async { writer.lock().await.write_all(&bytes).await };
+        let result = bounded(&mut cancel, Duration::from_secs(60), write).await;
+        assert_eq!(result.map(|r| r.is_ok()), Err(Interrupted::Cancelled));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn dropping_the_session_handle_counts_as_disconnect() {
+        let (writer, _peer) = stuck_writer();
+        let (cancel_tx, mut cancel) = watch::channel(false);
+        drop(cancel_tx);
+        let bytes = vec![0u8; 4096];
+        let write = async { writer.lock().await.write_all(&bytes).await };
+        let result = bounded(&mut cancel, Duration::from_secs(60), write).await;
+        assert_eq!(result.map(|r| r.is_ok()), Err(Interrupted::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn a_stuck_write_times_out() {
+        let (writer, _peer) = stuck_writer();
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let bytes = vec![0u8; 4096];
+        let write = async { writer.lock().await.write_all(&bytes).await };
+        let result = bounded(&mut cancel, Duration::from_millis(50), write).await;
+        assert_eq!(result.map(|r| r.is_ok()), Err(Interrupted::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn a_write_that_can_complete_still_goes_out_after_disconnect() {
+        // The goodbye and anything already queued must not be lost just because the flag is set.
+        let (ours, mut theirs) = tokio::io::duplex(1024);
+        let framed: Framed = ironrdp_tokio::TokioFramed::new(Box::new(ours) as Erased);
+        let (_reader, writer) = split_tokio_framed(framed);
+        let writer = tokio::sync::Mutex::new(writer);
+        let (cancel_tx, mut cancel) = watch::channel(false);
+        cancel_tx.send(true).unwrap();
+        let write = async { writer.lock().await.write_all(b"hello").await };
+        assert!(matches!(bounded(&mut cancel, Duration::from_secs(60), write).await, Ok(Ok(()))));
+        let mut got = [0u8; 5];
+        tokio::io::AsyncReadExt::read_exact(&mut theirs, &mut got).await.unwrap();
+        assert_eq!(&got, b"hello");
+    }
+
+    #[test]
+    fn microphone_uplink_drops_packets_instead_of_growing() {
+        let (tx, mut rx) = uplink();
+        let mut send = mic_uplink(tx.mic.clone());
+        // Nothing drains the queue (the session loop is stuck): ten times its capacity arrives.
+        for _ in 0..MIC_UPLINK_CAPACITY * 10 {
+            send(7, Vec::new()).expect("a full queue is not an error for the capture thread");
+        }
+        let mut queued = 0;
+        while rx.mic.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, MIC_UPLINK_CAPACITY);
+        // Drained again: packets flow again.
+        send(7, Vec::new()).unwrap();
+        assert!(rx.mic.try_recv().is_ok());
+        // Once the session is gone the capture side is told to stop.
+        drop(rx);
+        assert!(send(7, Vec::new()).is_err());
+    }
+
+    #[tokio::test]
+    async fn uplink_delivers_microphone_and_camera_data() {
+        let (tx, mut rx) = uplink();
+        mic_uplink(tx.mic.clone())(1, Vec::new()).unwrap();
+        tx.camera.send((2, Vec::new())).unwrap();
+        let mut ids = vec![rx.recv().await.unwrap().0, rx.recv().await.unwrap().0];
+        ids.sort_unstable();
+        assert_eq!(ids, [1, 2]);
+        drop(tx);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[derive(Default)]
+    struct FakeCapture {
+        opens: Arc<Mutex<u32>>,
+        fail: bool,
+    }
+
+    impl RdpeaiCaptureHandler for FakeCapture {
+        fn supported_formats(&self) -> &[AudioFormat] {
+            &[]
+        }
+        fn open(
+            &mut self,
+            _: &AudioFormat,
+            _: &AudioFormat,
+            _: usize,
+            _: ironrdp_rdpeai::client::AudioPacketSink,
+        ) -> i32 {
+            *self.opens.lock().unwrap() += 1;
+            if self.fail { OpenReplyPdu::E_FAIL } else { OpenReplyPdu::S_OK }
+        }
+        fn set_format(&mut self, _: &AudioFormat, _: usize) -> bool {
+            true
+        }
+        fn close(&mut self) {}
+    }
+
+    fn pcm() -> AudioFormat {
+        AudioFormat {
+            format: WaveFormat::PCM,
+            n_channels: 2,
+            n_samples_per_sec: 44_100,
+            n_avg_bytes_per_sec: 176_400,
+            n_block_align: 4,
+            bits_per_sample: 16,
+            data: None,
+        }
+    }
+
+    fn open(c: &mut SingleCapture<FakeCapture>) -> i32 {
+        c.open(&pcm(), &pcm(), 4096, Box::new(|_| {}))
+    }
+
+    #[test]
+    fn only_one_audio_input_channel_records_at_a_time() {
+        let busy = Arc::new(AtomicBool::new(false));
+        let opens = Arc::new(Mutex::new(0));
+        let instance = || SingleCapture::new(FakeCapture { opens: opens.clone(), fail: false }, busy.clone());
+        let mut first = instance();
+        let mut others: Vec<_> = (0..300).map(|_| instance()).collect();
+
+        assert_eq!(open(&mut first), OpenReplyPdu::S_OK);
+        // A server opening hundreds of channels gets one capture stream, not hundreds.
+        for other in &mut others {
+            assert_eq!(open(other), OpenReplyPdu::E_FAIL);
+        }
+        assert_eq!(*opens.lock().unwrap(), 1, "refused channels must not reach the capture device");
+        // Re-opening the recording channel itself is still allowed.
+        assert_eq!(open(&mut first), OpenReplyPdu::S_OK);
+
+        // Closing a refused channel must not free the slot it never held.
+        others[0].close();
+        assert_eq!(open(&mut others[1]), OpenReplyPdu::E_FAIL);
+
+        first.close();
+        assert_eq!(open(&mut others[1]), OpenReplyPdu::S_OK);
+        // A channel that goes away while recording (Windows reopens channels at logon) frees it too.
+        drop(others);
+        assert_eq!(open(&mut first), OpenReplyPdu::S_OK);
+    }
+
+    #[test]
+    fn a_failed_open_does_not_block_the_microphone() {
+        let busy = Arc::new(AtomicBool::new(false));
+        let mut broken = SingleCapture::new(FakeCapture { fail: true, ..Default::default() }, busy.clone());
+        assert_eq!(open(&mut broken), OpenReplyPdu::E_FAIL);
+        let mut working = SingleCapture::new(FakeCapture::default(), busy);
+        assert_eq!(open(&mut working), OpenReplyPdu::S_OK);
+    }
+
+    #[test]
+    fn protocol_errors_shown_to_the_user_have_no_source_paths() {
+        use ironrdp_session::SessionErrorExt as _;
+        let e = ironrdp_session::SessionError::reason("fast-path", "bad update");
+        // What the old message was built from does contain this file's path.
+        assert!(format!("{e:#}").contains(".rs:"), "test premise: {e:#}");
+        let shown = protocol_error(&e);
+        assert!(!shown.contains(".rs") && !shown.contains('/') && !shown.contains("fast-path"), "{shown}");
+        assert!(shown.contains("See the log"), "{shown}");
+        assert!(!WRITE_STALLED.contains('/'));
+    }
+
+    #[test]
+    fn the_gateway_password_copy_is_emptied_when_wiped() {
+        let mut copy = String::from("hunter2");
+        wipe(&mut copy);
+        assert!(copy.is_empty());
+        assert_eq!(copy.capacity(), 0, "the buffer must have been handed to the zeroizing container");
+    }
+
+    #[test]
+    fn log_gate_lets_one_message_through_per_interval() {
+        let gate = LogGate::new();
+        assert_eq!(gate.pass(), Some(1));
+        for _ in 0..1000 {
+            assert_eq!(gate.pass(), None);
+        }
+        // Pretend the interval has passed: the next message reports what was suppressed.
+        *gate.last.lock().unwrap() = std::time::Instant::now().checked_sub(LogGate::INTERVAL);
+        assert_eq!(gate.pass(), Some(1001));
     }
 }

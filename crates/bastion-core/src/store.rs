@@ -1,12 +1,12 @@
 //! Persistent profile storage (`profiles.toml`) and app-wide settings.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::paths::{AppPaths, write_private_atomic};
+use crate::paths::{AppPaths, lock_exclusive, write_private_atomic};
 use crate::profile::Profile;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -16,23 +16,44 @@ struct ProfilesFile {
 }
 
 /// In-memory list of profiles backed by a TOML file.
+///
+/// Several Bastion processes can run at once, so changes are never written from this copy:
+/// each one is applied to a fresh read of the file under an exclusive lock, which keeps what
+/// other processes saved or deleted in the meantime.
 #[derive(Debug)]
 pub struct ProfileStore {
     path: PathBuf,
     profiles: Vec<Profile>,
 }
 
+/// A missing file is an empty list; an unreadable or malformed one is an error.
+fn read_profiles(path: &Path) -> Result<Vec<Profile>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let file: ProfilesFile = toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+            Ok(file.profiles)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn upsert_into(profiles: &mut Vec<Profile>, profile: &Profile) {
+    match profiles.iter_mut().find(|p| p.id == profile.id) {
+        Some(existing) => *existing = profile.clone(),
+        None => profiles.push(profile.clone()),
+    }
+}
+
+fn remove_from(profiles: &mut Vec<Profile>, id: Uuid) -> Option<Profile> {
+    let idx = profiles.iter().position(|p| p.id == id)?;
+    Some(profiles.remove(idx))
+}
+
 impl ProfileStore {
     pub fn load(paths: &AppPaths) -> Result<Self> {
         let path = paths.profiles_file();
-        let profiles = match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                let file: ProfilesFile = toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-                file.profiles
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-        };
+        let profiles = read_profiles(&path)?;
         Ok(Self { path, profiles })
     }
 
@@ -44,26 +65,47 @@ impl ProfileStore {
         self.profiles.iter().find(|p| p.id == id)
     }
 
+    /// Picks up changes saved by another Bastion process.
+    pub fn reload(&mut self) -> Result<()> {
+        self.profiles = read_profiles(&self.path)?;
+        Ok(())
+    }
+
     /// Inserts or replaces (by id) and persists.
     pub fn upsert(&mut self, profile: Profile) -> Result<()> {
-        match self.profiles.iter_mut().find(|p| p.id == profile.id) {
-            Some(existing) => *existing = profile,
-            None => self.profiles.push(profile),
+        let saved = self.update_file(|profiles| upsert_into(profiles, &profile));
+        match saved {
+            Ok(((), profiles)) => {
+                self.profiles = profiles;
+                Ok(())
+            }
+            Err(e) => {
+                // Not saved; as before, this process still shows what the user entered.
+                upsert_into(&mut self.profiles, &profile);
+                Err(e)
+            }
         }
-        self.save()
     }
 
     pub fn remove(&mut self, id: Uuid) -> Result<Option<Profile>> {
-        let idx = self.profiles.iter().position(|p| p.id == id);
-        let removed = idx.map(|i| self.profiles.remove(i));
-        self.save()?;
-        Ok(removed)
+        let mine = remove_from(&mut self.profiles, id);
+        let (on_disk, profiles) = self.update_file(|profiles| remove_from(profiles, id))?;
+        self.profiles = profiles;
+        // Another process may have deleted it already; the caller still gets the profile it
+        // asked to remove (to clean up its keyring entries).
+        Ok(on_disk.or(mine))
     }
 
-    fn save(&self) -> Result<()> {
-        let file = ProfilesFile { profiles: self.profiles.clone() };
+    /// Applies one change on top of what is on disk *now* (not this process's possibly stale
+    /// copy) and writes it back, all under the lock shared with other Bastion processes.
+    fn update_file<T>(&self, change: impl FnOnce(&mut Vec<Profile>) -> T) -> Result<(T, Vec<Profile>)> {
+        let _lock = lock_exclusive(&self.path)?;
+        let mut profiles = read_profiles(&self.path)?;
+        let out = change(&mut profiles);
+        let file = ProfilesFile { profiles };
         let text = toml::to_string_pretty(&file)?;
-        write_private_atomic(&self.path, text.as_bytes())
+        write_private_atomic(&self.path, text.as_bytes())?;
+        Ok((out, file.profiles))
     }
 }
 
@@ -130,5 +172,67 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let mode = std::fs::metadata(paths.profiles_file()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn stale_process_does_not_undo_another_process_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted(dir.path());
+        let mut other = ProfileStore::load(&paths).unwrap();
+        let mut a = Profile { name: "A".into(), host: "a.example".into(), ..Default::default() };
+        a.security.allow_insecure_tls = true;
+        let deleted = Profile { name: "Gone".into(), host: "gone.example".into(), ..Default::default() };
+        other.upsert(a.clone()).unwrap();
+        other.upsert(deleted.clone()).unwrap();
+
+        // "Tray" instance with the old state.
+        let mut stale = ProfileStore::load(&paths).unwrap();
+
+        // Elsewhere: the insecure setting is switched off, one profile deleted, one added.
+        a.security.allow_insecure_tls = false;
+        other.upsert(a.clone()).unwrap();
+        other.remove(deleted.id).unwrap();
+        let added = Profile { name: "New".into(), host: "new.example".into(), ..Default::default() };
+        other.upsert(added.clone()).unwrap();
+
+        // The stale instance saves an unrelated profile.
+        let mine = Profile { name: "Mine".into(), host: "mine.example".into(), ..Default::default() };
+        stale.upsert(mine.clone()).unwrap();
+
+        let disk = ProfileStore::load(&paths).unwrap();
+        let names: Vec<&str> = disk.profiles().iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["A", "New", "Mine"]);
+        assert!(!disk.get(a.id).unwrap().security.allow_insecure_tls, "security setting must not be reverted");
+        // The stale instance now sees the same thing.
+        assert_eq!(stale.profiles(), disk.profiles());
+
+        // Removing from a stale instance keeps later additions, and removing something that is
+        // already gone on disk still hands back the profile.
+        let mut stale2 = ProfileStore::load(&paths).unwrap();
+        let late = Profile { name: "Late".into(), host: "late.example".into(), ..Default::default() };
+        other.upsert(late).unwrap();
+        other.remove(mine.id).unwrap();
+        assert_eq!(stale2.remove(mine.id).unwrap().map(|p| p.name), Some("Mine".to_owned()));
+        assert_eq!(stale2.remove(added.id).unwrap().map(|p| p.name), Some("New".to_owned()));
+        let disk = ProfileStore::load(&paths).unwrap();
+        let names: Vec<&str> = disk.profiles().iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["A", "Late"]);
+        assert_eq!(stale2.remove(Uuid::new_v4()).unwrap(), None);
+
+        other.reload().unwrap();
+        assert_eq!(other.profiles(), disk.profiles());
+    }
+
+    #[test]
+    fn malformed_file_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted(dir.path());
+        let mut store = ProfileStore::load(&paths).unwrap();
+        let p = Profile { name: "A".into(), host: "a.example".into(), ..Default::default() };
+        store.upsert(p.clone()).unwrap();
+        std::fs::write(paths.profiles_file(), "profile = 3").unwrap();
+        assert!(store.upsert(Profile { host: "b.example".into(), ..Default::default() }).is_err());
+        assert!(store.remove(p.id).is_err());
+        assert_eq!(std::fs::read_to_string(paths.profiles_file()).unwrap(), "profile = 3");
     }
 }

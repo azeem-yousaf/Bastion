@@ -9,7 +9,6 @@ use ironrdp_dvc::DvcEncode;
 use ironrdp_pdu::gcc::Monitor;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_pdu::{DecodeError, cast_length, ensure_size, read_padding, write_padding};
-use tracing::warn;
 
 use super::{Color, PixelFormat, Point};
 
@@ -199,7 +198,7 @@ impl<'de> Decode<'de> for GfxPdu {
         let cmdid = src.read_u16();
         let flags = src.read_u16(); /* flags */
         if flags != 0 {
-            warn!(?flags, "invalid GFX flag");
+            warn_throttled!(?flags, "invalid GFX flag");
         }
         let pdu_length = src.read_u32();
 

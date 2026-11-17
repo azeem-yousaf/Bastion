@@ -186,6 +186,8 @@ pub static RDP_PROCESS: Histogram = Histogram::new("rdp.process", 30);
 
 /// One graphics-pipeline message on the graphics thread (decode + composite into surfaces).
 pub static GFX_PROCESS: Histogram = Histogram::new("gfx.process", 30);
+/// Graphics-pipeline messages that failed (undecodable or out-of-protocol server data).
+pub static GFX_ERRORS: Counter = Counter::count("gfx.errors");
 /// `gfx.process` time of messages whose graphics used a single codec (the decoder's cost), so
 /// the slow one can be identified. `mixed` = several codecs in one PDU.
 pub static GFX_AVC420: Histogram = Histogram::new("gfx.avc420", 30);
@@ -261,12 +263,20 @@ pub static CAMERA_TX: Counter = Counter::bytes("camera.tx");
 /// Clipboard payload bytes transferred (both directions).
 pub static CLIPBOARD_BYTES: Counter = Counter::bytes("clipboard");
 
+/// Server audio/microphone requests refused (format or packet size out of bounds).
+pub static AUDIO_REJECTED: Counter = Counter::count("audio.rejected");
+/// Webcam frames dropped for being implausibly large.
+pub static CAMERA_DROPPED: Counter = Counter::count("camera.dropped_frames");
+/// Log lines withheld by rate limiting (their frequency is controlled by the remote server).
+pub static LOG_SUPPRESSED: Counter = Counter::count("log.suppressed");
+
 static COUNTERS: &[&Counter] = &[
     &NET_RX,
     &NET_TX,
     &NET_PDUS,
     &FRAME_UPDATES,
     &FRAME_PIXELS,
+    &GFX_ERRORS,
     &VIDEO_FRAMES,
     &VIDEO_HW_FALLBACKS,
     &INPUT_BATCHES,
@@ -284,6 +294,9 @@ static COUNTERS: &[&Counter] = &[
     &CAMERA_FRAMES,
     &CAMERA_TX,
     &CLIPBOARD_BYTES,
+    &AUDIO_REJECTED,
+    &CAMERA_DROPPED,
+    &LOG_SUPPRESSED,
 ];
 
 static HISTOGRAMS: &[&Histogram] = &[

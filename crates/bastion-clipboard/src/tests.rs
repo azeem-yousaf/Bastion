@@ -16,7 +16,8 @@ use ironrdp_cliprdr::pdu::{
 use ironrdp_cliprdr_native::data_control::find_mime_match;
 
 use crate::backend::{BackendFactory, file_capabilities};
-use crate::convert;
+use crate::convert::{self, MIME_BASTION_REMOTE, MIME_PASSWORD_HINT};
+use crate::flow::{FlowControl, MAX_QUEUED_REQUESTS, RESPONSE_BUDGET_BYTES};
 use crate::os::{OfferItem, OsClipboard, Transfer};
 use crate::uri;
 use crate::worker::{Command, Config, HTML_FORMAT_ID, Worker};
@@ -97,6 +98,7 @@ struct Harness {
     os: FakeOs,
     capture: Capture,
     base: tempfile::TempDir,
+    flow: FlowControl,
 }
 
 impl Harness {
@@ -108,10 +110,11 @@ impl Harness {
         let mut config = Config::new(files, max);
         config.download_base = Some(base.path().to_owned());
         config.paste_timeout = Duration::from_secs(5);
+        let flow = config.flow.clone();
         let worker = Worker::new(os.clone(), capture.clone(), config);
-        let factory = BackendFactory { commands: tx.clone(), files, max_transfer_bytes: max };
+        let factory = BackendFactory { commands: tx.clone(), files, max_transfer_bytes: max, flow: flow.shared() };
         let backend = factory.build_cliprdr_backend();
-        let mut h = Self { worker, tx, rx, backend, os, capture, base };
+        let mut h = Self { worker, tx, rx, backend, os, capture, base, flow };
         h.pump();
         h
     }
@@ -165,8 +168,9 @@ impl Harness {
         rx
     }
 
+    /// The content types of our local offer (without the marker every offer carries).
     fn offered_mimes(&self) -> Vec<String> {
-        self.os.state().offered.iter().map(|o| o.mime.clone()).collect()
+        self.os.state().offered.iter().map(|o| o.mime.clone()).filter(|m| m != MIME_BASTION_REMOTE).collect()
     }
 
     fn remote_copy(&mut self, formats: &[ClipboardFormat]) {
@@ -522,7 +526,8 @@ fn reconnect_resets_state() {
     let rx = h.paste("text/plain");
     h.take();
     // Engine reconnects: a new backend is built.
-    let factory = BackendFactory { commands: h.tx.clone(), files: false, max_transfer_bytes: 1 << 20 };
+    let factory =
+        BackendFactory { commands: h.tx.clone(), files: false, max_transfer_bytes: 1 << 20, flow: h.flow.shared() };
     h.backend = factory.build_cliprdr_backend();
     h.pump();
     assert_eq!(delivered(&rx), None);
@@ -832,6 +837,344 @@ fn remote_file_list_refused_by_server() {
     assert_eq!(delivered(&rx).expect("text"), b"ok");
 }
 
+#[test]
+fn every_waiting_paste_gets_the_remote_data() {
+    let mut h = Harness::new(false, 1 << 20);
+    h.connect();
+    h.remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+    let waiting: Vec<_> = (0..3).map(|_| h.paste("text/plain;charset=utf-8")).collect();
+    assert_eq!(paste_request(&h.take()), ClipboardFormatId::CF_UNICODETEXT, "one request serves all three");
+    let wire = convert::text_to_cf_unicodetext("shared");
+    h.backend.on_format_data_response(FormatDataResponse::new_data(wire.as_slice()));
+    h.pump();
+    for rx in &waiting {
+        assert_eq!(delivered(rx).expect("data"), b"shared");
+    }
+    // And the cache still answers later pastes.
+    let rx = h.paste("text/plain");
+    assert!(h.take().is_empty());
+    assert_eq!(delivered(&rx).expect("cached"), b"shared");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hostile servers: request floods
+// ---------------------------------------------------------------------------------------------
+
+fn is_error_response(message: &ClipboardMessage) -> bool {
+    match message {
+        ClipboardMessage::SendFormatData(r) => r.is_error(),
+        ClipboardMessage::SendFileContentsResponse(r) => r.is_error(),
+        other => panic!("unexpected message {other:?}"),
+    }
+}
+
+#[test]
+fn file_contents_flood_is_bounded_in_requests_and_bytes() {
+    const CHUNK: u32 = 8 * 1024 * 1024;
+    let mut h = Harness::new(true, 64 << 20);
+    h.connect();
+    // The session reports what it wrote (as the engine does).
+    h.flow.written(0);
+    let src = tempfile::tempdir().expect("tmp");
+    let f = src.path().join("big.bin");
+    std::fs::File::create(&f).expect("create").set_len(u64::from(CHUNK)).expect("sparse 8 MiB file");
+    h.local_copy(&[("text/uri-list", &uri::build_uri_list(&[f]))]);
+    assert!(matches!(h.take().as_slice(), [ClipboardMessage::SendInitiateFileCopy(_)]));
+
+    // The server sends 1,000 requests for 8 MiB each (8 GB of answers) before the worker runs.
+    for stream in 0..1000 {
+        h.backend.on_file_contents_request(range(stream, 0, 0, CHUNK, None));
+    }
+    assert_eq!(h.flow.shared().queued_requests(), MAX_QUEUED_REQUESTS * 2, "the request queue is capped");
+    let mut queued = 0;
+    while let Ok(command) = h.rx.try_recv() {
+        queued += 1;
+        h.worker.handle(command);
+    }
+    assert_eq!(queued, MAX_QUEUED_REQUESTS * 2);
+    assert_eq!(h.flow.shared().queued_requests(), 0);
+
+    // Nothing has been written yet: only as much data as the budget allows was produced, the
+    // rest was refused (or waits).
+    let first = h.take();
+    let data_bytes: usize = first.iter().map(FlowControl::cost).sum();
+    assert!(data_bytes >= CHUNK as usize, "some requests are served");
+    assert!(data_bytes < RESPONSE_BUDGET_BYTES + CHUNK as usize, "queued {data_bytes} bytes");
+    let served = first.iter().filter(|m| !is_error_response(m)).count();
+    let refused = first.len() - served;
+    assert!(refused >= MAX_QUEUED_REQUESTS, "excess requests get a failure response ({refused})");
+
+    // Time alone frees nothing while the session is still writing.
+    h.worker.tick(Instant::now() + Duration::from_secs(60));
+    assert!(h.take().is_empty());
+
+    // As the session writes responses out, the held-back requests are served, never more than
+    // the budget at a time.
+    let mut pending = first;
+    let mut later = 0;
+    for _ in 0..100 {
+        for message in pending.drain(..) {
+            drop(h.flow.track(&message));
+        }
+        h.worker.tick(Instant::now());
+        pending = h.take();
+        if pending.is_empty() {
+            break;
+        }
+        let bytes: usize = pending.iter().map(FlowControl::cost).sum();
+        assert!(bytes < RESPONSE_BUDGET_BYTES + CHUNK as usize);
+        assert!(pending.iter().all(|m| !is_error_response(m)));
+        later += pending.len();
+    }
+    assert!(later > 0, "held-back requests are answered once there is room");
+    assert_eq!(served + later + refused, MAX_QUEUED_REQUESTS * 2, "every queued request is answered exactly once");
+
+    // The clipboard still works afterwards.
+    let r = file_contents(&mut h, range(5000, 0, 0, 16, None));
+    assert_eq!(r.data(), &[0u8; 16]);
+}
+
+#[test]
+fn size_requests_are_answered_even_when_the_budget_is_used_up() {
+    const CHUNK: u32 = 8 * 1024 * 1024;
+    let mut h = Harness::new(true, 64 << 20);
+    h.connect();
+    h.flow.written(0);
+    let src = tempfile::tempdir().expect("tmp");
+    let f = src.path().join("big.bin");
+    std::fs::File::create(&f).expect("create").set_len(u64::from(CHUNK)).expect("sparse file");
+    h.local_copy(&[("text/uri-list", &uri::build_uri_list(&[f]))]);
+    h.take();
+    for stream in 0..8 {
+        h.backend.on_file_contents_request(range(stream, 0, 0, CHUNK, None));
+    }
+    h.pump();
+    let served = h.take();
+    assert!(served.len() < 8, "the budget holds some requests back");
+    let size = file_contents(
+        &mut h,
+        FileContentsRequest {
+            stream_id: 99,
+            index: 0,
+            flags: FileContentsFlags::SIZE,
+            position: 0,
+            requested_size: 8,
+            data_id: None,
+        },
+    );
+    assert_eq!(size.data_as_size().expect("size"), u64::from(CHUNK));
+    // A reconnect forgets what was queued for the old connection.
+    let factory =
+        BackendFactory { commands: h.tx.clone(), files: true, max_transfer_bytes: 64 << 20, flow: h.flow.shared() };
+    h.backend = factory.build_cliprdr_backend();
+    h.pump();
+    h.worker.tick(Instant::now());
+    assert!(h.take().is_empty(), "held-back requests of the old connection are dropped");
+}
+
+#[test]
+fn format_data_request_flood_is_refused_beyond_the_queue() {
+    let mut h = Harness::new(false, 1 << 20);
+    h.connect();
+    h.local_copy(&[("text/plain;charset=utf-8", b"hello")]);
+    h.take();
+    for _ in 0..10_000 {
+        h.backend.on_format_data_request(FormatDataRequest { format: ClipboardFormatId::CF_UNICODETEXT });
+    }
+    h.pump();
+    let msgs = h.take();
+    assert_eq!(msgs.len(), MAX_QUEUED_REQUESTS * 2, "requests beyond the queue are not even queued");
+    assert_eq!(msgs.iter().filter(|m| is_error_response(m)).count(), MAX_QUEUED_REQUESTS);
+    // Once the queue has drained, requests are served again.
+    h.backend.on_format_data_request(FormatDataRequest { format: ClipboardFormatId::CF_UNICODETEXT });
+    h.pump();
+    assert_eq!(format_data(h.take()).expect("data"), convert::text_to_cf_unicodetext("hello"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Selections that must not reach the remote
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn password_manager_secrets_are_never_announced_or_served() {
+    let mut h = Harness::new(true, 1 << 20);
+    h.connect();
+    h.local_copy(&[("text/plain;charset=utf-8", b"an ordinary copy")]);
+    assert_eq!(initiate_copy(&h.take()), vec![ClipboardFormatId::CF_UNICODETEXT]);
+
+    // KeePassXC copies a password: the hint rides along with the text.
+    h.os.state().reads.clear();
+    h.local_copy(&[
+        ("text/plain;charset=utf-8", b"hunter2"),
+        ("text/plain", b"hunter2"),
+        (MIME_PASSWORD_HINT, b"secret"),
+    ]);
+    let msgs = h.take();
+    assert_eq!(msgs.len(), 1);
+    assert!(initiate_copy(&msgs).is_empty(), "the earlier announcement is retracted with an empty list");
+
+    // The server asks anyway (it still knows the format from the earlier announcement).
+    for format in [ClipboardFormatId::CF_UNICODETEXT, HTML_FORMAT_ID, ClipboardFormatId::CF_DIB] {
+        h.backend.on_format_data_request(FormatDataRequest { format });
+        h.pump();
+        assert_eq!(format_data(h.take()), None, "{format:?}");
+    }
+    let reads = h.os.state().reads.clone();
+    assert!(reads.iter().all(|m| m == MIME_PASSWORD_HINT), "the secret itself is never read: {reads:?}");
+
+    // A hint that says anything else does not hide the selection.
+    h.local_copy(&[("text/plain;charset=utf-8", b"visible"), (MIME_PASSWORD_HINT, b"public")]);
+    assert_eq!(initiate_copy(&h.take()), vec![ClipboardFormatId::CF_UNICODETEXT]);
+    h.backend.on_format_data_request(FormatDataRequest { format: ClipboardFormatId::CF_UNICODETEXT });
+    h.pump();
+    assert_eq!(format_data(h.take()).expect("data"), convert::text_to_cf_unicodetext("visible"));
+
+    // A hint that is advertised but cannot be read counts as secret.
+    {
+        let mut s = h.os.state();
+        s.mimes = vec!["text/plain".to_owned(), MIME_PASSWORD_HINT.to_owned()];
+        s.data = [("text/plain".to_owned(), b"pw".to_vec())].into_iter().collect();
+    }
+    h.tx.send(Command::LocalChanged).expect("send");
+    h.pump();
+    assert!(initiate_copy(&h.take()).is_empty());
+}
+
+#[test]
+fn secret_on_the_clipboard_at_connect_is_not_announced() {
+    let mut h = Harness::new(true, 1 << 20);
+    {
+        let mut s = h.os.state();
+        s.mimes = vec!["text/plain;charset=utf-8".to_owned(), MIME_PASSWORD_HINT.to_owned()];
+        s.data = [
+            ("text/plain;charset=utf-8".to_owned(), b"hunter2".to_vec()),
+            (MIME_PASSWORD_HINT.to_owned(), b"secret".to_vec()),
+        ]
+        .into_iter()
+        .collect();
+    }
+    let msgs = h.connect();
+    assert_eq!(msgs.len(), 1);
+    assert!(initiate_copy(&msgs).is_empty());
+    h.backend.on_format_data_request(FormatDataRequest { format: ClipboardFormatId::CF_UNICODETEXT });
+    h.pump();
+    assert_eq!(format_data(h.take()), None);
+}
+
+#[test]
+fn secret_files_are_not_offered() {
+    let mut h = Harness::new(true, 1 << 20);
+    h.connect();
+    let src = tempfile::tempdir().expect("tmp");
+    let f = src.path().join("keys.kdbx");
+    std::fs::write(&f, b"db").expect("write");
+    h.local_copy(&[("text/uri-list", &uri::build_uri_list(&[f])), (MIME_PASSWORD_HINT, b"secret")]);
+    assert!(initiate_copy(&h.take()).is_empty());
+    assert!(file_contents(&mut h, range(1, 0, 0, 16, None)).is_error());
+}
+
+/// Puts what session `from` offers on the (shared) local clipboard as seen by session `to`.
+fn share_selection(from: &Harness, to: &mut Harness) {
+    let offered = from.os.state().offered.clone();
+    assert!(!offered.is_empty(), "the source session owns the selection");
+    let items: Vec<(&str, &[u8])> =
+        offered.iter().map(|o| (o.mime.as_str(), o.data.as_deref().unwrap_or_default())).collect();
+    to.local_copy(&items);
+}
+
+#[test]
+fn remote_offers_carry_the_session_marker() {
+    let mut h = Harness::new(true, 1 << 20);
+    h.connect();
+    h.remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+    let offered = h.os.state().offered.clone();
+    let marker = offered.iter().find(|o| o.mime == MIME_BASTION_REMOTE).expect("marker offered");
+    assert!(marker.data.is_some(), "the marker is answered without asking the remote");
+    // Nothing to offer: the local clipboard is left alone, marker included.
+    let mut h = Harness::new(true, 1 << 20);
+    h.connect();
+    h.remote_copy(&[ClipboardFormat::new(ClipboardFormatId(0xC123))]);
+    assert!(h.os.state().offered.is_empty());
+}
+
+#[test]
+fn another_sessions_remote_clipboard_is_not_re_exported() {
+    let mut a = Harness::new(true, 1 << 20);
+    a.connect();
+    let mut b = Harness::new(true, 1 << 20);
+    b.connect();
+    b.local_copy(&[("text/plain;charset=utf-8", b"mine")]);
+    assert_eq!(initiate_copy(&b.take()), vec![ClipboardFormatId::CF_UNICODETEXT]);
+
+    // Server A copies text, HTML and an image; session A offers them locally.
+    a.remote_copy(&[
+        ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+        ClipboardFormat::new(CF_HTML_REMOTE).with_name(ClipboardFormatName::HTML),
+        ClipboardFormat::new(ClipboardFormatId::CF_DIB),
+    ]);
+    b.os.state().reads.clear();
+    share_selection(&a, &mut b);
+    let msgs = b.take();
+    assert_eq!(msgs.len(), 1);
+    assert!(initiate_copy(&msgs).is_empty(), "session B announces nothing (and retracts its earlier list)");
+    for format in [ClipboardFormatId::CF_UNICODETEXT, HTML_FORMAT_ID, ClipboardFormatId::CF_DIB] {
+        b.backend.on_format_data_request(FormatDataRequest { format });
+        b.pump();
+        assert_eq!(format_data(b.take()), None, "server B cannot pull server A's data");
+    }
+    assert!(b.os.state().reads.is_empty(), "session B never reads session A's offer");
+    assert!(a.take().is_empty(), "so session A fetches nothing from its server");
+
+    // The same when session B connects while session A's offer is on the clipboard.
+    let mut c = Harness::new(true, 1 << 20);
+    {
+        let offered = a.os.state().offered.clone();
+        c.os.state().mimes = offered.iter().map(|o| o.mime.clone()).collect();
+    }
+    let msgs = c.connect();
+    assert!(initiate_copy(&msgs).is_empty());
+    assert!(msgs.iter().all(|m| matches!(m, ClipboardMessage::SendInitiateCopy(_))));
+
+    // An ordinary local copy afterwards is announced as before.
+    b.local_copy(&[("text/plain;charset=utf-8", b"typed")]);
+    assert_eq!(initiate_copy(&b.take()), vec![ClipboardFormatId::CF_UNICODETEXT]);
+}
+
+#[test]
+fn another_sessions_remote_files_are_neither_downloaded_nor_re_exported() {
+    let mut a = Harness::new(true, 4 << 20);
+    a.connect();
+    let mut b = Harness::new(true, 4 << 20);
+    b.connect();
+    a.remote_copy(&[ClipboardFormat::new(FILE_LIST_REMOTE).with_name(ClipboardFormatName::FILE_LIST)]);
+    a.take();
+
+    // Session B sees session A's file offer: it must not read the list (which would make A
+    // download the files with no paste anywhere).
+    share_selection(&a, &mut b);
+    assert!(initiate_copy(&b.take()).is_empty());
+    assert!(b.os.state().reads.is_empty());
+    assert!(a.take().is_empty(), "no file list was requested from server A");
+
+    // The user pastes A's files somewhere; later a clipboard manager re-publishes their paths
+    // without the marker. Session B (which never downloaded anything itself) recognises them.
+    let rx = a.paste("text/uri-list");
+    a.take();
+    let (files, contents) = remote_files();
+    a.backend.on_remote_file_list(&files, None);
+    a.pump();
+    serve_download(&mut a, &contents, None);
+    let list = delivered(&rx).expect("uri list");
+    assert!(!uri::parse_uri_list(&list).is_empty());
+    b.local_copy(&[("text/uri-list", &list)]);
+    let msgs = b.take();
+    assert!(
+        msgs.iter().all(|m| !matches!(m, ClipboardMessage::SendInitiateFileCopy(_))),
+        "another session's downloads are not uploaded: {msgs:?}"
+    );
+    assert!(file_contents(&mut b, range(1, 0, 0, 16, None)).is_error());
+}
+
 // ---------------------------------------------------------------------------------------------
 // End to end through the real `CliprdrClient`, with the test playing the RDP server.
 // ---------------------------------------------------------------------------------------------
@@ -854,7 +1197,8 @@ mod e2e {
     impl Wire {
         fn new(max: usize) -> Self {
             let h = Harness::new(true, max);
-            let factory = BackendFactory { commands: h.tx.clone(), files: true, max_transfer_bytes: max };
+            let factory =
+                BackendFactory { commands: h.tx.clone(), files: true, max_transfer_bytes: max, flow: h.flow.shared() };
             let client = CliprdrClient::new(factory.build_cliprdr_backend());
             let mut w = Self { h, client };
             w.h.pump();

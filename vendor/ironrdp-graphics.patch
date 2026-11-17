@@ -13,8 +13,103 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
  
 diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs_info.json' '--exclude=.cargo-ok' ironrdp-graphics-0.11.0/src/progressive.rs vendor/ironrdp-graphics/src/progressive.rs
 --- ironrdp-graphics-0.11.0/src/progressive.rs	2006-07-24 02:21:28.000000000 +0100
-+++ vendor/ironrdp-graphics/src/progressive.rs	2026-11-17 16:31:20.733885800 +0000
-@@ -1284,7 +1284,7 @@
++++ vendor/ironrdp-graphics/src/progressive.rs	2026-11-17 21:21:03.337080000 +0000
+@@ -1069,6 +1069,12 @@
+     /// Tile storage, indexed by `y_idx * tiles_wide + x_idx`.
+     /// `None` entries haven't received any progressive data yet.
+     pub tiles: Vec<Option<Box<TileState>>>,
++    /// Tiles created in this grid (Bastion patch: what the grid costs the decoder's
++    /// [`MAX_LIVE_TILES`] budget).
++    live: usize,
++    /// The decoder's clock when this surface was last decoded into (Bastion patch: orders
++    /// surfaces for [`ProgressiveDecoder`]'s eviction of abandoned ones).
++    last_used: u64,
+ }
+ 
+ impl SurfaceTiles {
+@@ -1099,9 +1105,16 @@
+             tiles_high,
+             use_reduce_extrapolate,
+             tiles: core::iter::repeat_with(|| None).take(count).collect(),
++            live: 0,
++            last_used: 0,
+         })
+     }
+ 
++    /// Number of tiles that hold state (each about 37 KB).
++    pub fn live_tiles(&self) -> usize {
++        self.live
++    }
++
+     /// Get or create the tile at the given grid position.
+     ///
+     /// Returns `None` if the coordinates are out of bounds.
+@@ -1110,6 +1123,7 @@
+         let tile = self.tiles[idx].get_or_insert_with(|| {
+             let mut t = Box::new(TileState::new());
+             t.use_reduce_extrapolate = self.use_reduce_extrapolate;
++            self.live += 1;
+             t
+         });
+         Some(tile)
+@@ -1126,6 +1140,7 @@
+         for tile in &mut self.tiles {
+             *tile = None;
+         }
++        self.live = 0;
+     }
+ 
+     fn tile_index(&self, x_idx: u16, y_idx: u16) -> Option<usize> {
+@@ -1163,6 +1178,29 @@
+ /// slot = 2 MiB of pointer storage per surface before any tile is populated.
+ pub const MAX_SURFACE_DIM: u16 = 32768;
+ 
++/// Bastion patch: most tiles a [`ProgressiveDecoder`] keeps state for, across all surfaces, and
++/// separately the most sub-band references it keeps.
++///
++/// A tile's state is about 37 KB and its reference 24 KB, both created by a tile block that
++/// can be as small as 26 bytes on the wire, and before this cap nothing bounded them: a peer
++/// could address every tile of every surface id. 32,768 tiles is twice what the largest desktop
++/// RDP allows (8192×8192, 128×128 tiles) needs, so no real session comes near it, and it caps
++/// the decoder at about 2 GB where it was unbounded.
++///
++/// Surfaces can also be abandoned without `delete_surface` (the EGFX client keeps Progressive
++/// state across `ResetGraphics`, which destroys every surface). So that their tiles cannot use
++/// the budget up, the decoder drops the state of the least recently decoded surfaces once
++/// three quarters of it is in use; a surface in use is always more recent than an abandoned one.
++pub const MAX_LIVE_TILES: usize = 32_768;
++
++/// Tile and reference counts against their cap, threaded through the tile decoding functions.
++struct TileBudget {
++    /// Tiles holding state, over every surface of the decoder.
++    live: usize,
++    /// Cap for `live` and for the number of references ([`MAX_LIVE_TILES`] outside tests).
++    max: usize,
++}
++
+ /// Maximum aggregate rectangle visits while clipping one progressive bitmap payload.
+ ///
+ /// `Region::union_rectangle` scans the normalized rectangle list, and each
+@@ -1190,6 +1228,8 @@
+     MissingTileReference { x_idx: u16, y_idx: u16 },
+     /// Surface dimensions exceed [`MAX_SURFACE_DIM`] per axis.
+     SurfaceTooLarge { width: u16, height: u16 },
++    /// Decoding would keep state for more tiles than [`MAX_LIVE_TILES`] (Bastion patch).
++    TileBudgetExceeded,
+ }
+ 
+ impl core::fmt::Display for ProgressiveDecodeError {
+@@ -1215,6 +1255,9 @@
+                      (MS-RDPEGFX 2.2.2.14 normative ceiling: 32766)"
+                 )
+             }
++            Self::TileBudgetExceeded => {
++                write!(f, "progressive tile state would exceed the decoder's tile budget")
++            }
+         }
+     }
+ }
+@@ -1284,10 +1327,14 @@
  /// ```
  pub struct ProgressiveDecoder {
      surfaces: BTreeMap<u16, SurfaceTiles>,
@@ -23,7 +118,102 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
      frame_tiles: BTreeMap<u16, BTreeSet<(u16, u16)>>,
      frame_active: bool,
      surface_context_flags: BTreeMap<u16, bool>,
-@@ -1425,21 +1425,19 @@
++    /// Bastion patch: live tile count and cap (see [`MAX_LIVE_TILES`]).
++    budget: TileBudget,
++    /// Advances with every decoded payload; stamps [`SurfaceTiles::last_used`].
++    use_clock: u64,
+ }
+ 
+ impl ProgressiveDecoder {
+@@ -1299,7 +1346,59 @@
+             frame_tiles: BTreeMap::new(),
+             frame_active: false,
+             surface_context_flags: BTreeMap::new(),
++            budget: TileBudget {
++                live: 0,
++                max: MAX_LIVE_TILES,
++            },
++            use_clock: 0,
++        }
++    }
++
++    /// Tiles currently holding state, over all surfaces (Bastion patch).
++    pub fn live_tiles(&self) -> usize {
++        self.budget.live
++    }
++
++    /// Bastion patch: once tile state or references pass three quarters of the budget, drop
++    /// the state of the least recently decoded surfaces other than `current` until they no
++    /// longer do (see [`MAX_LIVE_TILES`]).
++    ///
++    /// The band layout a surface's codec context announced is kept: a server need not repeat
++    /// it, so a surface that turns out to be in use after all only needs fresh first passes.
++    fn evict_idle_surfaces(&mut self, current: u16) {
++        let limit = self.budget.max / 4 * 3;
++        if self.budget.live <= limit && self.references.len() <= limit {
++            return;
+         }
++        let mut oldest_first: Vec<(u64, u16)> = self
++            .surfaces
++            .iter()
++            .filter(|&(&id, _)| id != current)
++            .map(|(&id, surface)| (surface.last_used, id))
++            .collect();
++        oldest_first.sort_unstable();
++
++        let mut references = self.references.len();
++        let mut victims = BTreeSet::new();
++        for (_, id) in oldest_first {
++            if self.budget.live <= limit && references <= limit {
++                break;
++            }
++            if let Some(surface) = self.surfaces.remove(&id) {
++                self.budget.live = self.budget.live.saturating_sub(surface.live);
++            }
++            references =
++                references.saturating_sub(self.references.range((id, 0, 0)..=(id, u16::MAX, u16::MAX)).count());
++            victims.insert(id);
++        }
++        // References whose tile grid is already gone (after `reset`) have no surface to be
++        // ordered by; they go last, if the surfaces above were not enough.
++        let orphans = references > limit;
++        let surfaces = &self.surfaces;
++        self.references.retain(|&(id, _, _), _| {
++            id == current || !(victims.contains(&id) || (orphans && !surfaces.contains_key(&id)))
++        });
++        self.frame_tiles.retain(|id, _| !victims.contains(id));
+     }
+ 
+     /// Start an RDPGFX frame, resetting the set of tiles available to REGION blocks.
+@@ -1375,7 +1474,13 @@
+             self.frame_tiles.clear();
+         }
+ 
++        // Bastion patch: keep abandoned surfaces from using up the tile budget.
++        self.use_clock = self.use_clock.wrapping_add(1);
++        self.evict_idle_surfaces(surface_id);
++        let use_clock = self.use_clock;
++
+         let (surfaces, references, all_frame_tiles) = (&mut self.surfaces, &mut self.references, &mut self.frame_tiles);
++        let budget = &mut self.budget;
+ 
+         // Every codec context on a surface decodes into the surface's tile grid.
+         let surface = match surfaces.entry(surface_id) {
+@@ -1392,9 +1497,12 @@
+         let expected_high = surface_height.div_ceil(TILE_DIM);
+         let surface_resized = surface.tiles_wide != expected_wide || surface.tiles_high != expected_high;
+         if surface_resized {
+-            *surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
++            let resized = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
++            budget.live = budget.live.saturating_sub(surface.live);
++            *surface = resized;
+         }
+         surface.use_reduce_extrapolate = use_reduce_extrapolate;
++        surface.last_used = use_clock;
+ 
+         let frame_tiles = all_frame_tiles.entry(surface_id).or_default();
+         if surface_resized {
+@@ -1425,21 +1533,20 @@
              };
  
              let mut region_tiles = BTreeMap::new();
@@ -46,6 +236,7 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
 +                surface_id,
 +                surface,
 +                references,
++                budget,
 +                &region.tiles,
 +                &region.quant_vals,
 +                &region.quant_prog_vals,
@@ -58,7 +249,26 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
              }
  
              let mut clipping_region = Region::new();
-@@ -1584,57 +1582,189 @@
+@@ -1536,7 +1643,9 @@
+     /// Call this when discarding a surface so a subsequent surface with the
+     /// same ID cannot inherit stale Progressive tile state.
+     pub fn delete_surface(&mut self, surface_id: u16) {
+-        self.surfaces.remove(&surface_id);
++        if let Some(surface) = self.surfaces.remove(&surface_id) {
++            self.budget.live = self.budget.live.saturating_sub(surface.live);
++        }
+         self.references
+             .retain(|(reference_surface_id, _, _), _| *reference_surface_id != surface_id);
+         self.frame_tiles.remove(&surface_id);
+@@ -1546,6 +1655,7 @@
+     /// Reset tile state while retaining surface sub-band references.
+     pub fn reset(&mut self) {
+         self.surfaces.clear();
++        self.budget.live = 0;
+         self.frame_tiles.clear();
+         self.frame_active = false;
+     }
+@@ -1584,57 +1694,236 @@
      clippy::similar_names,
      reason = "q_y/q_cb/q_cr are standard component quant index names"
  )]
@@ -91,12 +301,13 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
 -    references: &mut BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
 -    tile_block: &ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>,
 +    references: &mut BTreeMap<SubBandDiffingTileKey, Box<DecDwtQ>>,
++    budget: &mut TileBudget,
 +    tiles: &[ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>],
      quant_vals: &[ComponentCodecQuant],
      prog_quant_vals: &[ProgressiveCodecQuant],
      use_reduce_extrapolate: bool,
  ) -> Result<Vec<DecodedTile>, ProgressiveDecodeError> {
--    use ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile;
+     use ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile;
 +    use rayon::prelude::*;
  
 -    match tile_block {
@@ -114,6 +325,7 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
 +                surface_id,
 +                surface,
 +                references,
++                budget,
 +                tile_block,
 +                quant_vals,
 +                prog_quant_vals,
@@ -128,22 +340,42 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
 -            }
 -            let reference_key = (surface_id, x_idx, y_idx);
 +    // Validate everything before taking any tile out of the grid, so an error leaves the
-+    // grid untouched.
++    // grid untouched. That includes the tile budget: count the tile states and references
++    // this region would add, and refuse the region if either would pass the cap.
 +    let mut slots = Vec::with_capacity(tiles.len());
-+    for &(x_idx, y_idx, is_difference) in &positions {
++    let (mut new_tiles, mut new_references) = (0usize, 0usize);
++    for (&(x_idx, y_idx, is_difference), tile_block) in positions.iter().zip(tiles) {
 +        let slot = surface
 +            .tile_index(x_idx, y_idx)
 +            .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
-+        if is_difference && !references.contains_key(&(surface_id, x_idx, y_idx)) {
++        let has_reference = references.contains_key(&(surface_id, x_idx, y_idx));
++        if is_difference && !has_reference {
 +            return Err(ProgressiveDecodeError::MissingTileReference { x_idx, y_idx });
++        }
++        let exists = surface.tiles[slot].is_some();
++        // An upgrade for a tile that never had a first pass is skipped (see `decode_one_tile`),
++        // so it needs no state at all.
++        let skipped = !exists && matches!(tile_block, ProgressiveTile::Upgrade(_));
++        if !exists && !skipped {
++            new_tiles += 1;
++        }
++        if !has_reference && !skipped {
++            new_references += 1;
 +        }
 +        slots.push(slot);
 +    }
-+    let mut work: Vec<(usize, Box<TileState>)> = Vec::with_capacity(tiles.len());
-+    for (&slot, &(x_idx, y_idx, _)) in slots.iter().zip(&positions) {
-+        surface.get_or_create(x_idx, y_idx);
-+        let state = surface.tiles[slot].take().expect("tile created above");
-+        work.push((slot, state));
++    if (new_tiles > 0 && budget.live.saturating_add(new_tiles) > budget.max)
++        || (new_references > 0 && references.len().saturating_add(new_references) > budget.max)
++    {
++        return Err(ProgressiveDecodeError::TileBudgetExceeded);
++    }
++    let mut work: Vec<(usize, Option<Box<TileState>>)> = Vec::with_capacity(tiles.len());
++    for ((&slot, &(x_idx, y_idx, _)), tile_block) in slots.iter().zip(&positions).zip(tiles) {
++        if surface.tiles[slot].is_none() && !matches!(tile_block, ProgressiveTile::Upgrade(_)) {
++            surface.get_or_create(x_idx, y_idx);
++            budget.live += 1;
++        }
++        work.push((slot, surface.tiles[slot].take()));
 +    }
 +
 +    let refs = &*references;
@@ -178,6 +410,10 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
 -                    index: q_y.max(q_cb).max(q_cr),
 -                    table_len: quant_vals.len(),
 -                });
++            // `None`: an upgrade for a tile without state, skipped.
++            let Some(state) = state.as_deref_mut() else {
++                return Ok(None);
++            };
 +            let tile = decode_one_tile(state, reference, tile_block, quant_vals, prog_quant_vals, use_reduce_extrapolate)?;
 +            Ok(tile.map(|t| (t, Box::new(state.coefficients))))
 +        })
@@ -191,13 +427,15 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
 +            Ok(Some((tile, reference))) => {
 +                references.insert((surface_id, x_idx, y_idx), reference);
 +                out.push(tile);
-+            }
+             }
 +            Ok(None) => {}
 +            Err(e) => {
 +                first_error.get_or_insert(e);
-             }
++            }
 +        }
-+        surface.tiles[slot] = Some(state);
++        if state.is_some() {
++            surface.tiles[slot] = state;
++        }
 +    }
 +    match first_error {
 +        Some(e) => Err(e),
@@ -209,16 +447,31 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
 +    surface_id: u16,
 +    surface: &mut SurfaceTiles,
 +    references: &mut BTreeMap<SubBandDiffingTileKey, Box<DecDwtQ>>,
++    budget: &mut TileBudget,
 +    tile_block: &ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>,
 +    quant_vals: &[ComponentCodecQuant],
 +    prog_quant_vals: &[ProgressiveCodecQuant],
 +    use_reduce_extrapolate: bool,
 +) -> Result<Vec<DecodedTile>, ProgressiveDecodeError> {
++    use ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile;
+ 
 +    let (x_idx, y_idx, is_difference) = tile_position(tile_block);
 +    if surface.tile_index(x_idx, y_idx).is_none() {
 +        return Err(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx });
 +    }
 +    let reference_key = (surface_id, x_idx, y_idx);
++    // Bastion patch: tile state and references are budgeted (see `MAX_LIVE_TILES`).
++    let exists = surface.get(x_idx, y_idx).is_some();
++    if !exists && matches!(tile_block, ProgressiveTile::Upgrade(_)) {
++        // An upgrade for a tile that never had a first pass is skipped (see `decode_one_tile`);
++        // creating state for it only to skip it would let 26 wire bytes pin 37 KB.
++        return Ok(Vec::new());
++    }
++    if (!exists && budget.live >= budget.max)
++        || (!references.contains_key(&reference_key) && references.len() >= budget.max)
++    {
++        return Err(ProgressiveDecodeError::TileBudgetExceeded);
++    }
 +    let reference = if is_difference {
 +        Some(
 +            &**references
@@ -231,6 +484,9 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
 +    let tile_state = surface
 +        .get_or_create(x_idx, y_idx)
 +        .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
++    if !exists {
++        budget.live += 1;
++    }
 +    let decoded = decode_one_tile(
 +        tile_state,
 +        reference,
@@ -256,7 +512,7 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
 +    use_reduce_extrapolate: bool,
 +) -> Result<Option<DecodedTile>, ProgressiveDecodeError> {
 +    use ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile;
- 
++
 +    let check_quant = |q: [u8; 3]| {
 +        let [q_y, q_cb, q_cr] = q.map(usize::from);
 +        if q_y >= quant_vals.len() || q_cb >= quant_vals.len() || q_cr >= quant_vals.len() {
@@ -281,7 +537,7 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
                  [prog, prog, prog],
                  reference,
                  FirstPassOptions {
-@@ -1643,57 +1773,15 @@
+@@ -1643,57 +1932,15 @@
                      use_reduce_extrapolate,
                  },
              )?;
@@ -342,7 +598,7 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
                  [pq.y_quant, pq.cb_quant, pq.cr_quant],
                  reference,
                  FirstPassOptions {
-@@ -1702,53 +1790,33 @@
+@@ -1702,53 +1949,33 @@
                      use_reduce_extrapolate,
                  },
              )?;
@@ -409,7 +665,7 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
  }
  
  impl Default for ProgressiveDecoder {
-@@ -1766,6 +1834,82 @@
+@@ -1766,6 +1993,292 @@
  mod tests {
      use super::*;
  
@@ -466,20 +722,28 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
 +        let run = |parallel: bool| {
 +            let mut surface = SurfaceTiles::new(w * 64, h * 64, false).unwrap();
 +            let mut refs = BTreeMap::new();
++            let mut budget = TileBudget {
++                live: 0,
++                max: MAX_LIVE_TILES,
++            };
 +            let mut pixels = Vec::new();
 +            // A first pass, then difference tiles that read the references it left.
 +            for flags in [0, TILE_FLAG_DIFFERENCE] {
 +                let t = tiles(flags);
 +                let out: Vec<DecodedTile> = if parallel {
-+                    decode_region_tiles(1, &mut surface, &mut refs, &t, &quant_vals, &prog, false).unwrap()
++                    decode_region_tiles(1, &mut surface, &mut refs, &mut budget, &t, &quant_vals, &prog, false).unwrap()
 +                } else {
 +                    t.iter()
-+                        .flat_map(|tb| decode_tile_block(1, &mut surface, &mut refs, tb, &quant_vals, &prog, false).unwrap())
++                        .flat_map(|tb| {
++                            decode_tile_block(1, &mut surface, &mut refs, &mut budget, tb, &quant_vals, &prog, false)
++                                .unwrap()
++                        })
 +                        .collect()
 +                };
 +                pixels.extend(out.into_iter().map(|t| (t.x_idx, t.y_idx, t.pixels)));
 +            }
 +            assert!(surface.tiles.iter().all(Option::is_some), "every tile is back in the grid");
++            assert_eq!((budget.live, surface.live_tiles()), (data.len(), data.len()), "each tile counted once");
 +            (pixels, refs)
 +        };
 +        let (pixels_par, refs_par) = run(true);
@@ -489,10 +753,212 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
 +        assert!(refs_par == refs_seq, "parallel references differ from sequential");
 +    }
 +
++    /// Bastion patch: a stream of REGION blocks over a 64x64-tile grid, one tile block per
++    /// `(x, y, upgrade)` entry (TILE_SIMPLE with empty components, or an empty TILE_UPGRADE).
++    fn tile_grid_stream(tiles: &[(u16, u16, bool)]) -> Vec<u8> {
++        use ironrdp_pdu::codecs::rfx::RfxRectangle;
++        use ironrdp_pdu::codecs::rfx::progressive::{
++            ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
++            ProgressiveRegion, ProgressiveSyncPdu, ProgressiveTile, TileSimple, TileUpgrade,
++            encode_progressive_stream,
++        };
++
++        let lossless = ComponentCodecQuant::LOSSLESS;
++        let component = encode_full_quality_component(1);
++        let tiles = tiles
++            .iter()
++            .map(|&(x_idx, y_idx, upgrade)| {
++                if upgrade {
++                    ProgressiveTile::Upgrade(TileUpgrade {
++                        quant_idx_y: 0,
++                        quant_idx_cb: 0,
++                        quant_idx_cr: 0,
++                        x_idx,
++                        y_idx,
++                        quality: 0,
++                        y_srl_data: &[],
++                        y_raw_data: &[],
++                        cb_srl_data: &[],
++                        cb_raw_data: &[],
++                        cr_srl_data: &[],
++                        cr_raw_data: &[],
++                    })
++                } else {
++                    ProgressiveTile::Simple(TileSimple {
++                        quant_idx_y: 0,
++                        quant_idx_cb: 0,
++                        quant_idx_cr: 0,
++                        x_idx,
++                        y_idx,
++                        flags: 0,
++                        y_data: &component,
++                        cb_data: &component,
++                        cr_data: &component,
++                        tail_data: &[],
++                    })
++                }
++            })
++            .collect();
++        let blocks = [
++            ProgressiveBlock::Sync(ProgressiveSyncPdu),
++            ProgressiveBlock::Context(ProgressiveContextPdu {
++                context_id: 0,
++                tile_size: 0x0040,
++                flags: 0,
++            }),
++            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
++                frame_index: 0,
++                region_count: 1,
++            }),
++            ProgressiveBlock::Region(ProgressiveRegion {
++                tile_size: 0x40,
++                rects: vec![RfxRectangle {
++                    x: 0,
++                    y: 0,
++                    width: 64,
++                    height: 64,
++                }],
++                quant_vals: vec![lossless],
++                quant_prog_vals: vec![ProgressiveCodecQuant {
++                    quality: 0,
++                    y_quant: lossless,
++                    cb_quant: lossless,
++                    cr_quant: lossless,
++                }],
++                flags: 0,
++                tiles,
++            }),
++            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
++        ];
++        encode_progressive_stream(&blocks).expect("synthetic progressive stream should encode")
++    }
++
++    /// Bastion patch: upgrade blocks for tiles that never had a first pass used to allocate a
++    /// 37 KB tile state each (and keep it) before being skipped. Both decode paths.
++    #[test]
++    fn upgrades_for_tiles_without_a_first_pass_allocate_nothing() {
++        for count in [3u16, 40] {
++            let mut decoder = ProgressiveDecoder::new();
++            let upgrades: Vec<_> = (0..count).map(|i| (i % 8, i / 8, true)).collect();
++            let tiles = decoder
++                .decode_bitmap(1, 0, 512, 512, &tile_grid_stream(&upgrades))
++                .expect("skipped upgrades are not an error");
++            assert!(tiles.is_empty());
++            assert_eq!(decoder.live_tiles(), 0, "{count} upgrades");
++            assert!(decoder.surfaces[&1].tiles.iter().all(Option::is_none));
++            assert!(decoder.references.is_empty());
++        }
++    }
++
++    /// Bastion patch: tile state is capped, on the sequential and the parallel path, and
++    /// deleting or resizing a surface gives the room back.
++    #[test]
++    fn live_tiles_are_capped_and_released_with_their_surface() {
++        let mut decoder = ProgressiveDecoder::new();
++        decoder.budget.max = 20;
++        let tiles = |y: u16, from: u16, n: u16| -> Vec<(u16, u16, bool)> { (from..from + n).map(|x| (x, y, false)).collect() };
++        let decode = |decoder: &mut ProgressiveDecoder, id: u16, width: u16, tiles: &[(u16, u16, bool)]| {
++            decoder.decode_bitmap(id, 0, width, 128, &tile_grid_stream(tiles))
++        };
++
++        // A 16x2 tile surface: 12 tiles through the parallel path, 6 through the sequential.
++        assert_eq!(decode(&mut decoder, 1, 1024, &tiles(0, 0, 12)).unwrap().len(), 1);
++        decode(&mut decoder, 1, 1024, &tiles(1, 0, 6)).unwrap();
++        assert_eq!((decoder.live_tiles(), decoder.references.len()), (18, 18));
++        // Decoding tiles that already have state costs nothing more.
++        decode(&mut decoder, 1, 1024, &tiles(0, 0, 12)).unwrap();
++        assert_eq!(decoder.live_tiles(), 18);
++
++        // 3 more would make 21: the sequential path stops after the two that fit...
++        let error = decode(&mut decoder, 1, 1024, &tiles(1, 6, 3));
++        assert!(matches!(error, Err(ProgressiveDecodeError::TileBudgetExceeded)), "sequential");
++        assert_eq!(decoder.live_tiles(), 20);
++        // ...and the parallel path refuses a region as a whole, leaving the grid untouched.
++        let error = decode(&mut decoder, 1, 1024, &tiles(1, 8, 8));
++        assert!(matches!(error, Err(ProgressiveDecodeError::TileBudgetExceeded)), "parallel");
++        assert_eq!((decoder.live_tiles(), decoder.references.len()), (20, 20));
++        assert_eq!(decoder.surfaces[&1].live_tiles(), 20);
++        assert!(decoder.surfaces[&1].tiles[16 + 8..].iter().all(Option::is_none));
++        // At the cap, existing tiles still decode (both paths).
++        decode(&mut decoder, 1, 1024, &tiles(0, 0, 12)).unwrap();
++        decode(&mut decoder, 1, 1024, &tiles(1, 0, 3)).unwrap();
++
++        // Deleting the surface returns its tiles and references.
++        decoder.delete_surface(1);
++        assert_eq!((decoder.live_tiles(), decoder.references.len()), (0, 0));
++
++        // Resizing a surface drops its grid, and with it its share of the count.
++        decode(&mut decoder, 2, 1024, &tiles(0, 0, 10)).unwrap();
++        assert_eq!(decoder.live_tiles(), 10);
++        decode(&mut decoder, 2, 128, &tiles(0, 0, 1)).unwrap();
++        assert_eq!(decoder.live_tiles(), 1);
++
++        decoder.reset();
++        assert_eq!(decoder.live_tiles(), 0);
++    }
++
++    /// Bastion patch: surfaces abandoned without `delete_surface` (the EGFX client keeps
++    /// Progressive state across ResetGraphics) are dropped, oldest first, before their tiles
++    /// can use the budget up; surfaces in use and every surface's band layout are kept.
++    #[test]
++    fn abandoned_surfaces_are_evicted_before_they_exhaust_the_tile_budget() {
++        let mut decoder = ProgressiveDecoder::new();
++        decoder.budget.max = 40; // eviction starts above 30
++        let row = |n: u16| -> Vec<(u16, u16, bool)> { (0..n).map(|x| (x, 0, false)).collect() };
++        // Three surfaces of an earlier desktop, 10 tiles each, never deleted.
++        for id in [1, 2, 3] {
++            decoder.decode_bitmap(id, 0, 1024, 64, &tile_grid_stream(&row(10))).unwrap();
++        }
++        assert_eq!(decoder.live_tiles(), 30);
++        // The current desktop's surfaces. Nothing is over the threshold when 10 is decoded...
++        decoder.decode_bitmap(10, 0, 1024, 64, &tile_grid_stream(&row(8))).unwrap();
++        assert_eq!(decoder.live_tiles(), 38);
++        // ...but it is at the next payload: the oldest surface goes, and only that one.
++        decoder.decode_bitmap(11, 0, 1024, 64, &tile_grid_stream(&row(8))).unwrap();
++        assert!(!decoder.surfaces.contains_key(&1));
++        assert!(decoder.surfaces.contains_key(&2) && decoder.surfaces.contains_key(&3));
++        assert_eq!(decoder.live_tiles(), 36);
++        assert!(decoder.references.keys().all(|&(id, _, _)| id != 1));
++        assert_eq!(decoder.references.len(), 36);
++        // Using surface 2 again makes 3 the oldest; the surfaces in use are never chosen
++        // while an older one is left.
++        decoder.decode_bitmap(2, 0, 1024, 64, &tile_grid_stream(&row(10))).unwrap();
++        assert_eq!(decoder.live_tiles(), 26);
++        assert!(!decoder.surfaces.contains_key(&3));
++        for id in [2, 10, 11] {
++            assert_eq!(decoder.surfaces[&id].live_tiles(), if id == 2 { 10 } else { 8 }, "surface {id}");
++        }
++        // An evicted surface keeps the band layout its context announced, so a stream
++        // without a CONTEXT block still decodes on it.
++        assert!(decoder.decode_bitmap(1, 0, 64, 64, &minimal_progressive_stream(false)).is_ok());
++        // The surface being decoded is never evicted, whatever its size.
++        decoder.budget.max = 8;
++        decoder.decode_bitmap(2, 0, 1024, 64, &tile_grid_stream(&row(10))).unwrap();
++        assert_eq!((decoder.surfaces.len(), decoder.live_tiles()), (1, 10));
++        assert!(decoder.references.keys().all(|&(id, _, _)| id == 2));
++    }
++
++    /// Bastion patch: references outlive a resize, so they have their own cap.
++    #[test]
++    fn references_are_capped_separately_from_tile_state() {
++        let mut decoder = ProgressiveDecoder::new();
++        decoder.budget.max = 10;
++        let row = |from: u16, n: u16| -> Vec<(u16, u16, bool)> { (from..from + n).map(|x| (x, 0, false)).collect() };
++        decoder.decode_bitmap(1, 0, 1024, 64, &tile_grid_stream(&row(0, 8))).unwrap();
++        // Shrinking the surface drops the 8 tile states; their references remain.
++        decoder.decode_bitmap(1, 0, 2048, 64, &tile_grid_stream(&row(16, 1))).unwrap();
++        assert_eq!((decoder.live_tiles(), decoder.references.len()), (1, 9));
++        for (label, tiles) in [("sequential", row(17, 2)), ("parallel", row(17, 8))] {
++            let error = decoder.decode_bitmap(1, 0, 2048, 64, &tile_grid_stream(&tiles));
++            assert!(matches!(error, Err(ProgressiveDecodeError::TileBudgetExceeded)), "{label}");
++            assert!(decoder.references.len() <= 10, "{label}");
++        }
++    }
++
      fn minimal_progressive_stream(include_context: bool) -> Vec<u8> {
          use ironrdp_pdu::codecs::rfx::RfxRectangle;
          use ironrdp_pdu::codecs::rfx::progressive::{
-@@ -2204,14 +2348,14 @@
+@@ -2204,14 +2717,14 @@
          assert!(result.is_ok());
          assert_eq!(decoder.surfaces.len(), 1);
          assert_eq!(decoder.references.len(), 1);
@@ -509,7 +975,7 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
  
          assert!(
              decoder
-@@ -3650,7 +3794,7 @@
+@@ -3650,7 +4163,7 @@
                  &first_tile_stream(0, &original_data, base_quant, progressive_quant, true),
              )
              .expect("original first-pass tile should decode");
@@ -518,7 +984,7 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
              .references
              .get(&(1, 0, 0))
              .expect("original tile should retain a reference");
-@@ -3670,7 +3814,7 @@
+@@ -3670,7 +4183,7 @@
                  ),
              )
              .expect("upgrade tile should decode");
@@ -527,7 +993,7 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
              .references
              .get(&(1, 0, 0))
              .expect("upgrade should update the retained reference");
-@@ -3761,7 +3905,7 @@
+@@ -3761,7 +4274,7 @@
                      &first_tile_stream(0, &first_data, base_quant, progressive_quant, true),
                  )
                  .expect("first-pass tile should decode");
@@ -536,7 +1002,7 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
                  .references
                  .get(&(1, 0, 0))
                  .expect("first-pass tile should retain a reference");
-@@ -3821,7 +3965,7 @@
+@@ -3821,7 +4334,7 @@
          decoder
              .decode_bitmap(1, 7, 64, 64, &simple_tile_stream(0, original_components, true))
              .expect("original tile should decode");
@@ -545,7 +1011,7 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
              .references
              .get(&(1, 0, 0))
              .expect("original tile reference should be retained");
-@@ -3858,7 +4002,7 @@
+@@ -3858,7 +4371,7 @@
              }
          }
  
@@ -554,7 +1020,7 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
  
          decoder.delete_surface(1);
          assert!(!decoder.references.contains_key(&(1, 0, 0)));
-@@ -3883,7 +4027,7 @@
+@@ -3883,7 +4396,7 @@
          decoder
              .decode_bitmap(1, 7, 64, 64, &simple_tile_stream(0, original_components, true))
              .expect("original tile should decode");
@@ -563,7 +1029,7 @@ diff --color -ru '--exclude=target' '--exclude=Cargo.lock' '--exclude=.cargo_vcs
              .references
              .get(&(1, 0, 0))
              .expect("original tile reference should be retained");
-@@ -3891,7 +4035,7 @@
+@@ -3891,7 +4404,7 @@
          decoder
              .decode_bitmap(1, 7, 128, 64, &minimal_progressive_stream(true))
              .expect("resized surface should decode");

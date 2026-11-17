@@ -50,6 +50,23 @@ const MAX_OUTPUT_DIM: u16 = 32766;
 /// single-surface case (16384*16384*4) impossible to reach.
 const MAX_COMPOSITOR_BYTES: usize = 256 * 1024 * 1024;
 
+/// Bastion patch: pixels one graphics message may have written by commands whose cost is not
+/// tied to the message's size: `SolidFill` rectangles, `SurfaceToSurface` and `CacheToSurface`
+/// destination points, `SurfaceToCache` copies and AVC420 region rectangles.
+///
+/// Each of those costs the peer a few bytes (less after ZGFX) and the client up to a whole
+/// surface, as many times as the peer cares to repeat it: one small message could keep the
+/// graphics thread writing for hours. 2^30 pixels is sixteen repaints of the largest surface
+/// set the budget allows and over a hundred of a 4K desktop, in a single message; a real one
+/// paints its surface about once. Past the allowance such commands are skipped until the next
+/// message.
+const MAX_MESSAGE_PIXEL_WORK: u64 = 1 << 30;
+
+/// Bastion patch: charged per queued update on top of its pixels, for the `Vec` and the
+/// struct around them. Without it a 1x1 update costs the budget 4 bytes and the heap about
+/// 64, so the queue could outgrow its ceiling many times over.
+const UPDATE_OVERHEAD: usize = 64;
+
 /// A rectangular region of the graphics output whose pixels changed within a frame.
 ///
 /// `region` is in output space (after a surface-to-output mapping), using the
@@ -233,6 +250,8 @@ pub(crate) struct Compositor {
     small_bitmap_cache: bool,
     /// Window deltas from completed frames, awaiting drain.
     ready_windows: Vec<WindowUpdate>,
+    /// Pixels written in the current message by commands under [`MAX_MESSAGE_PIXEL_WORK`].
+    message_work: u64,
 }
 
 impl Compositor {
@@ -243,6 +262,33 @@ impl Compositor {
             output_height: self.output_height,
             ..Self::default()
         };
+    }
+
+    /// Start a new graphics message: its pixel-work allowance is whole again (Bastion patch).
+    pub(crate) fn begin_message(&mut self) {
+        self.message_work = 0;
+    }
+
+    /// Whether the compositor holds a canvas for the surface (Bastion patch).
+    pub(crate) fn has_surface(&self, id: u16) -> bool {
+        self.surfaces.contains_key(&id)
+    }
+
+    /// Account for writing a `w` by `h` block at `(x, y)` of a `width` by `height` canvas
+    /// against [`MAX_MESSAGE_PIXEL_WORK`]; `false` if the message has used its allowance.
+    fn spend_work(&mut self, (width, height): (u16, u16), x: u16, y: u16, w: u16, h: u16) -> bool {
+        let cols = u64::from(w.min(width.saturating_sub(x)));
+        let rows = u64::from(h.min(height.saturating_sub(y)));
+        let total = self.message_work.saturating_add(cols * rows);
+        if total > MAX_MESSAGE_PIXEL_WORK {
+            warn_throttled!(
+                limit = MAX_MESSAGE_PIXEL_WORK,
+                "Graphics message exceeds its pixel-work allowance; skipping the rest of its fills and copies"
+            );
+            return false;
+        }
+        self.message_work = total;
+        true
     }
 
     pub(crate) fn materializable_output_size(width: u32, height: u32) -> Option<(u16, u16)> {
@@ -500,6 +546,12 @@ impl Compositor {
         let y = dest.top;
         let w = dest.right.saturating_sub(dest.left);
         let h = dest.bottom.saturating_sub(dest.top);
+        // One decoded frame may list any number of region rectangles, each a blit.
+        if let Some(size) = self.surfaces.get(&surface_id).map(|s| (s.width, s.height)) {
+            if !self.spend_work(size, x, y, w, h) {
+                return;
+            }
+        }
         if let Some(surface) = self.surfaces.get_mut(&surface_id) {
             let offset = usize::from(source.1)
                 .saturating_mul(src_stride)
@@ -585,6 +637,11 @@ impl Compositor {
             let y = rect.top;
             let w = rect.right.saturating_sub(rect.left);
             let h = rect.bottom.saturating_sub(rect.top);
+            if let Some(size) = self.surfaces.get(&surface_id).map(|s| (s.width, s.height)) {
+                if !self.spend_work(size, x, y, w, h) {
+                    return;
+                }
+            }
             if let Some(surface) = self.surfaces.get_mut(&surface_id) {
                 fill_region(surface.canvas_mut(), x, y, w, h, px);
             }
@@ -621,7 +678,27 @@ impl Compositor {
             .bottom
             .saturating_sub(src_rect.top)
             .min(src.height.saturating_sub(src_rect.top));
+        let src_size = (src.width, src.height);
+        if !self.spend_work(src_size, src_rect.left, src_rect.top, w, h) {
+            return;
+        }
+        // Re-borrowed: charging the work needed `&mut self`.
+        let Some(src) = self.surfaces.get(&src_id) else {
+            return;
+        };
         let tile = copy_region(&src.data, src.width, src_rect.left, src_rect.top, w, h);
+
+        // Points that fit the message's work allowance; the rest are skipped.
+        let mut painted = dst_points.len();
+        if let Some(dst_size) = self.surfaces.get(&dst_id).map(|s| (s.width, s.height)) {
+            for (index, point) in dst_points.iter().enumerate() {
+                if !self.spend_work(dst_size, point.x, point.y, w, h) {
+                    painted = index;
+                    break;
+                }
+            }
+        }
+        let dst_points = &dst_points[..painted];
 
         if let Some(dst) = self.surfaces.get_mut(&dst_id) {
             for point in dst_points {
@@ -666,6 +743,11 @@ impl Compositor {
             return;
         }
         let len = usize::from(w) * usize::from(h) * BYTES_PER_PIXEL;
+
+        // `w` and `h` are already clamped to the surface, so this charges the copy exactly.
+        if !self.spend_work((w, h), 0, 0, w, h) {
+            return;
+        }
 
         // Charged before `copy_region`, not around the insert: the copy is the
         // allocation, so checking afterwards would still let a peer drive the
@@ -764,11 +846,24 @@ impl Compositor {
         tile.last_used = now;
         let (w, h) = (tile.width, tile.height);
 
+        // Bastion patch: charge the blits against the message's work allowance first (which
+        // needs `&mut self`), then paint the points that fit.
+        let mut painted = dst_points.len();
+        if let Some(size) = self.surfaces.get(&surface_id).map(|s| (s.width, s.height)) {
+            for (index, point) in dst_points.iter().enumerate() {
+                if !self.spend_work(size, point.x, point.y, w, h) {
+                    painted = index;
+                    break;
+                }
+            }
+        }
+        let dst_points = &dst_points[..painted];
+
         // `cache` and `surfaces` are disjoint fields, so the tile stays borrowed
         // across the blits rather than being copied to satisfy the borrow checker.
         // Recording is what needs all of `&mut self`, so it follows in its own loop
         // once the tile borrow has ended.
-        if let Some(surface) = self.surfaces.get_mut(&surface_id) {
+        if let (Some(tile), Some(surface)) = (self.cache.get(&cache_slot), self.surfaces.get_mut(&surface_id)) {
             for point in dst_points {
                 blit_region(surface.canvas_mut(), point.x, point.y, w, h, &tile.data);
             }
@@ -803,7 +898,7 @@ impl Compositor {
     /// Take all committed output updates, leaving the pending set empty.
     pub(crate) fn drain_output(&mut self) -> Vec<OutputUpdate> {
         let drained = core::mem::take(&mut self.ready);
-        let released = drained.iter().map(|update| update.data.len()).sum();
+        let released = drained.iter().map(|update| update.data.len() + UPDATE_OVERHEAD).sum();
         self.release(released);
         drained
     }
@@ -811,7 +906,7 @@ impl Compositor {
     /// Take all committed window updates, leaving the pending set empty.
     pub(crate) fn drain_window_updates(&mut self) -> Vec<WindowUpdate> {
         let drained = core::mem::take(&mut self.ready_windows);
-        let released = drained.iter().map(|update| update.data.len()).sum();
+        let released = drained.iter().map(|update| update.data.len() + UPDATE_OVERHEAD).sum();
         self.release(released);
         drained
     }
@@ -876,11 +971,11 @@ impl Compositor {
         let Some(len) = pixel_data_len(w, h) else {
             return;
         };
-        if !self.charge(len) {
+        if !self.charge(len + UPDATE_OVERHEAD) {
             return;
         }
         let Some(surface) = self.surfaces.get(&dirty.surface_id) else {
-            self.release(len);
+            self.release(len + UPDATE_OVERHEAD);
             return;
         };
         let output_rect = ExclusiveRectangle {
@@ -937,11 +1032,11 @@ impl Compositor {
         let Some(len) = pixel_data_len(w, h) else {
             return;
         };
-        if len == 0 || !self.charge(len) {
+        if len == 0 || !self.charge(len + UPDATE_OVERHEAD) {
             return;
         }
         let Some(surface) = self.surfaces.get(&dirty.surface_id) else {
-            self.release(len);
+            self.release(len + UPDATE_OVERHEAD);
             return;
         };
         let mut data = if window.target_width == window.mapped_width && window.target_height == window.mapped_height {
@@ -2010,6 +2105,87 @@ mod tests {
 
         assert_eq!(c.frame.len(), FIT, "the frame must stop growing at the budget");
         assert_eq!(c.allocated_bytes, MAX_COMPOSITOR_BYTES);
+    }
+
+    /// Bastion patch: fills and copies that cost the peer nothing to repeat are limited per
+    /// message; past the allowance they are skipped, and the next message starts afresh.
+    #[test]
+    fn repeated_fills_and_copies_stop_at_the_message_work_allowance() {
+        let red = Color {
+            b: 0,
+            g: 0,
+            r: 255,
+            xa: 0,
+        };
+        let is_red = |c: &Compositor, id: u16, x: usize, y: usize| {
+            let surface = &c.surfaces[&id];
+            surface.data[(y * usize::from(surface.width) + x) * BYTES_PER_PIXEL] == 255
+        };
+        let mut c = Compositor::default();
+        c.reset(64, 64);
+        c.create_surface(1, 64, 64);
+        c.create_surface(2, 64, 64);
+        c.begin_message();
+
+        // Rectangles are charged for the pixels they really cover (clipped to the surface).
+        c.solid_fill(1, &red, &[rect(60, 60, 65535, 65535)]);
+        assert_eq!(c.message_work, 16);
+
+        // Room for 100 more pixels: the 8x8 fill fits, the next 8x8 does not, and nothing
+        // after it in the same PDU is painted either.
+        c.message_work = MAX_MESSAGE_PIXEL_WORK - 100;
+        c.solid_fill(1, &red, &[rect(0, 0, 8, 8), rect(8, 0, 16, 8), rect(16, 0, 17, 1)]);
+        assert!(is_red(&c, 1, 7, 7));
+        assert!(!is_red(&c, 1, 8, 0) && !is_red(&c, 1, 16, 0));
+        assert_eq!(c.message_work, MAX_MESSAGE_PIXEL_WORK - 36);
+
+        // The same allowance covers every repeatable command: 36 pixels are left.
+        let points = |n: u16| -> Vec<Point> { (0..n).map(|i| Point { x: i * 4, y: 32 }).collect() };
+        c.surface_to_surface(1, 2, &rect(0, 0, 2, 2), &points(16)); // 4 for the read, 8 points fit
+        assert!(is_red(&c, 2, 28, 32) && !is_red(&c, 2, 32, 32));
+        assert_eq!(c.message_work, MAX_MESSAGE_PIXEL_WORK);
+        c.surface_to_cache(1, 1, 0, &rect(0, 0, 4, 4));
+        assert!(c.cache.is_empty(), "no allowance left for the copy");
+        c.apply_bitmap_from(2, &rect(0, 0, 4, 4), &[255; 64], 16, (0, 0));
+        assert!(!is_red(&c, 2, 0, 0));
+
+        // The next message has its allowance back.
+        c.begin_message();
+        c.surface_to_cache(1, 1, 0, &rect(0, 0, 4, 4));
+        c.cache_to_surface(1, 2, &points(3));
+        assert!(is_red(&c, 2, 8, 32 + 3));
+        c.message_work = MAX_MESSAGE_PIXEL_WORK - 16;
+        c.cache_to_surface(1, 2, &[Point { x: 0, y: 0 }, Point { x: 4, y: 0 }]);
+        assert!(is_red(&c, 2, 3, 3) && !is_red(&c, 2, 4, 0));
+        c.begin_message();
+        c.apply_bitmap_from(2, &rect(4, 0, 8, 4), &[255; 64], 16, (0, 0));
+        assert!(is_red(&c, 2, 4, 0));
+    }
+
+    /// Bastion patch: a queued update is charged for its bookkeeping as well as its pixels,
+    /// so millions of 1x1 updates cannot hold many times the budget on the heap.
+    #[test]
+    fn tiny_updates_are_charged_for_their_overhead() {
+        let mut c = Compositor::default();
+        c.reset(64, 64);
+        c.create_surface(1, 64, 64);
+        c.map_surface(1, 0, 0);
+        c.end_frame();
+        let _ = c.drain_output();
+        let idle = c.allocated_bytes;
+
+        let black = Color {
+            b: 0,
+            g: 0,
+            r: 0,
+            xa: 0,
+        };
+        let pixels: Vec<_> = (0..10u16).map(|i| rect(i * 2, 0, i * 2 + 1, 1)).collect();
+        c.solid_fill(1, &black, &pixels);
+        c.end_frame();
+        assert_eq!(c.allocated_bytes - idle, 10 * (BYTES_PER_PIXEL + UPDATE_OVERHEAD));
+        assert_eq!(c.drain_output().len(), 10);
+        assert_eq!(c.allocated_bytes, idle);
     }
 
     /// Draining hands the pixels to the consumer, so the queue's charge returns to

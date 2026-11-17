@@ -28,6 +28,20 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Already running (usually in the system tray)? Hand the request over and exit, before
+    // touching logs or settings.
+    let primary = match bastion::single::runtime_dir() {
+        Some(dir) => match bastion::single::acquire(&dir, &bastion::single::Request::from_launch(import.as_deref())) {
+            Ok(bastion::single::Startup::Forwarded) => return Ok(()),
+            Ok(bastion::single::Startup::Primary(primary)) => Some(primary),
+            Err(e) => {
+                eprintln!("bastion: single-instance check failed ({e}); starting a separate instance");
+                None
+            }
+        },
+        None => None,
+    };
+
     let paths = AppPaths::discover()?;
     let settings = bastion_core::store::AppSettings::load(&paths);
     let _log = bastion_core::logging::init(&paths, &settings.log_level)?;
@@ -40,7 +54,17 @@ fn main() -> anyhow::Result<()> {
 
     let event_loop =
         winit::event_loop::EventLoop::<app::UserEvent>::with_user_event().build().context("create event loop")?;
-    let mut app = app::App::new(paths, event_loop.create_proxy(), import)?;
+    let launches = primary.map(|primary| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let proxy = event_loop.create_proxy();
+        primary.serve(move |request| {
+            if tx.send(request).is_ok() {
+                let _ = proxy.send_event(app::UserEvent::Launched);
+            }
+        });
+        rx
+    });
+    let mut app = app::App::new(paths, event_loop.create_proxy(), import, launches)?;
     event_loop.run_app(&mut app).context("event loop")?;
     tracing::info!("Bastion exiting");
     Ok(())

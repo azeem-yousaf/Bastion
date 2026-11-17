@@ -209,6 +209,67 @@ fn connecting_without_saved_password_prompts_for_credentials() {
     h.get_by_label("Enter a username and password.");
 }
 
+fn prompt_harness(f: &Fixture) -> Harness<'static, Manager> {
+    let mut store = ProfileStore::load(&f.paths).unwrap();
+    let p = bastion_core::Profile {
+        name: "Lab".into(),
+        host: "lab01".into(),
+        username: "bob".into(),
+        ..Default::default()
+    };
+    store.upsert(p.clone()).unwrap();
+    let mut m = manager(f);
+    assert!(m.begin_connect(p.id).is_none());
+    harness(m)
+}
+
+/// A state no real edit can equal: `has_undo` is then true exactly when any undo point exists.
+fn never_typed() -> (egui::text::CCursorRange, String) {
+    (egui::text::CCursorRange::default(), "\u{0}never typed".to_owned())
+}
+
+#[test]
+fn typed_password_is_not_kept_in_egui_undo_history() {
+    let f = fixture();
+    let mut h = prompt_harness(&f);
+    h.run();
+    let pw = h.get_by_role_and_label(egui::accesskit::Role::PasswordInput, "Password");
+    pw.focus();
+    pw.type_text("hunter2");
+    h.run();
+    let ids = h.state().password_field_ids().to_vec();
+    assert_eq!(ids.len(), 1, "one password field (no separate gateway credentials)");
+    let state = egui::TextEdit::load_state(&h.ctx, ids[0]).expect("the field is on screen");
+    assert!(!state.undoer().has_undo(&never_typed()), "egui must hold no undo copy of the password");
+    assert!(!state.undoer().is_in_flux(), "nor a pending one");
+
+    // Closing the prompt leaves nothing about the field behind.
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    h.run();
+    assert!(h.query_by_label("Sign in to Lab").is_none());
+    assert!(egui::TextEdit::load_state(&h.ctx, ids[0]).is_none(), "field state must be removed");
+}
+
+#[test]
+fn settings_page_survives_a_non_ascii_fingerprint_in_known_hosts() {
+    let f = fixture();
+    std::fs::create_dir_all(&f.paths.config_dir).unwrap();
+    // Byte 23 of the fingerprint is inside a multi-byte character.
+    std::fs::write(
+        f.paths.trust_file(),
+        "[hosts.\"rdp|pc01.corp.local:3389\"]\nsha256 = \"AB:CD:EF:01:23:45:67:8\u{2014}9 \u{201c}renewed\u{201d}\"\npinned_at = \"2026-01-01T00:00:00Z\"\n",
+    )
+    .unwrap();
+    // If the store itself refuses such a file the value cannot reach the UI at all.
+    let trust = TrustStore::load(&f.paths).unwrap_or_else(|_| TrustStore::in_memory());
+    let m = Manager::new(f.paths.clone(), Arc::new(Mutex::new(trust)), Arc::new(|| {})).unwrap();
+    let mut h = harness(m);
+    h.run();
+    h.get_by_label("⚙  Settings & trusted hosts").click();
+    h.run();
+    h.get_by_label("Settings");
+}
+
 fn rejection(previous: Option<&str>) -> CertificateRejection {
     CertificateRejection {
         kind: EndpointKind::Rdp,
@@ -227,6 +288,10 @@ fn rejection(previous: Option<&str>) -> CertificateRejection {
 struct DialogState {
     rej: CertificateRejection,
     ack: bool,
+    /// The arming delay has passed (the trust button is usable).
+    armed: bool,
+    /// Draw the dialog the way a session window does: with keyboard input isolated.
+    isolate: bool,
     actions: Vec<Action>,
 }
 
@@ -234,10 +299,77 @@ fn cert_harness(previous: Option<&str>) -> Harness<'static, DialogState> {
     Harness::builder().with_size(egui::vec2(800.0, 560.0)).wgpu().build_ui_state(
         |ui, s: &mut DialogState| {
             bastion::theme::apply(ui.ctx());
-            certificate_dialog(ui, &s.rej, &mut s.ack, &mut s.actions);
+            if s.isolate {
+                bastion::session::isolate_keyboard(ui.ctx());
+            }
+            certificate_dialog(ui, &s.rej, &mut s.ack, s.armed, &mut s.actions);
         },
-        DialogState { rej: rejection(previous), ack: false, actions: Vec::new() },
+        DialogState { rej: rejection(previous), ack: false, armed: true, isolate: false, actions: Vec::new() },
     )
+}
+
+/// What a user touch-typing into the remote session sends: Tab, Tab, Enter, Space…
+fn type_blindly(h: &mut Harness<'_, DialogState>) {
+    for _ in 0..4 {
+        for key in [egui::Key::Tab, egui::Key::Enter, egui::Key::Tab, egui::Key::Space] {
+            h.key_press(key);
+            h.run();
+        }
+    }
+}
+
+#[test]
+fn keystrokes_cannot_operate_the_certificate_dialog_in_a_session_window() {
+    // Control: plain egui lets Tab focus a dialog button and Enter/Space "click" it — the
+    // behaviour session windows must not have.
+    let mut h = cert_harness(None);
+    h.run();
+    type_blindly(&mut h);
+    assert!(!h.state().actions.is_empty(), "egui activates focused buttons from the keyboard");
+
+    // As drawn in a session window: no key can trust (or cancel) anything.
+    for previous in [None, Some("00:11:22:33")] {
+        let mut h = cert_harness(previous);
+        h.state_mut().isolate = true;
+        h.run();
+        type_blindly(&mut h);
+        assert!(h.state().actions.is_empty(), "keys must never reach the dialog: {:?}", h.state().actions);
+        assert!(!h.state().ack, "keys must not tick the acknowledgement");
+        // The mouse still works.
+        if previous.is_some() {
+            h.get_by_label("I have verified the new certificate and want to replace the old one").click();
+            h.run();
+            h.get_by_label("Replace and connect").click();
+        } else {
+            h.get_by_label("Trust and connect").click();
+        }
+        h.run();
+        assert_eq!(h.state().actions, vec![Action::TrustCert(true)]);
+    }
+}
+
+#[test]
+fn trust_button_is_disabled_until_the_dialog_is_armed() {
+    let mut h = cert_harness(None);
+    h.state_mut().armed = false;
+    h.run();
+    // A click that was already on its way when the dialog popped up does nothing.
+    h.get_by_label("Trust and connect").click();
+    h.run();
+    assert!(h.state().actions.is_empty(), "must not trust during the arming delay");
+    // Once armed the same click works; Cancel never waits.
+    h.state_mut().armed = true;
+    h.run();
+    h.get_by_label("Trust and connect").click();
+    h.run();
+    assert_eq!(h.state().actions, vec![Action::TrustCert(true)]);
+
+    let mut h = cert_harness(None);
+    h.state_mut().armed = false;
+    h.run();
+    h.get_by_label("Cancel").click();
+    h.run();
+    assert_eq!(h.state().actions, vec![Action::TrustCert(false)]);
 }
 
 #[test]

@@ -10,8 +10,9 @@ use bastion_session::ConnectParams;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
+use winit::platform::startup_notify::WindowAttributesExtStartupNotify as _;
 use winit::platform::wayland::WindowAttributesExtWayland as _;
-use winit::window::{Window, WindowId};
+use winit::window::{ActivationToken, Window, WindowId};
 
 use crate::gpu::{Gpu, WindowGfx};
 use crate::manager::{ConnectRequest, Manager};
@@ -26,6 +27,8 @@ pub enum UserEvent {
     ManagerWake,
     TrayOpen,
     TrayQuit,
+    /// Bastion was launched again while running: requests wait in `App::launches`.
+    Launched,
 }
 
 struct Live {
@@ -41,6 +44,8 @@ pub struct App {
     manager_win: Option<WindowGfx>,
     sessions: Vec<Live>,
     startup_import: Option<PathBuf>,
+    /// Requests from later launches, forwarded by the single-instance listener.
+    launches: Option<std::sync::mpsc::Receiver<crate::single::Request>>,
     keyboard_layout: u32,
     client_name: String,
     tray: Option<crate::tray::TrayHandle>,
@@ -59,6 +64,7 @@ impl App {
         paths: AppPaths,
         proxy: EventLoopProxy<UserEvent>,
         startup_import: Option<PathBuf>,
+        launches: Option<std::sync::mpsc::Receiver<crate::single::Request>>,
     ) -> anyhow::Result<Self> {
         let trust = Arc::new(Mutex::new(TrustStore::load(&paths)?));
         let p = proxy.clone();
@@ -79,6 +85,7 @@ impl App {
             manager_win: None,
             sessions: Vec::new(),
             startup_import,
+            launches,
             keyboard_layout: bastion_session::keyboard::detect_klid(),
             tray,
             tray_sessions: 0,
@@ -95,12 +102,15 @@ impl App {
         })
     }
 
-    fn open_manager(&mut self, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
-        let attrs = Window::default_attributes()
+    fn open_manager(&mut self, event_loop: &ActiveEventLoop, token: Option<ActivationToken>) -> anyhow::Result<()> {
+        let mut attrs = Window::default_attributes()
             .with_title("Bastion")
             .with_inner_size(winit::dpi::LogicalSize::new(980, 640))
             .with_min_inner_size(winit::dpi::LogicalSize::new(720, 480))
             .with_name("bastion", "bastion");
+        if let Some(token) = token {
+            attrs = attrs.with_activation_token(token);
+        }
         let window = Arc::new(event_loop.create_window(attrs)?);
         let gfx = match &self.gpu {
             Some(gpu) => WindowGfx::new(gpu, window, None)?,
@@ -113,6 +123,33 @@ impl App {
         };
         self.manager_win = Some(gfx);
         Ok(())
+    }
+
+    /// Bastion was launched again (application icon, or a `.rdp` file opened) while this
+    /// instance was running: bring the main window up and import the file, if any.
+    fn handle_launches(&mut self, event_loop: &ActiveEventLoop) {
+        let requests: Vec<_> = self.launches.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        for request in requests {
+            tracing::info!(import = request.import.is_some(), "Launched again; showing the main window");
+            // Wayland does not let an application raise a window it already has, so a visible
+            // (or minimised) window is replaced by a new one carrying the launcher's activation
+            // token. The manager's state lives outside the window and is kept.
+            if request.token.is_some() || self.manager_win.is_none() {
+                self.manager_win = None;
+                if let Err(e) = self.open_manager(event_loop, request.token.map(ActivationToken::from_raw)) {
+                    tracing::error!(error = %e, "Cannot reopen main window");
+                }
+            } else if let Some(w) = &self.manager_win {
+                w.window.set_minimized(false);
+                w.window.focus_window();
+            }
+            if let Some(path) = request.import {
+                self.manager.import_file(&path);
+            }
+            if let Some(w) = &self.manager_win {
+                w.window.request_redraw();
+            }
+        }
     }
 
     fn start_session(&mut self, event_loop: &ActiveEventLoop, request: ConnectRequest) {
@@ -224,7 +261,7 @@ impl App {
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.manager_win.is_none() && self.gpu.is_none() {
-            if let Err(e) = self.open_manager(event_loop) {
+            if let Err(e) = self.open_manager(event_loop, None) {
                 tracing::error!(error = %e, "Cannot open main window");
                 event_loop.exit();
                 return;
@@ -252,7 +289,7 @@ impl ApplicationHandler<UserEvent> for App {
                     w.window.focus_window();
                 }
                 None => {
-                    if let Err(e) = self.open_manager(event_loop) {
+                    if let Err(e) = self.open_manager(event_loop, None) {
                         tracing::error!(error = %e, "Cannot reopen main window");
                     }
                 }
@@ -262,6 +299,7 @@ impl ApplicationHandler<UserEvent> for App {
                     w.window.request_redraw();
                 }
             }
+            UserEvent::Launched => self.handle_launches(event_loop),
             UserEvent::Wake => {}
         }
         for live in &mut self.sessions {

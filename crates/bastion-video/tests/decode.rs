@@ -196,3 +196,30 @@ fn adaptive_decoder_starts_in_software_and_moves_to_hardware_at_a_keyframe() {
     let diff = reference.data().iter().zip(after.data()).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
     assert!(diff <= 3, "picture changed by {diff} levels across the switch");
 }
+
+#[test]
+fn streams_larger_than_the_limit_are_refused_before_decoding() {
+    // The fixture is 320x240. With the limit below that, FFmpeg must refuse the stream when
+    // it reads the SPS (no picture is allocated) and no frame may come out on either path.
+    for planes in [false, true] {
+        let mut d = software();
+        d.set_max_dimension(128);
+        d.yuv420_switch().store(planes, std::sync::atomic::Ordering::Relaxed);
+        for (i, unit) in access_units(TESTSRC).iter().enumerate() {
+            if planes {
+                assert!(d.decode_yuv420(unit).is_err(), "frame {i}");
+            } else {
+                assert!(d.decode(unit).is_err(), "frame {i}");
+            }
+        }
+        // A stream within the limit still decodes on the same decoder.
+        let mut d = software();
+        d.set_max_dimension(128);
+        let frame = d.decode(&access_units(RED)[0]).expect("64x48 is within 128x128");
+        assert_eq!((frame.width(), frame.height()), (64, 48));
+    }
+    // The default limit is the largest RDP desktop; ordinary streams are unaffected.
+    assert_eq!(bastion_video::MAX_FRAME_DIM, 8192);
+    let mut d = software();
+    assert!(d.decode(&access_units(TESTSRC)[0]).is_ok());
+}

@@ -251,3 +251,101 @@ fn enumeration_channel_can_be_reopened_after_windows_closes_it() {
         server(DrdynvcServerPdu::Close(ClosePdu::new(id)));
     }
 }
+
+/// Opens the device channel of `brio()` and returns it with the media types it offers.
+fn open_device(
+    ch: &mut bastion_camera::CameraChannels,
+    id: u32,
+) -> (Box<dyn DvcClientProcessor>, Vec<ironrdp_rdpecam::MediaType>) {
+    // The device channel is only accepted once the enumeration channel has negotiated a version.
+    let mut enumerator = ch.enumerator();
+    enumerator.start(1).unwrap();
+    enumerator.process(1, &encode_vec(&EnumerationPdu::SelectVersionResponse(V2)).unwrap()).unwrap();
+    let mut dev = ch.devices[0].create(id).expect("device channel accepted");
+    dev.start(id).unwrap();
+    send(&mut dev, id, DevicePdu::ActivateDeviceRequest);
+    let types = match &send(&mut dev, id, DevicePdu::MediaTypeListRequest(0))[..] {
+        [DevicePdu::MediaTypeListResponse(t)] => t.clone(),
+        other => panic!("{other:?}"),
+    };
+    (dev, types)
+}
+
+#[test]
+fn implausibly_large_frames_are_dropped_not_queued_or_sent() {
+    let host = FakeHost { cameras: vec![brio()], ..Default::default() };
+    let (up, sent) = uplink();
+    let mut ch = camera_channels(Arc::new(host.clone()), up).unwrap();
+    let (mut dev, types) = open_device(&mut ch, 2);
+    let start = DevicePdu::StartStreamsRequest(vec![StartStreamInfo { stream_index: 0, media_type: types[0] }]);
+    assert!(matches!(send(&mut dev, 2, start)[..], [DevicePdu::SuccessResponse]));
+
+    // A "JPEG" far beyond anything a 1080p camera produces, with a request outstanding…
+    let mut huge = vec![0u8; 9 * 1024 * 1024];
+    huge[..2].copy_from_slice(&[0xFF, 0xD8]);
+    assert!(send(&mut dev, 2, DevicePdu::SampleRequest(0)).is_empty());
+    host.emit(&huge);
+    assert!(sent.lock().unwrap().is_empty(), "an oversized frame must not be sent");
+    // …and without one: it must not be kept for the next request either.
+    let ok = [0xFF, 0xD8, 7, 0xFF, 0xD9];
+    host.emit(&ok);
+    assert_eq!(uplinked_samples(&sent), [ok.to_vec()]);
+    host.emit(&huge);
+    assert!(send(&mut dev, 2, DevicePdu::SampleRequest(0)).is_empty());
+    assert!(sent.lock().unwrap().is_empty(), "an oversized frame must not be held as pending");
+}
+
+#[test]
+fn ending_the_session_releases_the_camera() {
+    let host = FakeHost { cameras: vec![brio()], ..Default::default() };
+    let mut ch = camera_channels(Arc::new(host.clone()), uplink().0).unwrap();
+    let (mut dev, types) = open_device(&mut ch, 2);
+    send(&mut dev, 2, DevicePdu::StartStreamsRequest(vec![StartStreamInfo { stream_index: 0, media_type: types[0] }]));
+    assert!(host.running());
+    // No Stop request, no channel close: the connection just goes away and everything is dropped.
+    drop(dev);
+    drop(ch);
+    assert!(!host.running(), "camera must be released when the session's channels are dropped");
+}
+
+/// Counts info-and-above log events on the current thread.
+struct CountLogs(Arc<std::sync::atomic::AtomicUsize>);
+
+impl tracing::Subscriber for CountLogs {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        // Only this crate's lines: the protocol crate's own logging is not ours to bound.
+        if *event.metadata().level() <= tracing::Level::INFO && event.metadata().target().starts_with("bastion_camera")
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Start/Stop Streams requests arrive as fast as the server likes; they must not each log a line.
+#[test]
+fn start_and_stop_requests_do_not_log_once_per_request() {
+    let host = FakeHost { cameras: vec![brio()], ..Default::default() };
+    let mut ch = camera_channels(Arc::new(host.clone()), uplink().0).unwrap();
+    let (mut dev, types) = open_device(&mut ch, 2);
+    let lines = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tracing::subscriber::with_default(CountLogs(lines.clone()), || {
+        for _ in 0..300 {
+            let start = DevicePdu::StartStreamsRequest(vec![StartStreamInfo { stream_index: 0, media_type: types[0] }]);
+            assert!(matches!(send(&mut dev, 2, start)[..], [DevicePdu::SuccessResponse]));
+            assert!(matches!(send(&mut dev, 2, DevicePdu::StopStreamsRequest)[..], [DevicePdu::SuccessResponse]));
+        }
+    });
+    assert_eq!(host.state.lock().unwrap().started.len(), 300);
+    let lines = lines.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(lines <= 30, "{lines} log lines for 600 start/stop requests");
+}

@@ -5,6 +5,7 @@
 //! O_EXCL | O_NOFOLLOW)` relative to directory descriptors below a fresh private (0700)
 //! directory, so a hostile file list cannot write outside it or through symlinks.
 
+use std::collections::HashMap;
 use std::fs::{File, FileTimes};
 use std::io::Write as _;
 use std::os::fd::OwnedFd;
@@ -15,7 +16,7 @@ use ironrdp_cliprdr::pdu::{ClipboardFileAttributes, FileContentsFlags, FileConte
 use rustix::fs::{Mode, OFlags};
 use tempfile::TempDir;
 
-use super::{DOWNLOAD_PREFIX, Limits, PathRejection, sanitize_remote_path};
+use super::{DOWNLOAD_PREFIX, Limits, PathRejection, lock_download_dir, sanitize_remote_path};
 
 /// Bytes requested per `FileContentsRequest`.
 pub(crate) const CHUNK_BYTES: u32 = 1024 * 1024;
@@ -105,6 +106,57 @@ pub(crate) struct Download {
     last_activity: Instant,
 }
 
+/// A finished download on disk. Dropping it deletes the files; until then it keeps the
+/// directory locked so no sweep (ours or another session's) removes it.
+#[derive(Debug)]
+pub(crate) struct DownloadDir {
+    // Field order matters: the files go first, then the lock is released.
+    _dir: TempDir,
+    _lock: OwnedFd,
+}
+
+impl DownloadDir {
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &std::path::Path {
+        self._dir.path()
+    }
+}
+
+/// Counts the distinct directories and files a list would create, so nested paths cannot
+/// multiply the number of inodes past the entry limit.
+#[derive(Default)]
+struct InodeCount {
+    /// Children of each directory seen so far; index 0 is the download root.
+    children: Vec<HashMap<String, usize>>,
+    inodes: usize,
+}
+
+impl InodeCount {
+    fn add(&mut self, components: &[String], is_dir: bool) -> usize {
+        if self.children.is_empty() {
+            self.children.push(HashMap::new());
+        }
+        let dirs = if is_dir { components } else { &components[..components.len().saturating_sub(1)] };
+        let mut node = 0;
+        for c in dirs {
+            node = match self.children[node].get(c.as_str()) {
+                Some(&child) => child,
+                None => {
+                    let child = self.children.len();
+                    self.children.push(HashMap::new());
+                    self.children[node].insert(c.clone(), child);
+                    self.inodes += 1;
+                    child
+                }
+            };
+        }
+        if !is_dir {
+            self.inodes += 1;
+        }
+        self.inodes
+    }
+}
+
 fn filetime_to_system(ft: u64) -> Option<std::time::SystemTime> {
     let secs = (ft / 10_000_000).checked_sub(FILETIME_UNIX_OFFSET_SECS)?;
     let nanos = u32::try_from((ft % 10_000_000) * 100).ok()?;
@@ -124,6 +176,8 @@ impl Download {
         }
         let mut entries = Vec::new();
         let mut declared: u64 = 0;
+        let mut inodes = InodeCount::default();
+        let mut renamed = 0usize;
         for (index, f) in files.iter().enumerate() {
             let components = match sanitize_remote_path(f.relative_path.as_deref(), &f.name) {
                 Ok(c) => c,
@@ -133,6 +187,15 @@ impl Download {
                 }
             };
             let is_dir = f.attributes.is_some_and(|a| a.contains(ClipboardFileAttributes::DIRECTORY));
+            // Parent directories are created implicitly, so they count too: 10,000 entries with
+            // distinct 33-deep paths would otherwise create 330,000 directories.
+            let created = inodes.add(&components, is_dir);
+            if created > limits.max_files {
+                return Err(DownloadError::TooMany(created));
+            }
+            if components.last().is_some_and(|last| !f.name.ends_with(last.as_str())) {
+                renamed += 1;
+            }
             if !is_dir && let Some(size) = f.file_size {
                 declared = declared.saturating_add(size);
                 if size > limits.max_total_bytes || declared > limits.max_total_bytes {
@@ -145,6 +208,9 @@ impl Download {
         if entries.is_empty() {
             return Err(DownloadError::NoFiles);
         }
+        if renamed > 0 {
+            tracing::info!(renamed, "Renamed hidden or deceptive file names from the remote clipboard");
+        }
         let dir = tempfile::Builder::new()
             .prefix(DOWNLOAD_PREFIX)
             .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
@@ -154,6 +220,10 @@ impl Download {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
+        // Held for as long as the directory exists; see `files::sweep_stale`.
+        if !lock_download_dir(&root) {
+            tracing::debug!("Could not lock the clipboard download directory");
+        }
         Ok(Self {
             dir,
             root,
@@ -177,8 +247,8 @@ impl Download {
         self.dir.path()
     }
 
-    pub(crate) fn into_dir(self) -> TempDir {
-        self.dir
+    pub(crate) fn into_dir(self) -> DownloadDir {
+        DownloadDir { _dir: self.dir, _lock: self.root }
     }
 
     /// Opens (creating as needed) the directory for `components` below the root, never
@@ -492,6 +562,72 @@ mod tests {
         let l = Limits { max_total_bytes: 100, max_files: 4 };
         assert!(matches!(Download::start(&files, None, base.path(), l), Err(DownloadError::TooMany(5))));
         assert!(matches!(Download::start(&[], None, base.path(), limits(1)), Err(DownloadError::NoFiles)));
+    }
+
+    #[test]
+    fn implicit_directories_count_against_the_entry_limit() {
+        let base = tempfile::tempdir().expect("tmp");
+        // 20 entries, each below its own 5-deep directory chain: 100 directories + 20 files.
+        let files: Vec<_> =
+            (0..20).map(|i| file("f", Some(&format!("a{i}\\b{i}\\c{i}\\d{i}\\e{i}")), Some(0))).collect();
+        assert!(matches!(
+            Download::start(&files, None, base.path(), limits(1 << 20)),
+            Err(DownloadError::TooMany(n)) if n > 100
+        ));
+        let dirs: Vec<_> = (0..30).map(|i| dir(&format!("leaf{i}"), Some(&format!("x{i}\\y{i}\\z{i}")))).collect();
+        assert!(matches!(Download::start(&dirs, None, base.path(), limits(1 << 20)), Err(DownloadError::TooMany(_))));
+        assert_eq!(std::fs::read_dir(base.path()).expect("ls").count(), 0, "nothing created");
+
+        // Shared parents are counted once: 1 + 1 directories and 98 files fit in 100.
+        let mut shared = vec![dir("top", None), dir("sub", Some("top"))];
+        shared.extend((0..98).map(|i| file(&format!("f{i}"), Some("top\\sub"), Some(0))));
+        let mut dl = Download::start(&shared, None, base.path(), limits(1 << 20)).expect("start");
+        let contents = vec![Vec::new(); shared.len()];
+        assert_eq!(run(&mut dl, &contents).expect("download"), vec![dl.path().join("top")]);
+        assert_eq!(std::fs::read_dir(dl.path().join("top/sub")).expect("ls").count(), 98);
+    }
+
+    #[test]
+    fn hidden_names_arrive_under_visible_names() {
+        let base = tempfile::tempdir().expect("tmp");
+        let files = vec![
+            file("report.docx", None, Some(2)),
+            file(".bash_profile", None, Some(4)),
+            dir(".ssh", None),
+            file("authorized_keys", Some(".ssh"), Some(3)),
+        ];
+        let contents = vec![b"ok".to_vec(), b"evil".to_vec(), vec![], b"key".to_vec()];
+        let mut dl = Download::start(&files, None, base.path(), limits(100)).expect("start");
+        let paths = run(&mut dl, &contents).expect("download");
+        let root = dl.path().to_owned();
+        assert_eq!(paths, vec![root.join("report.docx"), root.join("_bash_profile"), root.join("_ssh")]);
+        assert_eq!(std::fs::read(root.join("_bash_profile")).expect("read"), b"evil", "contents still arrive");
+        assert_eq!(std::fs::read(root.join("_ssh/authorized_keys")).expect("read"), b"key");
+        let hidden: Vec<_> = std::fs::read_dir(&root)
+            .expect("ls")
+            .map(|e| e.expect("e").file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with('.'))
+            .collect();
+        assert!(hidden.is_empty(), "no hidden entry may be created: {hidden:?}");
+    }
+
+    #[test]
+    fn download_directory_stays_locked_until_dropped() {
+        let base = tempfile::tempdir().expect("tmp");
+        let mut dl = Download::start(&[file("a", None, Some(1))], None, base.path(), limits(100)).expect("start");
+        let path = dl.path().to_owned();
+        let old = std::time::SystemTime::now() - Duration::from_secs(3 * 24 * 3600);
+        let set_old = |p: &std::path::Path| File::open(p).expect("open").set_modified(old).expect("mtime");
+        set_old(&path);
+        super::super::sweep_stale(base.path());
+        assert!(path.exists(), "a download in progress survives a sweep");
+        run(&mut dl, &[b"x".to_vec()]).expect("download");
+        let kept = dl.into_dir();
+        set_old(&path);
+        super::super::sweep_stale(base.path());
+        assert!(path.join("a").exists(), "a finished download still on the clipboard survives a sweep");
+        drop(kept);
+        assert!(!path.exists());
     }
 
     #[test]

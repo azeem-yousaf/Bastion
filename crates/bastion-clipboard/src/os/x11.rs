@@ -26,7 +26,8 @@ use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME, NONE};
 
 use super::{OfferItem, OsClipboard, Transfer};
 use crate::convert::{
-    MIME_BMP, MIME_GNOME_FILES, MIME_HTML, MIME_JPEG, MIME_PNG, MIME_TEXT_PLAIN, MIME_TEXT_UTF8, MIME_URI_LIST,
+    MIME_BASTION_REMOTE, MIME_BMP, MIME_GNOME_FILES, MIME_HTML, MIME_JPEG, MIME_PASSWORD_HINT, MIME_PNG,
+    MIME_TEXT_PLAIN, MIME_TEXT_UTF8, MIME_URI_LIST,
 };
 use crate::worker::Command;
 
@@ -48,13 +49,15 @@ x11rb::atom_manager! {
         BMP: b"image/bmp",
         URI_LIST: b"text/uri-list",
         GNOME_FILES: b"x-special/gnome-copied-files",
+        PASSWORD_HINT: b"x-kde-passwordManagerHint",
+        BASTION_REMOTE: b"application/x-bastion-remote-clipboard",
         TRANSFER: b"BASTION_CLIPBOARD_TRANSFER",
     }
 }
 
 impl Atoms {
     /// Non-text MIME types we understand, with their atoms.
-    fn binary_types(&self) -> [(Atom, &'static str); 6] {
+    fn binary_types(&self) -> [(Atom, &'static str); 8] {
         [
             (self.HTML, MIME_HTML),
             (self.PNG, MIME_PNG),
@@ -62,6 +65,9 @@ impl Atoms {
             (self.BMP, MIME_BMP),
             (self.URI_LIST, MIME_URI_LIST),
             (self.GNOME_FILES, MIME_GNOME_FILES),
+            // Not content: who owns the selection / whether it may be forwarded (see the worker).
+            (self.PASSWORD_HINT, MIME_PASSWORD_HINT),
+            (self.BASTION_REMOTE, MIME_BASTION_REMOTE),
         ]
     }
 

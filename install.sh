@@ -15,7 +15,15 @@ if [[ "${1:-}" == "--uninstall" ]]; then
 fi
 
 cargo build --release -p bastion
-install -Dm755 target/release/bastion "$BIN/bastion"
+# Cargo does not always build into ./target (CARGO_TARGET_DIR, build.target-dir): ask it where
+# the binary went, so an old ./target/release/bastion is never installed in its place.
+TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+BUILT="$TARGET_DIR/release/bastion"
+if [[ -z "$TARGET_DIR" || "$TARGET_DIR" == *\\* || ! -x "$BUILT" ]]; then
+  echo "install.sh: cannot find the binary cargo just built (looked for '$BUILT'); nothing was installed." >&2
+  exit 1
+fi
+install -Dm755 "$BUILT" "$BIN/bastion"
 install -Dm644 packaging/bastion.desktop "$APPS/bastion.desktop"
 install -Dm644 packaging/bastion.svg "$ICONS/bastion.svg"
 install -Dm644 packaging/bastion-rdp.xml "$MIME/packages/bastion-rdp.xml"

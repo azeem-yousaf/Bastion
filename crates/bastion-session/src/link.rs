@@ -72,6 +72,12 @@ impl LinkStats {
         self.via_gateway.store(via_gateway, Ordering::Relaxed);
     }
 
+    /// Forgets the connection's socket once it has ended. The probe is a duplicate of that
+    /// socket, and the connection only really closes when every duplicate is gone.
+    pub fn clear_connection(&self) {
+        *self.probe.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
     pub fn set_server_report(&self, report: ServerReport) {
         *self.server.lock().unwrap_or_else(|p| p.into_inner()) = Some(report);
     }
@@ -214,6 +220,25 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(probe.read().is_none());
+    }
+
+    #[test]
+    fn clearing_the_connection_lets_the_socket_close() {
+        use std::io::Read;
+        let (client, mut server) = pair();
+        let stats = LinkStats::default();
+        stats.set_connection(TcpProbe::new(client.as_fd()), false);
+        let frame = crate::SharedFrame::default();
+        assert!(stats.sample(&frame).tcp.is_some());
+        drop(client);
+        // The probe's duplicate still holds the connection open: the peer sees no end of stream.
+        server.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let mut buf = [0u8; 1];
+        assert!(server.read(&mut buf).is_err(), "connection closed while the probe was alive");
+        stats.clear_connection();
+        server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(server.read(&mut buf).unwrap(), 0, "peer must see the connection close");
+        assert_eq!(stats.sample(&frame).tcp, None);
     }
 
     #[test]

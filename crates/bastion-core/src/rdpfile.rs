@@ -7,7 +7,7 @@
 use anyhow::{Result, bail};
 use ironrdp_propertyset::PropertySet;
 
-use crate::profile::{DEFAULT_GATEWAY_PORT, DEFAULT_RDP_PORT, DisplayMode, GatewaySettings, Profile};
+use crate::profile::{DEFAULT_GATEWAY_PORT, DEFAULT_RDP_PORT, DisplayMode, GatewaySettings, MAX_DESKTOP_SIZE, Profile};
 
 const MAX_RDP_FILE_BYTES: usize = 1024 * 1024;
 
@@ -94,6 +94,14 @@ pub fn import(text: &str, fallback_name: &str) -> (Profile, Vec<String>) {
         let mut gw = GatewaySettings { host, port, ..Default::default() };
         // promptcredentialonce:i:1 = reuse credentials for gateway and host (mstsc default).
         gw.same_credentials = i("promptcredentialonce").unwrap_or(1) == 1;
+        // The file chose where the password goes: say so, the same as mstsc's publisher prompt.
+        if gw.same_credentials {
+            warnings.push(format!(
+                "The file routes this connection through the gateway {}, which will receive the same user name \
+                 and password as the computer. Only keep it if you trust that gateway.",
+                gw.endpoint()
+            ));
+        }
         if usage == 2 {
             warnings.push("Gateway was set to auto-detect; Bastion will always use it.".to_owned());
         }
@@ -111,12 +119,19 @@ pub fn import(text: &str, fallback_name: &str) -> (Profile, Vec<String>) {
         p.display.mode = if i("use multimon") == Some(1) { DisplayMode::AllMonitors } else { DisplayMode::Fullscreen };
     }
     if let (Some(w), Some(h)) = (i("desktopwidth"), i("desktopheight"))
-        && let (Ok(w), Ok(h)) = (u16::try_from(w), u16::try_from(h))
         && w >= 200
         && h >= 200
     {
-        p.display.width = w;
-        p.display.height = h;
+        // A hostile file must not ask for a window or desktop no GPU or server can provide.
+        let max = i64::from(MAX_DESKTOP_SIZE);
+        if w > max || h > max {
+            warnings.push(format!(
+                "The desktop size in the file ({w} x {h}) is larger than RDP allows; it was limited to \
+                 {MAX_DESKTOP_SIZE} x {MAX_DESKTOP_SIZE}."
+            ));
+        }
+        p.display.width = u16::try_from(w.min(max)).unwrap_or(MAX_DESKTOP_SIZE);
+        p.display.height = u16::try_from(h.min(max)).unwrap_or(MAX_DESKTOP_SIZE);
     }
     if let Some(v) = i("dynamic resolution") {
         p.display.dynamic_resolution = v == 1;
@@ -130,12 +145,12 @@ pub fn import(text: &str, fallback_name: &str) -> (Profile, Vec<String>) {
         p.audio.microphone = m == 1;
     }
 
-    // Cameras: `*` = all, otherwise a ';'-separated list of device ids (Windows-specific).
-    if let Some(c) = s("camerastoredirect").as_deref().map(str::trim).filter(|c| !c.is_empty()) {
-        p.camera.enabled = true;
-        if c != "*" {
-            warnings.push("The file lists specific cameras; Bastion shares all of this computer's webcams.".to_owned());
-        }
+    // Cameras (`*` = all, otherwise a ';'-separated list of Windows device ids): like drives,
+    // never switched on by a file - the remote side could start a webcam at any time.
+    if s("camerastoredirect").is_some_and(|c| !c.trim().is_empty()) {
+        warnings.push(
+            "The file requests webcam redirection; it was left OFF. Enable it per connection if wanted.".to_owned(),
+        );
     }
 
     // Clipboard.
@@ -188,16 +203,55 @@ audiocapturemode:i:1\r\nredirectclipboard:i:1\r\ndrivestoredirect:s:*\r\n\r\n";
         assert!(p.audio.playback && p.audio.microphone && p.clipboard.enabled);
         assert!(!p.drive.enabled);
         assert!(warnings.iter().any(|w| w.contains("drive")));
+        assert_eq!((p.display.width, p.display.height), (1920, 1080));
+        assert!(!warnings.iter().any(|w| w.contains("desktop size")), "{warnings:?}");
     }
 
     #[test]
-    fn camera_redirection_is_imported() {
-        assert!(!import(SAMPLE, "x").0.camera.enabled);
-        let (p, w) = import("full address:s:pc01\r\ncamerastoredirect:s:*\r\n", "x");
-        assert!(p.camera.enabled && w.is_empty(), "{w:?}");
-        let (p, w) = import("full address:s:pc01\r\ncamerastoredirect:s:\\\\?\\usb#vid_046d\r\n", "x");
-        assert!(p.camera.enabled);
-        assert!(w.iter().any(|w| w.contains("all of this computer's webcams")), "{w:?}");
+    fn warns_when_the_file_supplies_a_gateway() {
+        let (_, w) = import(SAMPLE, "x");
+        assert!(w.iter().any(|w| w.contains("rdg.corp.com:443") && w.contains("same user name and password")), "{w:?}");
+        // Separate gateway credentials: nothing is shared, nothing to warn about.
+        let (p, w) =
+            import("full address:s:pc01\r\ngatewayhostname:s:gw.evil.example\r\npromptcredentialonce:i:0\r\n", "x");
+        assert!(!p.gateway.unwrap().same_credentials);
+        assert!(w.is_empty(), "{w:?}");
+        // No gateway, no warning.
+        let (p, w) = import("full address:s:pc01\r\n", "x");
+        assert!(p.gateway.is_none() && w.is_empty(), "{w:?}");
+    }
+
+    #[test]
+    fn oversized_desktop_is_limited_with_a_warning() {
+        for (w, h) in [(65535_i64, 65535_i64), (8193, 1080), (1920, 100_000), (4_000_000_000, 4_000_000_000)] {
+            let (p, warnings) =
+                import(&format!("full address:s:pc01\r\ndesktopwidth:i:{w}\r\ndesktopheight:i:{h}\r\n"), "x");
+            assert!(p.display.width <= MAX_DESKTOP_SIZE && p.display.height <= MAX_DESKTOP_SIZE, "{w}x{h}");
+            assert_eq!(p.display.width, u16::try_from(w.min(8192)).unwrap());
+            assert_eq!(p.display.height, u16::try_from(h.min(8192)).unwrap());
+            assert!(warnings.iter().any(|m| m.contains("limited to 8192 x 8192")), "{warnings:?}");
+            assert!(p.validate().is_empty(), "{:?}", p.validate());
+        }
+        // The largest legal size passes untouched; nonsense sizes keep the default.
+        let (p, warnings) = import("full address:s:pc01\r\ndesktopwidth:i:8192\r\ndesktopheight:i:8192\r\n", "x");
+        assert_eq!((p.display.width, p.display.height), (8192, 8192));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (p, _) = import("full address:s:pc01\r\ndesktopwidth:i:-5\r\ndesktopheight:i:70000\r\n", "x");
+        assert_eq!((p.display.width, p.display.height), (1600, 900));
+    }
+
+    #[test]
+    fn camera_redirection_is_never_enabled_by_a_file() {
+        let (p, w) = import(SAMPLE, "x");
+        assert!(!p.camera.enabled);
+        assert!(!w.iter().any(|w| w.contains("webcam")), "{w:?}");
+        for cameras in ["*", "\\\\?\\usb#vid_046d"] {
+            let (p, w) = import(&format!("full address:s:pc01\r\ncamerastoredirect:s:{cameras}\r\n"), "x");
+            assert!(!p.camera.enabled, "an imported file must not switch the camera on");
+            assert!(w.iter().any(|w| w.contains("webcam redirection") && w.contains("left OFF")), "{w:?}");
+        }
+        let (p, w) = import("full address:s:pc01\r\ncamerastoredirect:s:\r\n", "x");
+        assert!(!p.camera.enabled && w.is_empty(), "{w:?}");
     }
 
     #[test]

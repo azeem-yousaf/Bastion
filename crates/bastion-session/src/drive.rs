@@ -75,7 +75,9 @@ fn deny(req: ServerDriveIoRequest) -> PduResult<Vec<SvcMessage>> {
         ServerDriveIoRequest::ServerDriveSetSecurityRequest(r) => RdpdrPdu::ClientDriveSetSecurityResponse(
             ClientDriveSetSecurityResponse::new(&r, DENIED).map_err(|e| ironrdp_pdu::encode_err!(e))?,
         ),
-        _ => unreachable!("only mutating requests are denied"),
+        // Not reachable through `ReadOnlyDrive` (it only denies what `is_mutating` flags), but a
+        // request we cannot answer must end in an error, never a panic: release builds abort.
+        _ => return Err(ironrdp_pdu::pdu_other_err!("read-only drive", "request has no write-protected reply")),
     };
     Ok(vec![SvcMessage::from(pdu)])
 }
@@ -149,7 +151,10 @@ impl RdpdrBackend for ReadOnlyDrive {
 
 #[cfg(test)]
 mod tests {
-    use ironrdp_rdpdr::pdu::efs::{DeviceIoRequest, FileAttributes, MajorFunction, MinorFunction, SharedAccess};
+    use ironrdp_rdpdr::pdu::efs::{
+        DeviceCloseRequest, DeviceIoRequest, DeviceWriteRequest, FileAttributes, MajorFunction, MinorFunction,
+        SharedAccess,
+    };
 
     use super::*;
 
@@ -212,6 +217,30 @@ mod tests {
             CreateDisposition::FILE_OPEN,
             CreateOptions::FILE_DELETE_ON_CLOSE
         )));
+    }
+
+    #[test]
+    fn writes_are_refused_and_unexpected_requests_do_not_panic() {
+        let header = |major_function| DeviceIoRequest {
+            device_id: 1,
+            file_id: 3,
+            completion_id: 9,
+            major_function,
+            minor_function: MinorFunction::from(0u32),
+        };
+        let write = ServerDriveIoRequest::DeviceWriteRequest(DeviceWriteRequest {
+            device_io_request: header(MajorFunction::Write),
+            offset: 0,
+            write_data: b"x".to_vec(),
+        });
+        assert!(is_mutating(&write));
+        assert_eq!(deny(write).unwrap().len(), 1);
+
+        let close = ServerDriveIoRequest::DeviceCloseRequest(DeviceCloseRequest {
+            device_io_request: header(MajorFunction::Close),
+        });
+        assert!(!is_mutating(&close), "closing a handle is not a modification");
+        assert!(deny(close).is_err(), "an unexpected request is an error, not a panic");
     }
 
     #[test]

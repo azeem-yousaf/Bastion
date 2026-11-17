@@ -15,9 +15,17 @@ use std::time::Duration;
 use ironrdp_rdpsnd::client::RdpsndClientHandler;
 use ironrdp_rdpsnd::codec::AudioDecoder;
 use ironrdp_rdpsnd::pdu::{AudioFormat, AudioFormatFlags, PitchPdu, VolumePdu, WaveFormat};
-use tracing::{debug, info, warn};
+use tracing::debug;
 
+use crate::format::pcm_spec;
 use crate::host::{AudioHost, PcmSpec, PulseHost};
+use crate::ratelimit::gated;
+
+/// Most audio the playback queue may hold, whatever the server sends: beyond this, new chunks
+/// are dropped before they are queued (the writer's high-water mark normally drops far earlier).
+const MAX_QUEUED: Duration = Duration::from_secs(10);
+/// Server format lists are logged only up to this many entries.
+const MAX_LOGGED_FORMATS: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct PlaybackOptions {
@@ -60,6 +68,7 @@ pub fn client_formats() -> Vec<AudioFormat> {
 pub fn is_playable(f: &AudioFormat) -> bool {
     (1..=2).contains(&f.n_channels)
         && (8_000..=192_000).contains(&f.n_samples_per_sec)
+        && pcm_spec(f).is_some()
         && AudioDecoder::supports(&crate::format::normalize(f))
 }
 
@@ -70,6 +79,8 @@ struct Writer {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     spec: PcmSpec,
+    /// Hard cap on queued samples ([`MAX_QUEUED`] of audio).
+    max_queued: usize,
 }
 
 impl Writer {
@@ -94,14 +105,20 @@ impl Writer {
         let thread = std::thread::Builder::new()
             .name("bastion-playback".into())
             .spawn(move || ctx.run())
-            .map_err(|e| warn!(error = %e, "Cannot spawn audio playback thread"))
+            .map_err(|e| gated!(warn, error = %e, "Cannot spawn audio playback thread"))
             .ok();
-        Self { tx: Some(tx), queued_samples, device_latency_us, stop, thread, spec }
+        let max_queued = spec.samples_for(MAX_QUEUED);
+        Self { tx: Some(tx), queued_samples, device_latency_us, stop, thread, spec, max_queued }
     }
 
     fn push(&self, samples: Vec<i16>) {
         let n = samples.len();
         let Some(tx) = &self.tx else { return };
+        // The channel bounds the number of chunks, not their size; this bounds the memory.
+        if self.queued_samples.load(Ordering::Relaxed).saturating_add(n) > self.max_queued {
+            bastion_metrics::AUDIO_DROPPED.add(n as u64);
+            return;
+        }
         self.queued_samples.fetch_add(n, Ordering::Relaxed);
         match tx.try_send(samples) {
             Ok(()) => {}
@@ -164,11 +181,11 @@ impl WriterCtx {
             if dev.is_none() {
                 match self.host.open_playback(self.device.as_deref(), self.spec, self.latency) {
                     Ok(d) => {
-                        info!(device = self.device.as_deref().unwrap_or("default"), spec = ?self.spec, "Audio playback started");
+                        gated!(info, device = self.device.as_deref().unwrap_or("default"), spec = ?self.spec, "Audio playback started");
                         dev = Some(d);
                     }
                     Err(e) => {
-                        warn!(error = %e, "Cannot open audio output; retrying");
+                        gated!(warn, error = %e, "Cannot open audio output; retrying");
                         std::thread::sleep(Duration::from_millis(500));
                         continue;
                     }
@@ -176,7 +193,7 @@ impl WriterCtx {
             }
             if let Some(d) = dev.as_mut() {
                 if let Err(e) = d.write(&chunk) {
-                    warn!(error = %e, "Audio output failed (device removed?); reopening");
+                    gated!(warn, error = %e, "Audio output failed (device removed?); reopening");
                     dev = None;
                 } else {
                     self.dev_lat.store(d.latency().as_micros() as u64, Ordering::Relaxed);
@@ -223,18 +240,25 @@ impl PulsePlayback {
         if self.decoder.as_ref().is_some_and(|(f, _)| f == format) {
             return true;
         }
+        // Only negotiated formats should arrive here, but the device shape must never be built
+        // from unchecked server fields (a channel count of 256 would truncate to 0).
+        let Some(spec) = pcm_spec(format).filter(|_| is_playable(format)) else {
+            bastion_metrics::AUDIO_REJECTED.incr();
+            gated!(warn, format = ?format.format, channels = format.n_channels, rate = format.n_samples_per_sec, "Unsupported audio format from server");
+            return false;
+        };
         let dec = match AudioDecoder::new(&crate::format::normalize(format)) {
             Ok(d) => d,
             Err(e) => {
-                warn!(error = %e, ?format, "Unsupported audio format from server");
+                bastion_metrics::AUDIO_REJECTED.incr();
+                gated!(warn, error = %e, format = ?format.format, "Unsupported audio format from server");
                 return false;
             }
         };
-        let spec = PcmSpec { rate: format.n_samples_per_sec, channels: format.n_channels as u8 };
         if self.writer.as_ref().is_none_or(|w| w.spec != spec) {
             self.writer = Some(Writer::spawn(self.host.clone(), &self.opts, spec));
         }
-        info!(format = ?crate::format::normalize(format).format, rate = format.n_samples_per_sec, channels = format.n_channels, "Remote audio stream started");
+        gated!(info, format = ?crate::format::normalize(format).format, rate = format.n_samples_per_sec, channels = format.n_channels, "Remote audio stream started");
         self.decoder = Some((format.clone(), dec));
         true
     }
@@ -251,15 +275,21 @@ impl RdpsndClientHandler for PulsePlayback {
 
     fn choose_formats(&self, server_formats: &[AudioFormat]) -> Vec<AudioFormat> {
         let chosen: Vec<_> = server_formats.iter().filter(|f| is_playable(f)).cloned().collect();
-        let offered: Vec<String> = server_formats
-            .iter()
-            .map(|f| format!("{:?}/{}ch/{}Hz/{}bit", f.format, f.n_channels, f.n_samples_per_sec, f.bits_per_sample))
-            .collect();
+        // The list is as long as the server likes; only its head is ever formatted.
+        let offered = || -> Vec<String> {
+            server_formats
+                .iter()
+                .take(MAX_LOGGED_FORMATS)
+                .map(|f| {
+                    format!("{:?}/{}ch/{}Hz/{}bit", f.format, f.n_channels, f.n_samples_per_sec, f.bits_per_sample)
+                })
+                .collect()
+        };
         if chosen.is_empty() {
-            warn!(?offered, "Server offered no playable audio format");
+            gated!(warn, offered = ?offered(), total = server_formats.len(), "Server offered no playable audio format");
         } else {
-            info!(offered = offered.len(), accepted = chosen.len(), "Audio formats negotiated");
-            debug!(?offered, "Server audio formats");
+            gated!(info, offered = server_formats.len(), accepted = chosen.len(), "Audio formats negotiated");
+            debug!(offered = ?offered(), total = server_formats.len(), "Server audio formats");
         }
         chosen
     }

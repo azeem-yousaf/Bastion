@@ -12,13 +12,17 @@
 //!
 //! The decoder is configured for low delay: every input access unit yields its own picture
 //! (no reordering), which AVC444 relies on.
+//!
+//! The picture size is whatever the stream's SPS says, i.e. chosen by the server, so it is
+//! capped at [`MAX_FRAME_DIM`] per side: FFmpeg refuses larger streams before allocating
+//! pictures for them (`max_pixels`), and nothing larger is ever converted.
 
 #![allow(unsafe_code)]
 
 use std::ffi::c_int;
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use ffmpeg_next::ffi;
@@ -57,6 +61,22 @@ impl Default for DecoderOptions {
     fn default() -> Self {
         Self { prefer_hardware: true, yuv420_planes: false, adaptive: false }
     }
+}
+
+/// Largest H.264 picture edge decoded, in pixels: the largest desktop RDP (and Bastion) allows.
+/// A legitimate stream is the size of the surface it paints, rounded up to whole macroblocks;
+/// 8192 is itself a multiple of 16, so the largest desktop still fits.
+pub const MAX_FRAME_DIM: u32 = 8192;
+
+/// Refuses decoded pictures larger than `max_dim` per side, before anything is allocated or
+/// converted for them.
+fn check_picture_size(width: u32, height: u32, max_dim: u32) -> DecoderResult<()> {
+    if width > max_dim || height > max_dim {
+        return Err(DecoderError::msg(format!(
+            "H.264 picture of {width}x{height} exceeds the {max_dim}x{max_dim} limit"
+        )));
+    }
+    Ok(())
 }
 
 /// Average software decode time (ms per frame) above which adaptive mode moves to hardware.
@@ -151,7 +171,13 @@ fn err(ctx: &str, code: c_int) -> DecoderError {
 }
 
 impl Context {
-    fn open(accel: Accel) -> DecoderResult<Self> {
+    /// Limits the coded picture size FFmpeg accepts (checked when a stream's SPS is activated,
+    /// before it allocates pictures) to `max_dim` × `max_dim`.
+    fn limit_picture_size(&mut self, max_dim: u32) {
+        unsafe { (*self.ctx).max_pixels = i64::from(max_dim) * i64::from(max_dim) };
+    }
+
+    fn open(accel: Accel, max_dim: u32) -> DecoderResult<Self> {
         unsafe {
             let codec = ffi::avcodec_find_decoder(ffi::AVCodecID::AV_CODEC_ID_H264);
             if codec.is_null() {
@@ -162,6 +188,7 @@ impl Context {
                 return Err(DecoderError::msg("avcodec_alloc_context3 failed"));
             }
             let mut this = Self { ctx, accel };
+            this.limit_picture_size(max_dim);
             (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as c_int;
             (*ctx).flags2 |= ffi::AV_CODEC_FLAG2_SHOW_ALL as c_int;
             match accel {
@@ -221,6 +248,8 @@ pub struct FfmpegH264Decoder {
     adaptive: Option<Adaptive>,
     /// What `supports_yuv420` answers; see [`FfmpegH264Decoder::yuv420_switch`].
     planes: Arc<AtomicBool>,
+    /// Largest picture edge accepted (see [`MAX_FRAME_DIM`]).
+    max_dim: u32,
 }
 
 // SAFETY: all FFmpeg objects are exclusively owned and only used through `&mut self`.
@@ -230,8 +259,14 @@ impl FfmpegH264Decoder {
     pub fn new(opts: DecoderOptions) -> DecoderResult<Self> {
         let hw_allowed = opts.prefer_hardware && std::env::var_os("BASTION_NO_HWDEC").is_none();
         let adaptive = (opts.adaptive && hw_allowed).then(Adaptive::default);
-        let ctx = Self::open_best(opts.prefer_hardware && adaptive.is_none())?;
-        info!(accel = ctx.accel.name(), "H.264 decoder ready");
+        let ctx = Self::open_best(opts.prefer_hardware && adaptive.is_none(), MAX_FRAME_DIM)?;
+        // A server can make the session open a decoder per graphics channel it creates, so
+        // only the first few and then every 64th are logged.
+        static OPENED: AtomicU64 = AtomicU64::new(0);
+        let opened = OPENED.fetch_add(1, Ordering::Relaxed) + 1;
+        if opened <= 8 || opened.is_multiple_of(64) {
+            info!(accel = ctx.accel.name(), opened, "H.264 decoder ready");
+        }
         Ok(Self {
             ctx,
             frame: Frame::new(),
@@ -240,7 +275,15 @@ impl FfmpegH264Decoder {
             hw_failures: 0,
             adaptive,
             planes: Arc::new(AtomicBool::new(opts.yuv420_planes)),
+            max_dim: MAX_FRAME_DIM,
         })
+    }
+
+    /// Lowers the largest picture edge accepted (never above [`MAX_FRAME_DIM`]), e.g. to the
+    /// size of the desktop being shown. Streams announcing a larger picture then fail to decode.
+    pub fn set_max_dimension(&mut self, max_dim: u32) {
+        self.max_dim = max_dim.clamp(16, MAX_FRAME_DIM);
+        self.ctx.limit_picture_size(self.max_dim);
     }
 
     /// Flag the decoder sets to ask the server for a keyframe (adaptive mode, before switching
@@ -263,9 +306,9 @@ impl FfmpegH264Decoder {
     }
 
     /// Opens a hardware decoder, if any works.
-    fn open_hardware() -> Option<Context> {
+    fn open_hardware(max_dim: u32) -> Option<Context> {
         [Accel::Cuda, Accel::Vaapi].into_iter().find_map(|accel| {
-            Context::open(accel)
+            Context::open(accel, max_dim)
                 .map_err(|e| debug!(accel = accel.name(), error = %e, "Hardware decoder unavailable"))
                 .ok()
         })
@@ -286,22 +329,22 @@ impl FfmpegH264Decoder {
         self.ctx.accel
     }
 
-    fn open_best(prefer_hw: bool) -> DecoderResult<Context> {
+    fn open_best(prefer_hw: bool, max_dim: u32) -> DecoderResult<Context> {
         if prefer_hw && std::env::var_os("BASTION_NO_HWDEC").is_none() {
             for accel in [Accel::Cuda, Accel::Vaapi] {
-                match Context::open(accel) {
+                match Context::open(accel, max_dim) {
                     Ok(c) => return Ok(c),
                     Err(e) => debug!(accel = accel.name(), error = %e, "Hardware decoder unavailable"),
                 }
             }
         }
-        Context::open(Accel::Software)
+        Context::open(Accel::Software, max_dim)
     }
 
     fn fall_back_to_software(&mut self) -> DecoderResult<()> {
         warn!(from = self.ctx.accel.name(), "Hardware H.264 decode failed; switching to software");
         bastion_metrics::VIDEO_HW_FALLBACKS.incr();
-        self.ctx = Context::open(Accel::Software)?;
+        self.ctx = Context::open(Accel::Software, self.max_dim)?;
         Ok(())
     }
 
@@ -317,7 +360,7 @@ impl FfmpegH264Decoder {
         let payload_len = self.input.len();
         if self.adaptive.as_ref().is_some_and(|a| a.switch_pending) && contains_idr(&self.input) {
             // A keyframe: the hardware decoder can start here without artefacts.
-            match Self::open_hardware() {
+            match Self::open_hardware(self.max_dim) {
                 Some(ctx) => {
                     info!(accel = ctx.accel.name(), "Switched H.264 decoding to hardware");
                     self.ctx = ctx;
@@ -413,10 +456,13 @@ enum PlanesKind<'a> {
     Nv12 { uv: &'a [u8], stride: usize },
 }
 
-unsafe fn planes<'a>(f: *const ffi::AVFrame) -> DecoderResult<Planes<'a>> {
+unsafe fn planes<'a>(f: *const ffi::AVFrame, max_dim: u32) -> DecoderResult<Planes<'a>> {
     unsafe {
         let w = u32::try_from((*f).width).map_err(|_| DecoderError::msg("bad frame width"))?;
         let h = u32::try_from((*f).height).map_err(|_| DecoderError::msg("bad frame height"))?;
+        // `max_pixels` bounds the area FFmpeg decodes; this bounds each side (a 16384×4096
+        // picture has an acceptable area) before any plane is copied or converted.
+        check_picture_size(w, h, max_dim)?;
         let ch = h.div_ceil(2) as usize;
         let ls = |i: usize| (*f).linesize[i] as usize;
         let plane = |i: usize, rows: usize| std::slice::from_raw_parts((*f).data[i], ls(i) * rows);
@@ -502,12 +548,14 @@ fn to_yuv420(p: &Planes<'_>) -> DecoderResult<Yuv420Frame> {
 impl H264Decoder for FfmpegH264Decoder {
     fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame> {
         let f = self.decode_raw(data)?;
-        bastion_metrics::VIDEO_CONVERT.time(|| to_rgba(&unsafe { planes(f)? }))
+        let max_dim = self.max_dim;
+        bastion_metrics::VIDEO_CONVERT.time(|| to_rgba(&unsafe { planes(f, max_dim)? }))
     }
 
     fn decode_yuv420(&mut self, data: &[u8]) -> DecoderResult<Yuv420Frame> {
         let f = self.decode_raw(data)?;
-        bastion_metrics::VIDEO_CONVERT.time(|| to_yuv420(&unsafe { planes(f)? }))
+        let max_dim = self.max_dim;
+        bastion_metrics::VIDEO_CONVERT.time(|| to_yuv420(&unsafe { planes(f, max_dim)? }))
     }
 
     fn supports_yuv420(&self) -> bool {
@@ -540,6 +588,16 @@ mod adaptive_tests {
             let ms = if i % 50 == 0 { 30.0 } else { 2.0 };
             assert!(!a.observe(ms), "frame {i}");
         }
+    }
+
+    #[test]
+    fn pictures_larger_than_any_remote_desktop_are_refused() {
+        assert!(check_picture_size(MAX_FRAME_DIM, MAX_FRAME_DIM, MAX_FRAME_DIM).is_ok());
+        assert!(check_picture_size(3840, 2160, MAX_FRAME_DIM).is_ok());
+        // Acceptable area, absurd shape; and the 1 GB RGBA case from a few bytes of SPS.
+        assert!(check_picture_size(16_384, 4096, MAX_FRAME_DIM).is_err());
+        assert!(check_picture_size(64, MAX_FRAME_DIM + 16, MAX_FRAME_DIM).is_err());
+        assert!(check_picture_size(16_384, 16_000, MAX_FRAME_DIM).is_err());
     }
 
     #[test]

@@ -18,6 +18,12 @@ pub(crate) const MIME_JPEG: &str = "image/jpeg";
 pub(crate) const MIME_BMP: &str = "image/bmp";
 pub(crate) const MIME_URI_LIST: &str = "text/uri-list";
 pub(crate) const MIME_GNOME_FILES: &str = "x-special/gnome-copied-files";
+/// Set to `secret` by password managers (KeePassXC, KWallet, ...) on selections that must not
+/// be recorded or forwarded. Clipboard managers honour it; so do we.
+pub(crate) const MIME_PASSWORD_HINT: &str = "x-kde-passwordManagerHint";
+/// Carried by every remote clipboard a Bastion session offers locally, so other sessions (in
+/// this process or another) recognise it and do not pass it on to their own remote.
+pub(crate) const MIME_BASTION_REMOTE: &str = "application/x-bastion-remote-clipboard";
 
 /// Text types we read locally, best first.
 pub(crate) const LOCAL_TEXT_TYPES: &[&str] =
@@ -207,9 +213,16 @@ pub(crate) fn cf_html_to_local_html(data: &[u8]) -> Result<Vec<u8>, ConvertError
 // Images
 // ---------------------------------------------------------------------------------------------
 
+/// Largest side of an image the DIB conversion accepts.
+const MAX_IMAGE_SIDE: u32 = 10_000;
+/// Largest decoded (RGBA) image the DIB conversion accepts.
+const MAX_IMAGE_RGBA_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Converts a local image (`image/png`, `image/bmp`, `image/jpeg`) to PNG.
 ///
-/// `max_bytes` bounds the decoder's allocations so a crafted image cannot exhaust memory.
+/// An image the DIB conversion would refuse anyway (more than 64 MiB of RGBA, or a side over
+/// 10,000 pixels) is refused from its header, before anything is decoded. `max_bytes` further
+/// bounds the decoder's allocations so a crafted image cannot exhaust memory.
 pub(crate) fn local_image_to_png(mime: &str, data: &[u8], max_bytes: usize) -> Result<Vec<u8>, ConvertError> {
     let format = match mime {
         MIME_PNG => return Ok(data.to_vec()),
@@ -217,9 +230,20 @@ pub(crate) fn local_image_to_png(mime: &str, data: &[u8], max_bytes: usize) -> R
         MIME_JPEG => image::ImageFormat::Jpeg,
         other => return Err(ConvertError(format!("unsupported image type {other}"))),
     };
+    let (width, height) = image::ImageReader::with_format(Cursor::new(data), format).into_dimensions().map_err(err)?;
+    if width > MAX_IMAGE_SIDE
+        || height > MAX_IMAGE_SIDE
+        || u64::from(width) * u64::from(height) * 4 > MAX_IMAGE_RGBA_BYTES
+    {
+        return Err(ConvertError(format!("image is too large for the clipboard ({width}x{height})")));
+    }
     let mut reader = image::ImageReader::with_format(Cursor::new(data), format);
     let mut limits = image::Limits::default();
-    limits.max_alloc = Some(u64::try_from(max_bytes.saturating_mul(4)).unwrap_or(u64::MAX));
+    limits.max_image_width = Some(MAX_IMAGE_SIDE);
+    limits.max_image_height = Some(MAX_IMAGE_SIDE);
+    // The decoded image fits in 64 MiB (checked above); allow the decoder some working memory.
+    let max_alloc = u64::try_from(max_bytes.saturating_mul(4)).unwrap_or(u64::MAX).min(MAX_IMAGE_RGBA_BYTES * 2);
+    limits.max_alloc = Some(max_alloc);
     reader.limits(limits);
     let img = reader.decode().map_err(err)?;
     let rgba = img.to_rgba8();
@@ -413,6 +437,35 @@ mod tests {
             assert_eq!(decode_png(&png).dimensions(), (3, 2));
         }
         assert!(local_image_to_png(MIME_JPEG, b"not a jpeg", 1 << 20).is_err());
+    }
+
+    /// A valid BMP header (24 bpp) for a `width` x `height` image, with no pixel data.
+    fn bmp_header(width: u32, height: u32) -> Vec<u8> {
+        let mut bmp = Vec::new();
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // file size (ignored)
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        bmp.extend_from_slice(&54u32.to_le_bytes()); // pixel data offset
+        bmp.extend_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER
+        bmp.extend_from_slice(&width.to_le_bytes());
+        bmp.extend_from_slice(&height.to_le_bytes());
+        bmp.extend_from_slice(&1u16.to_le_bytes()); // planes
+        bmp.extend_from_slice(&24u16.to_le_bytes()); // bits per pixel
+        bmp.extend_from_slice(&[0u8; 24]); // no compression, sizes, resolution, palette
+        bmp
+    }
+
+    #[test]
+    fn oversized_local_images_are_refused_from_the_header() {
+        // What the DIB conversion could never send must be refused before decoding, whatever the
+        // transfer limit: 18,000 x 18,000 would need 1.2 GiB of RGBA.
+        for (width, height) in [(18_000, 18_000), (9_000, 9_000), (10_001, 1), (1, 10_001), (4_097, 4_097)] {
+            let error = local_image_to_png(MIME_BMP, &bmp_header(width, height), 256 << 20).expect_err("refused");
+            assert!(error.to_string().contains("too large"), "{width}x{height}: {error}");
+        }
+        // Within the cap the header is accepted and decoding proceeds (and fails: no pixels).
+        let error = local_image_to_png(MIME_BMP, &bmp_header(4_096, 4_096), 256 << 20).expect_err("truncated");
+        assert!(!error.to_string().contains("too large"), "{error}");
     }
 
     #[test]

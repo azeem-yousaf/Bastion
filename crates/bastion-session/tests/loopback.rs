@@ -461,6 +461,44 @@ fn connection_loss_triggers_auto_reconnect() {
     assert!(error, "{reason}");
 }
 
+/// A server (or someone on the path) that answers the security negotiation with "TLS only"
+/// must not get a TLS handshake, let alone the password in the Client Info PDU.
+#[test]
+fn tls_only_downgrade_is_refused_before_anything_is_sent() {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        s.set_read_timeout(Some(TIMEOUT)).unwrap();
+        // X.224 Connection Request: TPKT header (length at bytes 2..4), then the rest.
+        let mut header = [0u8; 4];
+        s.read_exact(&mut header).unwrap();
+        let mut rest = vec![0u8; usize::from(u16::from_be_bytes([header[2], header[3]])) - 4];
+        s.read_exact(&mut rest).unwrap();
+        // X.224 Connection Confirm with RDP_NEG_RSP selecting PROTOCOL_SSL (0x1): no CredSSP.
+        s.write_all(&[
+            0x03, 0x00, 0x00, 0x13, // TPKT, 19 bytes
+            0x0e, 0xd0, 0x00, 0x00, 0x12, 0x34, 0x00, // X.224 CC
+            0x02, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, // RDP_NEG_RSP, selectedProtocol = SSL
+        ])
+        .unwrap();
+        // Everything the client sends from here on (a TLS ClientHello would be the first thing).
+        let mut after = Vec::new();
+        let _ = s.read_to_end(&mut after);
+        let _ = seen_tx.send(after);
+    });
+
+    let h = connect(profile(port), PASSWORD, Arc::new(Mutex::new(TrustStore::in_memory())));
+    let (reason, error) = wait_disconnect(&h);
+    assert!(error);
+    assert!(reason.contains("Network Level Authentication"), "{reason}");
+    assert!(!reason.contains(".rs"), "{reason}");
+    let after = seen_rx.recv_timeout(TIMEOUT).expect("server thread");
+    assert!(after.is_empty(), "client kept talking after the downgrade: {} bytes", after.len());
+}
+
 #[test]
 fn unreachable_host_reports_error() {
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();

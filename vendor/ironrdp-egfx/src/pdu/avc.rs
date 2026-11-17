@@ -7,7 +7,6 @@ use ironrdp_pdu::{
     Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_fixed_part_size,
     ensure_size, invalid_field_err,
 };
-use tracing::warn;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuantQuality {
@@ -498,11 +497,11 @@ pub fn avc_to_annex_b_into(data: &[u8], out: &mut Vec<u8>) {
         offset += 4;
 
         let Some(end) = offset.checked_add(nal_len) else {
-            warn!(nal_len, offset, "AVC NAL length overflow, discarding remaining data");
+            warn_throttled!(nal_len, offset, "AVC NAL length overflow, discarding remaining data");
             break;
         };
         if end > data.len() {
-            warn!(
+            warn_throttled!(
                 nal_len,
                 offset,
                 data_len = data.len(),

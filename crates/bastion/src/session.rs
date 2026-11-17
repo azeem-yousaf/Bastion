@@ -57,7 +57,12 @@ pub struct Session {
     pub handle: SessionHandle,
     pub views: HashMap<WindowId, View>,
     phase: Phase,
-    cert: Option<(Box<CertificateRejection>, bool)>,
+    /// Pending certificate prompt: the rejection, the "I have verified it" tick, and when the
+    /// dialog was first painted (its trust button stays disabled for [`CERT_ARM_DELAY`]).
+    cert: Option<(Box<CertificateRejection>, bool, Option<Instant>)>,
+    /// Set when Bastion itself ended the session (e.g. a desktop size the GPU cannot show);
+    /// this message is kept over whatever the engine reports afterwards.
+    fatal: Option<String>,
     notices: Vec<(Instant, String)>,
     input: InputState,
     /// Keyboard goes to the remote session (false after the release chord until clicked back).
@@ -246,6 +251,60 @@ enum RemoteCursor {
 }
 
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
+/// How long the certificate dialog's trust button stays disabled after the dialog first appears.
+/// The prompt can pop up in the middle of work (an automatic reconnect), so a click that was
+/// already on its way to the remote desktop must not be able to accept a certificate.
+pub const CERT_ARM_DELAY: Duration = Duration::from_millis(1500);
+
+/// Whether the certificate dialog's trust button may be used, `shown_for` after it appeared.
+pub fn cert_armed(shown_for: Duration) -> bool {
+    shown_for >= CERT_ARM_DELAY
+}
+
+/// Whether egui may see this window event of a session window. Keyboard and IME input never
+/// does: no session overlay has a text field, and egui would otherwise let Tab focus an overlay
+/// button and Space/Enter "click" it — keys typed for the remote computer could accept a
+/// certificate or disconnect. Overlays are operated with the pointer only.
+pub fn egui_may_see(event: &WindowEvent) -> bool {
+    !matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_))
+}
+
+/// Second line of defence, called at the start of every session-window frame: drops any
+/// keyboard input that reached egui anyway and takes keyboard focus away from overlay widgets,
+/// so nothing in a session window can be activated from the keyboard.
+pub fn isolate_keyboard(ctx: &egui::Context) {
+    ctx.input_mut(|i| {
+        i.events.retain(|e| {
+            !matches!(
+                e,
+                egui::Event::Key { .. }
+                    | egui::Event::Text(_)
+                    | egui::Event::Ime(_)
+                    | egui::Event::Copy
+                    | egui::Event::Cut
+                    | egui::Event::Paste(_)
+            )
+        });
+        i.keys_down.clear();
+    });
+    ctx.memory_mut(|m| {
+        if let Some(id) = m.focused() {
+            m.surrender_focus(id);
+        }
+    });
+}
+
+/// Checks a desktop size chosen by the remote computer against what the GPU can hold in one
+/// texture (`max_side`). The error is shown to the user as the reason the session ended.
+pub fn check_desktop_size(width: u32, height: u32, max_side: u32) -> Result<(), String> {
+    if crate::gpu::texture_size_ok(width, height, max_side) {
+        return Ok(());
+    }
+    Err(format!(
+        "The remote computer asked for a screen of {width} × {height} pixels, which is more than this \
+         computer's graphics hardware can display (at most {max_side} × {max_side}). The session was closed."
+    ))
+}
 /// Events egui reports as "needs repaint" that must not schedule one: egui says so for
 /// `RedrawRequested` itself, so honouring it re-requested a frame after every frame and each
 /// visible window rendered at the monitor refresh rate forever (~300 frames/s over two
@@ -331,6 +390,7 @@ impl Session {
             views: built.views,
             phase: Phase::Connecting("Starting…".into()),
             cert: None,
+            fatal: None,
             notices,
             input: InputState::new(),
             grabbed: true,
@@ -487,6 +547,8 @@ impl Session {
         while let Some(ev) = self.handle.try_event() {
             changed = true;
             match ev {
+                // Once Bastion has ended the session, late status updates must not revive it.
+                Event::Status(_) if self.fatal.is_some() => {}
                 Event::Status(s) => {
                     self.phase = match s {
                         Status::ConnectingGateway => Phase::Connecting("Connecting to RD Gateway…".into()),
@@ -513,7 +575,8 @@ impl Session {
                     }
                 }
                 Event::Pointer(p) => self.set_remote_cursor(event_loop, p),
-                Event::CertificatePrompt(r) => self.cert = Some((r, false)),
+                Event::CertificatePrompt(_) if self.fatal.is_some() => {}
+                Event::CertificatePrompt(r) => self.cert = Some((r, false, None)),
                 Event::Notice(n) => self.notices.push((Instant::now(), n)),
                 Event::Disconnected { reason, error } => {
                     if reason.starts_with("Sign-in failed") || reason.contains("rejected your credentials") {
@@ -525,7 +588,10 @@ impl Session {
                     {
                         self.want_close = true;
                     }
-                    self.phase = Phase::Disconnected { reason, error };
+                    self.phase = match &self.fatal {
+                        Some(fatal) => Phase::Disconnected { reason: fatal.clone(), error: true },
+                        None => Phase::Disconnected { reason, error },
+                    };
                     self.cert = None;
                     self.apply_cursor(RemoteCursor::Default);
                 }
@@ -665,7 +731,13 @@ impl Session {
         if pinned_here {
             view.bar = BarState::Pinned;
         }
-        let egui_resp = view.gfx.egui.on_window_event(&view.gfx.window, event);
+        // Keyboard input is never given to egui (see `egui_may_see`); whether a key goes to the
+        // remote computer is decided below from our own state only.
+        let egui_resp = if egui_may_see(event) {
+            view.gfx.egui.on_window_event(&view.gfx.window, event)
+        } else {
+            egui_winit::EventResponse { consumed: false, repaint: false }
+        };
         let modal = self.cert.is_some() || !matches!(self.phase, Phase::Connected);
         // egui asks to repaint on every pointer move; that only matters while one of our
         // overlays is on screen — new remote pixels trigger their own redraw.
@@ -735,7 +807,7 @@ impl Session {
                 }
             }
             WindowEvent::KeyboardInput { event: k, is_synthetic, .. } => {
-                if modal || *is_synthetic || !self.grabbed || egui_resp.consumed {
+                if modal || *is_synthetic || !self.grabbed {
                     return;
                 }
                 let PhysicalKey::Code(code) = k.physical_key else { return };
@@ -845,6 +917,24 @@ impl Session {
         }
         let recreate = self.texture.as_ref().is_none_or(|(_, _, generation)| *generation != f.generation);
         if recreate {
+            // The size is the remote computer's choice; an oversized texture is a wgpu
+            // validation error, so end this session instead.
+            if let Err(reason) = check_desktop_size(f.width, f.height, gpu.max_texture_side) {
+                let (width, height) = (f.width, f.height);
+                f.dirty.clear();
+                drop(f);
+                self.texture = None;
+                if self.fatal.is_none() {
+                    tracing::error!(
+                        width,
+                        height,
+                        limit = gpu.max_texture_side,
+                        "Remote desktop too large for the GPU"
+                    );
+                }
+                self.fail(reason);
+                return;
+            }
             let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("remote-desktop"),
                 size: wgpu::Extent3d { width: f.width, height: f.height, depth_or_array_layers: 1 },
@@ -881,7 +971,7 @@ impl Session {
             bastion_metrics::FRAME_LATENCY.since(t);
         }
         let started = Instant::now();
-        let (tex, _, _) = self.texture.as_ref().expect("texture exists");
+        let Some((tex, _, _)) = self.texture.as_ref() else { return };
         for d in &rects {
             let offset = (u64::from(d.y) * u64::from(f.width) + u64::from(d.x)) * 4;
             gpu.queue.write_texture(
@@ -898,6 +988,20 @@ impl Session {
             bastion_metrics::UI_UPLOAD_BYTES.add(d.area() * 4);
         }
         bastion_metrics::UI_UPLOAD.since(started);
+    }
+
+    /// Ends the session from our side with a message for the user (shown on the "Connection
+    /// ended" card). Safe to call repeatedly; only the first reason is kept.
+    fn fail(&mut self, reason: String) {
+        if self.fatal.is_some() {
+            return;
+        }
+        self.handle.send(Command::Disconnect);
+        self.fatal = Some(reason.clone());
+        self.phase = Phase::Disconnected { reason, error: true };
+        self.cert = None;
+        self.apply_cursor(RemoteCursor::Default);
+        self.request_redraw();
     }
 
     fn hide_bars(&mut self) {
@@ -990,6 +1094,7 @@ impl Session {
         let render = bastion_metrics::UI_RENDER.start();
         bastion_metrics::UI_FRAMES.incr();
         view.gfx.frame(gpu, |ui| {
+            isolate_keyboard(ui.ctx());
             egui::CentralPanel::no_frame().show(ui, |ui| {
                 let avail = ui.max_rect();
                 if let (Some(tex), true) = (tex_id, fw > 0 && fh > 0) {
@@ -1027,8 +1132,14 @@ impl Session {
                 if let Some((reason, error)) = &disconnected {
                     disconnected_card(ui, &name, reason, *error, &mut actions);
                 }
-                if let Some((rej, ack)) = cert.as_mut() {
-                    certificate_dialog(ui, rej, ack, &mut actions);
+                if let Some((rej, ack, shown)) = cert.as_mut() {
+                    let shown_for = shown.get_or_insert_with(Instant::now).elapsed();
+                    let armed = cert_armed(shown_for);
+                    if !armed {
+                        // Repaint when the trust button becomes usable.
+                        ui.ctx().request_repaint_after(CERT_ARM_DELAY.saturating_sub(shown_for));
+                    }
+                    certificate_dialog(ui, rej, ack, armed, &mut actions);
                 }
                 for (i, n) in notices.iter().enumerate() {
                     toast(ui, i, n);
@@ -1205,7 +1316,15 @@ pub fn disconnected_card(ui: &mut egui::Ui, name: &str, reason: &str, error: boo
     });
 }
 
-pub fn certificate_dialog(ui: &mut egui::Ui, rej: &CertificateRejection, ack: &mut bool, actions: &mut Vec<Action>) {
+/// `armed` is false for [`CERT_ARM_DELAY`] after the dialog appears: the trust button is shown
+/// but disabled, so input already under way cannot accept the certificate. Cancel always works.
+pub fn certificate_dialog(
+    ui: &mut egui::Ui,
+    rej: &CertificateRejection,
+    ack: &mut bool,
+    armed: bool,
+    actions: &mut Vec<Action>,
+) {
     let mismatch = rej.previous_fingerprint.is_some();
     let what = match rej.kind {
         bastion_core::trust::EndpointKind::Gateway => "RD Gateway",
@@ -1252,7 +1371,7 @@ pub fn certificate_dialog(ui: &mut egui::Ui, rej: &CertificateRejection, ack: &m
         }
         ui.add_space(12.0);
         ui.horizontal(|ui| {
-            let enabled = !mismatch || *ack;
+            let enabled = armed && (!mismatch || *ack);
             let label = if mismatch { "Replace and connect" } else { "Trust and connect" };
             if ui
                 .add_enabled(
@@ -1440,6 +1559,43 @@ mod bar_tests {
     const W: f32 = 2327.0; // the user's 4K monitor at 165 %, in points
     fn bar() -> Option<egui::Rect> {
         Some(egui::Rect::from_min_max(egui::pos2(W / 2.0 - 280.0, 4.0), egui::pos2(W / 2.0 + 280.0, 40.0)))
+    }
+
+    #[test]
+    fn keyboard_and_ime_events_never_reach_egui() {
+        use winit::event::{DeviceId, Ime};
+        assert!(!egui_may_see(&WindowEvent::Ime(Ime::Enabled)));
+        assert!(!egui_may_see(&WindowEvent::Ime(Ime::Commit("\t\t\n".into()))));
+        // Pointer, focus and redraw events still drive the overlays.
+        let position = winit::dpi::PhysicalPosition::new(10.0, 10.0);
+        assert!(egui_may_see(&WindowEvent::CursorMoved { device_id: DeviceId::dummy(), position }));
+        assert!(egui_may_see(&WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state: ElementState::Pressed,
+            button: winit::event::MouseButton::Left,
+        }));
+        assert!(egui_may_see(&WindowEvent::Focused(true)));
+        assert!(egui_may_see(&WindowEvent::RedrawRequested));
+    }
+
+    #[test]
+    fn trust_button_arms_only_after_the_delay() {
+        assert!(!cert_armed(Duration::ZERO));
+        assert!(!cert_armed(CERT_ARM_DELAY - Duration::from_millis(1)));
+        assert!(cert_armed(CERT_ARM_DELAY));
+        assert!(CERT_ARM_DELAY >= Duration::from_secs(1), "long enough to notice the dialog");
+    }
+
+    #[test]
+    fn oversized_desktop_is_refused_with_a_friendly_message() {
+        assert_eq!(check_desktop_size(3840, 2160, 16384), Ok(()));
+        assert_eq!(check_desktop_size(16384, 16384, 16384), Ok(()));
+        // ResetGraphics 32766×8 / Demand Active 40000×8 on a 16384-limit adapter.
+        for (w, h) in [(32766, 8), (40000, 8), (8, 32766), (16385, 16385)] {
+            let msg = check_desktop_size(w, h, 16384).unwrap_err();
+            assert!(msg.contains(&w.to_string()) && msg.contains("16384"), "{msg}");
+            assert!(!msg.contains(".rs") && !msg.contains("wgpu") && !msg.contains('/'), "{msg}");
+        }
     }
 
     #[test]

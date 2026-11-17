@@ -1,6 +1,8 @@
 //! The `CliprdrBackend` handed to `ironrdp-cliprdr`. Every callback runs on the session's async
 //! thread, so each one only copies its (bounded) arguments into a [`Command`] for the worker.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
 use ironrdp_cliprdr::backend::{CliprdrBackend, CliprdrBackendFactory};
@@ -11,12 +13,15 @@ use ironrdp_cliprdr::pdu::{
 use ironrdp_core::impl_as_any;
 
 use crate::files::download::CHUNK_BYTES;
+use crate::flow::{Admission, Shared};
 use crate::worker::Command;
 
 pub(crate) struct BackendFactory {
     pub(crate) commands: Sender<Command>,
     pub(crate) files: bool,
     pub(crate) max_transfer_bytes: usize,
+    /// Request/response accounting shared with the worker.
+    pub(crate) flow: Arc<Shared>,
 }
 
 impl CliprdrBackendFactory for BackendFactory {
@@ -26,6 +31,8 @@ impl CliprdrBackendFactory for BackendFactory {
             commands: self.commands.clone(),
             files: self.files,
             max_transfer_bytes: self.max_transfer_bytes,
+            flow: Arc::clone(&self.flow),
+            flood_reported: AtomicBool::new(false),
         })
     }
 }
@@ -35,6 +42,9 @@ pub(crate) struct BastionBackend {
     commands: Sender<Command>,
     files: bool,
     max_transfer_bytes: usize,
+    flow: Arc<Shared>,
+    /// Set once this connection's server exceeded the request queue (logged once, not per PDU).
+    flood_reported: AtomicBool,
 }
 
 impl_as_any!(BastionBackend);
@@ -43,6 +53,20 @@ impl BastionBackend {
     fn send(&self, command: Command) {
         if self.commands.send(command).is_err() {
             tracing::warn!("Clipboard worker is gone; dropping a CLIPRDR event");
+        }
+    }
+
+    /// Queues a server request for the worker, or only its refusal once too many are waiting.
+    /// The server decides how many requests it sends, so the queue must not grow with them.
+    fn request(&self, serve: Command, refuse: Command) {
+        let admission = self.flow.admit();
+        if admission != Admission::Serve && !self.flood_reported.swap(true, Ordering::Relaxed) {
+            tracing::warn!("The remote sends clipboard requests faster than they can be answered; refusing the excess");
+        }
+        match admission {
+            Admission::Serve => self.send(serve),
+            Admission::Refuse => self.send(refuse),
+            Admission::Drop => {}
         }
     }
 }
@@ -85,7 +109,7 @@ impl CliprdrBackend for BastionBackend {
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
-        self.send(Command::FormatDataRequest(request.format));
+        self.request(Command::FormatDataRequest(request.format), Command::RefuseFormatData);
     }
 
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
@@ -95,7 +119,8 @@ impl CliprdrBackend for BastionBackend {
     }
 
     fn on_file_contents_request(&mut self, request: FileContentsRequest) {
-        self.send(Command::FileContentsRequest(request));
+        let refuse = Command::RefuseFileContents(request.stream_id);
+        self.request(Command::FileContentsRequest(request), refuse);
     }
 
     fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {

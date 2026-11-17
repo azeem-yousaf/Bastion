@@ -7,12 +7,21 @@
 //! Redaction policy: code never logs secrets or keystrokes. As defence in depth, the
 //! file layer runs every line through [`redact`] which masks `password=`/`pass:`-style
 //! values that might slip in via third-party crates' debug output.
+//!
+//! Some dependencies log credential material when asked for debug/trace output (see
+//! [`CREDENTIAL_CAPS`]). Those targets are capped by [`credential_cap_allows`] whatever
+//! `BASTION_LOG` or the settings say; there is deliberately no way to lift the caps.
+//!
+//! Log files are created 0600 inside the 0700 log directory.
 
 use std::io::Write;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
+use tracing::{Level, Subscriber};
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -103,6 +112,56 @@ impl PrivateMode for std::fs::OpenOptions {
     }
 }
 
+/// `bastion.YYYY-MM-DD.log`, the name [`log_file_date`] parses.
+fn log_file_name(date: time::Date) -> String {
+    format!("{LOG_PREFIX}{:04}-{:02}-{:02}.log", date.year(), u8::from(date.month()), date.day())
+}
+
+/// Opens (appending) the log file for `date`, owner-only. A file left group/world readable by
+/// an earlier version is tightened too.
+fn open_log_file(dir: &Path, date: time::Date) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let file =
+        std::fs::OpenOptions::new().append(true).create(true).mode_private().open(dir.join(log_file_name(date)))?;
+    if file.metadata()?.permissions().mode() & 0o077 != 0 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+/// The current UTC day's log file; moves to a new file when the day changes.
+struct DailyLogFile<C: Fn() -> time::Date> {
+    dir: std::path::PathBuf,
+    today: C,
+    date: time::Date,
+    file: std::fs::File,
+}
+
+impl<C: Fn() -> time::Date> DailyLogFile<C> {
+    fn open(dir: &Path, today: C) -> std::io::Result<Self> {
+        let date = today();
+        Ok(Self { dir: dir.to_path_buf(), file: open_log_file(dir, date)?, date, today })
+    }
+}
+
+impl<C: Fn() -> time::Date> Write for DailyLogFile<C> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let date = (self.today)();
+        if date != self.date {
+            // If the new file cannot be opened, keep writing to the old one and try again on
+            // the next batch.
+            if let Ok(file) = open_log_file(&self.dir, date) {
+                self.file = file;
+                self.date = date;
+            }
+        }
+        self.file.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
 fn start_log_maintenance(dir: std::path::PathBuf) {
     let spawned = std::thread::Builder::new().name("bastion-logmaint".into()).spawn(move || {
         loop {
@@ -189,16 +248,61 @@ impl<W: Write> Write for RedactingWriter<W> {
     }
 }
 
+/// Log targets (a crate or module, covering everything below it) that emit credential
+/// material when verbose, with the most verbose level Bastion will ever record for them.
+///
+/// - `sspi` (debug): `#[instrument(ret)]` on `write_password_credentials` and friends prints the
+///   encoded TSPasswordCreds (domain, user name and password) plus NTLM/Kerberos tokens.
+/// - `ironrdp_connector::credssp` (debug): dumps every `TsRequest`, i.e. the NTLM challenge and
+///   NetNTLMv2 response, which can be cracked offline.
+/// - `tungstenite` (trace): prints the gateway WebSocket upgrade request including its
+///   `Authorization` header, and then every frame of the session.
+/// - `reqwest`, `hyper`, `hyper_util`, `h2` (trace): raw HTTP reads/writes and header parsing
+///   for the gateway and KDC-proxy connections, which carry `Authorization` headers.
+pub const CREDENTIAL_CAPS: &[(&str, Level)] = &[
+    ("sspi", Level::WARN),
+    ("ironrdp_connector::credssp", Level::INFO),
+    ("tungstenite", Level::DEBUG),
+    ("tokio_tungstenite", Level::DEBUG),
+    ("reqwest", Level::DEBUG),
+    ("hyper", Level::DEBUG),
+    ("hyper_util", Level::DEBUG),
+    ("h2", Level::DEBUG),
+];
+
+/// Whether an event or span from `target` at `level` may be recorded at all. Applied on top of
+/// the user's filter, so no `BASTION_LOG` directive or settings level can enable what this
+/// refuses.
+pub fn credential_cap_allows(target: &str, level: &Level) -> bool {
+    CREDENTIAL_CAPS.iter().all(|(capped, max)| {
+        let inside = target.strip_prefix(capped).is_some_and(|rest| rest.is_empty() || rest.starts_with("::"));
+        // More verbose levels compare greater.
+        !inside || level <= max
+    })
+}
+
+/// Builds the filter for the whole logging stack: the user's directive (`BASTION_LOG` if set,
+/// else the settings level with noisy protocol crates capped at `warn`), and then the
+/// credential caps, which the directive cannot override.
+fn build_filter<S>(env_directive: Option<&str>, level: &str) -> impl Layer<S>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    let directive = match env_directive {
+        Some(d) => d.to_owned(),
+        None => format!("{level},sspi=warn,ironrdp_tls=warn,wgpu_core=warn,wgpu_hal=warn,naga=warn,zbus=warn"),
+    };
+    let user = EnvFilter::try_new(&directive).unwrap_or_else(|_| EnvFilter::new("info"));
+    let caps = tracing_subscriber::filter::filter_fn(|meta| credential_cap_allows(meta.target(), meta.level()));
+    user.and_then(caps)
+}
+
 /// Initialises global logging. `level` is an EnvFilter directive (e.g. "info", "bastion=debug").
 pub fn init(paths: &AppPaths, level: &str) -> Result<LogGuard> {
     let dir = paths.log_dir();
     ensure_private_dir(&dir)?;
-    let appender = tracing_appender::rolling::Builder::new()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("bastion")
-        .filename_suffix("log")
-        .max_log_files(7)
-        .build(&dir)?;
+    let appender = DailyLogFile::open(&dir, || time::OffsetDateTime::now_utc().date())
+        .with_context(|| format!("open a log file in {}", dir.display()))?;
     // Off the calling thread (non_blocking, lossy rather than ever blocking a hot path), and
     // batched: the background worker drains every queued line and then flushes once, so the
     // buffer turns a burst of lines into a single write() instead of one per line.
@@ -212,11 +316,7 @@ pub fn init(paths: &AppPaths, level: &str) -> Result<LogGuard> {
         .thread_name("bastion-stderr")
         .finish(RedactingWriter { inner: std::io::stderr() });
 
-    // Noisy protocol crates are capped at `warn` unless explicitly requested.
-    let directive = std::env::var("BASTION_LOG").unwrap_or_else(|_| {
-        format!("{level},sspi=warn,ironrdp_tls=warn,wgpu_core=warn,wgpu_hal=warn,naga=warn,zbus=warn")
-    });
-    let filter = EnvFilter::try_new(&directive).unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = build_filter(std::env::var("BASTION_LOG").ok().as_deref(), level);
 
     tracing_subscriber::registry()
         .with(filter)
@@ -276,6 +376,123 @@ mod tests {
         assert_eq!(log_file_date("bastion.2026-13-16.log"), None);
         assert_eq!(log_file_date("bastion.2026-11-16.log.gz.tmp"), None);
         assert_eq!(log_file_date("other.2026-11-16.log"), None);
+    }
+
+    #[test]
+    fn credential_caps_cover_whole_module_trees_only() {
+        // The line that prints the password: sspi::credssp::ts_request at DEBUG.
+        assert!(!credential_cap_allows("sspi::credssp::ts_request", &Level::DEBUG));
+        assert!(!credential_cap_allows("sspi", &Level::INFO));
+        assert!(credential_cap_allows("sspi::credssp", &Level::WARN));
+        assert!(!credential_cap_allows("ironrdp_connector::credssp", &Level::DEBUG));
+        assert!(credential_cap_allows("ironrdp_connector::credssp", &Level::INFO));
+        assert!(credential_cap_allows("ironrdp_connector::connection", &Level::TRACE));
+        assert!(!credential_cap_allows("tungstenite::handshake::client", &Level::TRACE));
+        assert!(credential_cap_allows("tungstenite::handshake::client", &Level::DEBUG));
+        assert!(!credential_cap_allows("reqwest::connect::verbose", &Level::TRACE));
+        // Names that merely start with a capped one are unaffected.
+        assert!(credential_cap_allows("sspi_helper", &Level::TRACE));
+        assert!(credential_cap_allows("bastion_session::engine", &Level::TRACE));
+    }
+
+    /// Runs `emit` under the filter `init` would install and returns what reached the log.
+    fn logged(env_directive: Option<&str>, level: &str, emit: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::registry()
+            .with(build_filter(env_directive, level))
+            .with(fmt::layer().with_writer(move || writer.clone()).with_ansi(false).with_target(true));
+        tracing::subscriber::with_default(subscriber, emit);
+        String::from_utf8(capture.0.lock().unwrap().clone()).unwrap()
+    }
+
+    fn emit_everything() {
+        // What sspi's `#[instrument(ret, level = "debug")]` expands to: a span carrying the
+        // arguments and an event carrying the return value.
+        let span = tracing::span!(target: "sspi::credssp::ts_request", Level::DEBUG, "write_password_credentials", credentials = "SPAN-SECRET");
+        let _entered = span.enter();
+        tracing::event!(target: "sspi::credssp::ts_request", Level::DEBUG, r#return = "RETURN-SECRET");
+        tracing::event!(target: "sspi::ntlm", Level::TRACE, "NTLM-SECRET");
+        tracing::event!(target: "ironrdp_connector::credssp", Level::DEBUG, message = "TSREQUEST-SECRET", "Send");
+        tracing::event!(target: "tungstenite::handshake::client", Level::TRACE, "Request: Authorization: Basic BASIC-SECRET");
+        tracing::event!(target: "reqwest::connect::verbose", Level::TRACE, "write: HTTP-SECRET");
+        tracing::event!(target: "sspi::kerberos", Level::WARN, "sspi-warning");
+        tracing::event!(target: "ironrdp_connector::credssp", Level::INFO, "credssp-info");
+        tracing::event!(target: "ironrdp_connector::connection", Level::DEBUG, "connector-debug");
+        tracing::event!(target: "bastion_session::engine", Level::DEBUG, "engine-debug");
+        tracing::event!(target: "bastion_session::engine", Level::INFO, "engine-info");
+    }
+
+    #[test]
+    fn no_directive_can_enable_credential_logging() {
+        // Every way a user can ask for verbose logs, including naming the modules outright.
+        let directives = [
+            (Some("debug"), "info"),
+            (Some("trace"), "info"),
+            (Some("trace,sspi=trace,sspi::credssp::ts_request=trace,ironrdp_connector::credssp=trace"), "info"),
+            (Some("sspi=debug,tungstenite=trace,reqwest=trace,ironrdp_connector=trace"), "info"),
+            (None, "trace"),
+            (None, "debug,sspi=debug"),
+            (None, "info,sspi::credssp::ts_request=trace"),
+        ];
+        for (env, level) in directives {
+            let out = logged(env, level, emit_everything);
+            assert!(!out.contains("SECRET"), "{env:?}/{level}: credential material was logged:\n{out}");
+            assert!(!out.contains("write_password_credentials"), "{env:?}/{level}: sspi span was recorded:\n{out}");
+        }
+    }
+
+    #[test]
+    fn verbose_logging_still_works_for_everything_else() {
+        let out = logged(Some("debug"), "info", emit_everything);
+        for expected in ["sspi-warning", "credssp-info", "connector-debug", "engine-debug", "engine-info"] {
+            assert!(out.contains(expected), "missing {expected}:\n{out}");
+        }
+        // Default settings: info, with sspi warnings.
+        let out = logged(None, "info", emit_everything);
+        assert!(out.contains("engine-info") && out.contains("sspi-warning") && out.contains("credssp-info"), "{out}");
+        assert!(!out.contains("engine-debug") && !out.contains("connector-debug"), "{out}");
+        // A directive that does not parse falls back to info rather than to nothing.
+        let out = logged(Some("not a=directive=at all"), "info", emit_everything);
+        assert!(out.contains("engine-info") && !out.contains("engine-debug") && !out.contains("SECRET"), "{out}");
+    }
+
+    #[test]
+    fn log_files_are_private_and_roll_over_by_day() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let day = std::rc::Rc::new(std::cell::Cell::new(time::macros::date!(2026 - 11 - 17)));
+        let first = dir.path().join("bastion.2026-11-17.log");
+        // Left behind world-readable by an earlier version.
+        std::fs::write(&first, "earlier\n").unwrap();
+        std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let clock = day.clone();
+        let mut log = DailyLogFile::open(dir.path(), move || clock.get()).unwrap();
+        assert_eq!(mode(&first), 0o600, "existing file is tightened");
+        log.write_all(b"one\n").unwrap();
+        day.set(time::macros::date!(2026 - 11 - 18));
+        log.write_all(b"two\n").unwrap();
+        log.flush().unwrap();
+
+        let second = dir.path().join("bastion.2026-11-18.log");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "earlier\none\n", "appends, never truncates");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "two\n");
+        assert_eq!(mode(&second), 0o600, "new files are created owner-only");
+        // Names are the ones log maintenance recognises.
+        assert_eq!(log_file_date(&log_file_name(day.get())), Some((day.get(), false)));
     }
 
     #[test]

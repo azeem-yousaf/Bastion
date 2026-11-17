@@ -19,6 +19,25 @@ pub struct Rect {
 /// overhead would outweigh the saved bytes).
 pub const MAX_DIRTY_RECTS: usize = 32;
 
+/// Largest frame edge accepted, in pixels. It is the most Bastion ever asks a server for (and
+/// what RDP display control allows); a server announcing more is refused rather than given a
+/// multi-gigabyte buffer or a texture no GPU can create.
+pub const MAX_FRAME_DIM: u32 = 8192;
+
+/// Regions written per lock in [`SharedFrame::apply_regions`]. The renderer (the one UI thread
+/// for every window) takes the same lock, so a server that produces millions of tiny regions
+/// must not be able to hold it for all of them. Far above what a real frame produces (a full
+/// 8192×8192 RemoteFX Progressive update is 16,384 tiles), so real frames still land atomically.
+const REGIONS_PER_LOCK: usize = 32_768;
+
+/// Bytes of a `width`×`height` RGBA frame; `None` if it is larger than Bastion accepts.
+fn frame_len(width: u32, height: u32) -> Option<usize> {
+    if width > MAX_FRAME_DIM || height > MAX_FRAME_DIM {
+        return None;
+    }
+    (width as usize).checked_mul(height as usize)?.checked_mul(4)
+}
+
 impl Rect {
     pub fn area(self) -> u64 {
         u64::from(self.w) * u64::from(self.h)
@@ -55,6 +74,9 @@ pub struct SharedFrame {
     pub needs_present: std::sync::atomic::AtomicBool,
     /// Screen updates written so far (for the frame rate shown by the quality indicator).
     pub updates: std::sync::atomic::AtomicU64,
+    /// The session's graphics pipeline threads (see `gfx::Pipelines`): kept here because this
+    /// is the one object every graphics channel of a session shares.
+    pub(crate) gfx: Mutex<crate::gfx::Pipelines>,
 }
 
 /// Adds `r` to the dirty list, merging it with rectangles it overlaps or abuts when the merge
@@ -78,59 +100,88 @@ impl SharedFrame {
 
     /// Sets the frame size announced by the graphics pipeline. A new size clears the frame (the
     /// server repaints after a reset); the same size keeps the pixels.
-    pub fn reset(&self, width: u32, height: u32) {
+    ///
+    /// Returns `false`, leaving the frame untouched, for a size beyond [`MAX_FRAME_DIM`]: the
+    /// size comes from the server, and nothing is allocated for one no display could have.
+    pub fn reset(&self, width: u32, height: u32) -> bool {
+        let Some(len) = frame_len(width, height) else {
+            return false;
+        };
         let mut st = self.lock();
         if st.width != width || st.height != height {
             st.width = width;
             st.height = height;
-            st.data = vec![0; width as usize * height as usize * 4];
+            st.data = vec![0; len];
             st.generation += 1;
         }
         st.dirty = vec![Rect { x: 0, y: 0, w: width, h: height }];
         st.dirty_since.get_or_insert_with(std::time::Instant::now);
+        true
     }
 
     /// Writes regions of tightly packed RGBA rows (as the graphics pipeline produces them)
     /// into the frame. Regions outside the frame are clipped. Returns the pixels written.
     pub fn apply_regions<'a>(&self, regions: impl IntoIterator<Item = (Rect, &'a [u8])>) -> u64 {
-        let mut st = self.lock();
-        let (fw, fh) = (st.width, st.height);
-        let stride = fw as usize * 4;
+        self.apply_regions_chunked(regions, REGIONS_PER_LOCK)
+    }
+
+    /// [`Self::apply_regions`], releasing the lock after every `per_lock` regions so the
+    /// renderer is never kept waiting for an unbounded list (see [`REGIONS_PER_LOCK`]).
+    fn apply_regions_chunked<'a>(&self, regions: impl IntoIterator<Item = (Rect, &'a [u8])>, per_lock: usize) -> u64 {
+        let mut regions = regions.into_iter();
         let mut copied = 0;
-        for (rect, src) in regions {
-            let clip = clamp(rect, fw, fh);
-            if clip.w == 0 || clip.h == 0 || src.len() < rect.area() as usize * 4 {
-                continue;
+        loop {
+            let mut st = self.lock();
+            let (fw, fh) = (st.width, st.height);
+            let stride = fw as usize * 4;
+            let mut taken = 0;
+            for (rect, src) in regions.by_ref().take(per_lock) {
+                taken += 1;
+                let clip = clamp(rect, fw, fh);
+                if clip.w == 0 || clip.h == 0 || (src.len() as u64) < rect.area().saturating_mul(4) {
+                    continue;
+                }
+                let src_stride = rect.w as usize * 4;
+                let row_bytes = clip.w as usize * 4;
+                for row in 0..clip.h as usize {
+                    let s = row * src_stride;
+                    let d = (clip.y as usize + row) * stride + clip.x as usize * 4;
+                    st.data[d..d + row_bytes].copy_from_slice(&src[s..s + row_bytes]);
+                }
+                add_dirty(&mut st.dirty, clip);
+                copied += clip.area();
             }
-            let src_stride = rect.w as usize * 4;
-            let row_bytes = clip.w as usize * 4;
-            for row in 0..clip.h as usize {
-                let s = row * src_stride;
-                let d = (clip.y as usize + row) * stride + clip.x as usize * 4;
-                st.data[d..d + row_bytes].copy_from_slice(&src[s..s + row_bytes]);
+            if taken < per_lock {
+                if copied > 0 {
+                    st.dirty_since.get_or_insert_with(std::time::Instant::now);
+                    self.updates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return copied;
             }
-            add_dirty(&mut st.dirty, clip);
-            copied += clip.area();
+            if copied > 0 {
+                st.dirty_since.get_or_insert_with(std::time::Instant::now);
+            }
         }
-        if copied > 0 {
-            st.dirty_since.get_or_insert_with(std::time::Instant::now);
-            self.updates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        copied
     }
 
     /// Copies `rect` from `src` (tightly packed RGBA, `src_width` wide) into the shared frame.
-    pub fn update_from(&self, src: &[u8], src_width: u32, src_height: u32, rect: Rect) {
-        self.update_rects(src, src_width, src_height, &[rect]);
+    pub fn update_from(&self, src: &[u8], src_width: u32, src_height: u32, rect: Rect) -> u64 {
+        self.update_rects(src, src_width, src_height, &[rect])
     }
 
     /// Copies each of `rects` from `src` under one lock. Returns the number of pixels copied.
+    ///
+    /// A source larger than [`MAX_FRAME_DIM`], or shorter than its stated size, is ignored
+    /// (nothing is copied or allocated).
     pub fn update_rects(&self, src: &[u8], src_width: u32, src_height: u32, rects: &[Rect]) -> u64 {
+        let Some(len) = frame_len(src_width, src_height).filter(|&len| src.len() >= len) else {
+            return 0;
+        };
         let mut st = self.lock();
         if st.width != src_width || st.height != src_height {
             st.width = src_width;
             st.height = src_height;
-            st.data = src.to_vec();
+            st.data = src[..len].to_vec();
             st.generation += 1;
             st.dirty = vec![Rect { x: 0, y: 0, w: src_width, h: src_height }];
             st.dirty_since.get_or_insert_with(std::time::Instant::now);
@@ -201,6 +252,56 @@ mod tests {
         f.reset(8, 4);
         assert_eq!(f.lock().generation, 1);
         assert_eq!(f.lock().data[(3 * 8 + 6) * 4], 0);
+    }
+
+    #[test]
+    fn sizes_no_display_could_have_are_refused_without_allocating() {
+        let f = SharedFrame::default();
+        assert!(f.reset(64, 48));
+        f.lock().dirty.clear();
+        // What a hostile ResetGraphics can ask for: one edge over the limit, or both (17 GB).
+        for (w, h) in [(MAX_FRAME_DIM + 1, 8), (8, MAX_FRAME_DIM + 1), (32_766, 32_766), (u32::MAX, u32::MAX)] {
+            assert!(!f.reset(w, h), "{w}x{h}");
+        }
+        let st = f.lock();
+        assert_eq!((st.width, st.height, st.data.len(), st.generation), (64, 48, 64 * 48 * 4, 1));
+        assert!(st.dirty.is_empty(), "a refused reset leaves the frame alone");
+        drop(st);
+        assert!(f.reset(MAX_FRAME_DIM, 2), "the largest size Bastion requests still works");
+
+        // The legacy path sizes the frame from the source image.
+        let f = SharedFrame::default();
+        let wide = vec![0u8; (MAX_FRAME_DIM as usize + 1) * 4];
+        assert_eq!(f.update_from(&wide, MAX_FRAME_DIM + 1, 1, Rect { x: 0, y: 0, w: 1, h: 1 }), 0);
+        assert_eq!(f.update_from(&wide, 65_535, 65_535, Rect { x: 0, y: 0, w: 1, h: 1 }), 0);
+        // A source shorter than it claims must not be read past its end.
+        assert_eq!(f.update_from(&wide[..16], 4, 4, Rect { x: 0, y: 0, w: 4, h: 4 }), 0);
+        let st = f.lock();
+        assert_eq!((st.width, st.height, st.generation), (0, 0, 0));
+        assert!(st.data.is_empty());
+    }
+
+    #[test]
+    fn many_regions_are_applied_in_bounded_lock_holds_with_the_same_result() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let regions: Vec<(Rect, [u8; 4])> =
+            (0..100u32).map(|i| (Rect { x: (i * 7) % 16, y: (i * 3) % 8, w: 1, h: 1 }, [i as u8, 1, 2, 3])).collect();
+        let apply = |per_lock: usize| {
+            let f = SharedFrame::default();
+            f.reset(16, 8);
+            f.lock().dirty.clear();
+            let n = f.apply_regions_chunked(regions.iter().map(|(r, px)| (*r, &px[..])), per_lock);
+            let st = f.lock();
+            (n, st.data.clone(), st.dirty.clone(), f.updates.load(Relaxed))
+        };
+        let whole = apply(usize::MAX);
+        assert_eq!(whole.0, 100);
+        assert_eq!(whole.3, 1);
+        // 7 per lock: the lock is released 14 times on the way; pixels, dirty list and the
+        // update count are what one pass gives. Exactly divisible chunk sizes end cleanly too.
+        assert_eq!(apply(7), whole);
+        assert_eq!(apply(10), whole);
+        assert_eq!(apply(100), whole);
     }
 
     #[test]

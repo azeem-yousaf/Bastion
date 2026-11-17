@@ -14,9 +14,19 @@
 //! the [`SharedFrame`] (one row copy each) and sends the pipeline's replies — capabilities,
 //! frame acknowledgements — back to the session loop as [`Command::GfxReply`]. Acknowledging
 //! after decoding also gives the server natural flow control when we fall behind.
+//!
+//! Everything arriving here is chosen by the server, so the hand-off is bounded:
+//! - the queue to the thread holds at most [`QUEUE_BUDGET`] bytes; beyond that the session loop
+//!   waits (TCP back-pressure, as when decoding ran inline) and gives the session up if the
+//!   thread makes no room for [`QUEUE_STALL`];
+//! - a session has one live pipeline: a further channel retires the previous one, and at most
+//!   [`MAX_PIPELINE_THREADS`] threads may still be winding down ([`Pipelines`]);
+//! - a retired or closed pipeline drops what is still queued and ends after its current message;
+//! - log lines a server can trigger per message go through a [`LogGate`].
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, mpsc as std_mpsc};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
@@ -44,16 +54,258 @@ pub(crate) struct GfxShared {
     pub active: Arc<AtomicBool>,
 }
 
+/// Graphics data a session may have queued for its graphics thread. A cooperative server stays
+/// far below this (it waits for frame acknowledgements); one that does not is slowed down to
+/// the speed we decode at instead of being buffered without limit.
+const QUEUE_BUDGET: usize = 64 << 20;
+/// How long the session loop waits for room in a full queue before the session is given up
+/// (the graphics thread is then stuck in one message, and so would the session be).
+const QUEUE_STALL: Duration = Duration::from_secs(10);
+/// Charged per queued message on top of its bytes, so empty messages are bounded too.
+const JOB_OVERHEAD: usize = 64;
+/// Graphics threads a session may have alive: the live pipeline plus retired ones still
+/// finishing a message. Windows reopens the channel once, at logon; anything near this many
+/// overlapping threads is a server opening channels in a loop.
+const MAX_PIPELINE_THREADS: usize = 4;
+
+const FRAME_SIZE_MESSAGE: &str = "The remote computer reported an unsupported desktop size.";
+const STALL_MESSAGE: &str = "The remote computer sent graphics faster than they could be displayed.";
+const REFUSED_MESSAGE: &str = "Too many graphics channels are open.";
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn channel_error(description: &'static str) -> ironrdp_pdu::PduError {
+    ironrdp_pdu::pdu_other_err!("graphics", description)
+}
+
+/// Lets a short burst of log lines through per window and counts the rest (`log.suppressed`
+/// in the metrics line). For lines whose frequency the server controls — one per message,
+/// channel or PDU — which would otherwise let it write to the log file as fast as it can send.
+struct LogGate {
+    /// Window number (upper 32 bits, 0 = never used) and lines let through in it (lower 32).
+    state: AtomicU64,
+}
+
+impl LogGate {
+    const BURST: u64 = 5;
+    const WINDOW_SECS: u64 = 30;
+
+    const fn new() -> Self {
+        Self { state: AtomicU64::new(0) }
+    }
+
+    fn allow(&self) -> bool {
+        static START: OnceLock<Instant> = OnceLock::new();
+        let window = START.get_or_init(Instant::now).elapsed().as_secs() / Self::WINDOW_SECS + 1;
+        let allowed = self.allow_in(window);
+        if !allowed {
+            bastion_metrics::LOG_SUPPRESSED.incr();
+        }
+        allowed
+    }
+
+    fn allow_in(&self, window: u64) -> bool {
+        let window = window & 0xFFFF_FFFF;
+        let mut current = self.state.load(Ordering::Relaxed);
+        loop {
+            let next = if current >> 32 != window {
+                (window << 32) | 1
+            } else if current & 0xFFFF_FFFF < Self::BURST {
+                current + 1
+            } else {
+                return false;
+            };
+            match self.state.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(seen) => current = seen,
+            }
+        }
+    }
+}
+
+/// `gated!(warn, ...)`: `tracing::warn!(...)` through a [`LogGate`] of its own.
+macro_rules! gated {
+    ($level:ident, $($arg:tt)+) => {{
+        static GATE: LogGate = LogGate::new();
+        if GATE.allow() {
+            $level!($($arg)+);
+        }
+    }};
+}
+
 enum Job {
     Start(u32),
     Data(u32, Vec<u8>),
-    Close(u32),
+}
+
+impl Job {
+    fn cost(&self) -> usize {
+        match self {
+            Job::Start(_) => JOB_OVERHEAD,
+            Job::Data(_, payload) => payload.len().saturating_add(JOB_OVERHEAD),
+        }
+    }
+}
+
+/// The queue was full and the graphics thread made no room in time.
+#[derive(Debug, PartialEq, Eq)]
+struct Stalled;
+
+/// Messages on their way to one graphics thread, bounded by bytes.
+struct Queue {
+    state: Mutex<QueueState>,
+    /// Signalled when a job arrives or the queue closes (the thread waits on it).
+    arrived: Condvar,
+    /// Signalled when a job is taken or the queue closes (the session loop waits on it).
+    room: Condvar,
+    budget: usize,
+    /// Set by the thread when the server announced a desktop size we refuse: the next message
+    /// on the channel ends the session with [`FRAME_SIZE_MESSAGE`].
+    frame_refused: AtomicBool,
+}
+
+#[derive(Default)]
+struct QueueState {
+    jobs: VecDeque<Job>,
+    bytes: usize,
+    /// Nothing more is accepted or handed out: the channel closed, the pipeline was retired,
+    /// or its thread ended.
+    closed: bool,
+}
+
+impl Queue {
+    fn new(budget: usize) -> Self {
+        Self {
+            state: Mutex::default(),
+            arrived: Condvar::new(),
+            room: Condvar::new(),
+            budget,
+            frame_refused: AtomicBool::new(false),
+        }
+    }
+
+    /// Queues `job`, waiting up to `patience` for room. A lone job always fits, whatever its
+    /// size; a closed queue swallows it (nothing will display it any more).
+    fn push(&self, job: Job, patience: Duration) -> Result<(), Stalled> {
+        let cost = job.cost();
+        let mut st = lock(&self.state);
+        let mut deadline = None;
+        loop {
+            if st.closed {
+                return Ok(());
+            }
+            if st.bytes == 0 || st.bytes.saturating_add(cost) <= self.budget {
+                break;
+            }
+            let deadline = *deadline.get_or_insert_with(|| Instant::now() + patience);
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Stalled);
+            }
+            st = self.room.wait_timeout(st, left).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+        }
+        st.bytes = st.bytes.saturating_add(cost);
+        st.jobs.push_back(job);
+        drop(st);
+        self.arrived.notify_one();
+        Ok(())
+    }
+
+    /// The next job, waiting for one; `None` once the queue is closed.
+    fn pop(&self) -> Option<Job> {
+        let mut st = lock(&self.state);
+        loop {
+            if st.closed {
+                return None;
+            }
+            if let Some(job) = st.jobs.pop_front() {
+                st.bytes = st.bytes.saturating_sub(job.cost());
+                drop(st);
+                self.room.notify_all();
+                return Some(job);
+            }
+            st = self.arrived.wait(st).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Ends the pipeline: queued messages are dropped and its thread stops after the message
+    /// it is in.
+    fn close(&self) {
+        let mut st = lock(&self.state);
+        st.closed = true;
+        st.jobs = VecDeque::new();
+        st.bytes = 0;
+        drop(st);
+        self.arrived.notify_all();
+        self.room.notify_all();
+    }
+
+    fn is_closed(&self) -> bool {
+        lock(&self.state).closed
+    }
+}
+
+/// A session's graphics pipelines (kept in its [`SharedFrame`], which every channel of the
+/// session shares). The dynamic-channel layer creates a processor for every Create Request the
+/// server sends, under any channel id, and each of ours owns a thread and an H.264 decoder —
+/// so they are limited here: one live pipeline, and a cap on threads still winding down.
+#[derive(Default)]
+pub(crate) struct Pipelines {
+    current: Option<Arc<Queue>>,
+    threads: usize,
+}
+
+impl std::fmt::Debug for Pipelines {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pipelines").field("live", &self.current.is_some()).field("threads", &self.threads).finish()
+    }
+}
+
+impl Pipelines {
+    /// Makes `queue` the session's pipeline and retires the previous one. `false` (nothing
+    /// admitted) while too many retired threads are still alive.
+    fn admit(&mut self, queue: &Arc<Queue>) -> bool {
+        if let Some(previous) = self.current.take() {
+            previous.close();
+        }
+        if self.threads >= MAX_PIPELINE_THREADS {
+            return false;
+        }
+        self.threads += 1;
+        self.current = Some(queue.clone());
+        true
+    }
+
+    /// The thread of an admitted pipeline ended (or never started).
+    fn finished(&mut self, queue: &Arc<Queue>) {
+        self.threads = self.threads.saturating_sub(1);
+        if self.current.as_ref().is_some_and(|c| Arc::ptr_eq(c, queue)) {
+            self.current = None;
+        }
+    }
+}
+
+/// Held by the graphics thread: whichever way it ends, its queue closes (so the session loop
+/// never waits on a dead thread) and its slot in [`Pipelines`] is returned.
+struct ThreadExit {
+    queue: Arc<Queue>,
+    frame: Arc<SharedFrame>,
+}
+
+impl Drop for ThreadExit {
+    fn drop(&mut self) {
+        self.queue.close();
+        lock(&self.frame.gfx).finished(&self.queue);
+    }
 }
 
 /// Stands in for the pipeline on the dynamic channel and forwards to the graphics thread.
 /// Dropping it (channel closed or session over) ends the thread.
 pub(crate) struct GfxForwarder {
-    jobs: std_mpsc::Sender<Job>,
+    /// `None`: refused (see [`Pipelines`]); the channel is then reported as unavailable.
+    queue: Option<Arc<Queue>>,
 }
 
 ironrdp_core::impl_as_any!(GfxForwarder);
@@ -61,19 +313,37 @@ ironrdp_core::impl_as_any!(GfxForwarder);
 impl GfxForwarder {
     /// Creates the pipeline client and its thread.
     pub(crate) fn spawn(display: &bastion_core::profile::DisplaySettings, shared: GfxShared) -> Self {
-        let (jobs, rx) = std_mpsc::channel();
+        let queue = Arc::new(Queue::new(QUEUE_BUDGET));
+        if !lock(&shared.frame.gfx).admit(&queue) {
+            gated!(warn, "Refusing another graphics channel: too many are still open");
+            return Self { queue: None };
+        }
+        let exit = ThreadExit { queue: queue.clone(), frame: shared.frame.clone() };
         let codecs = Arc::new(AtomicU32::new(0));
         let reset = Arc::new(AtomicBool::new(false));
         let display = display.clone();
         let spawned = std::thread::Builder::new().name("bastion-gfx".into()).spawn(move || {
+            let exit = exit;
+            if exit.queue.is_closed() {
+                return; // Retired before it began: don't open a decoder for nothing.
+            }
             // Created here: opening the H.264 decoder can take a moment.
             let client = gfx_client(&display, Some(reset.clone()), codecs.clone());
-            run(&rx, client, &shared, &codecs, &reset);
+            run(&exit.queue, client, &shared, &codecs, &reset);
         });
         if let Err(e) = spawned {
-            warn!(error = %e, "Cannot start the graphics thread");
+            // The closure (and with it `exit`) was dropped: the queue is closed.
+            gated!(warn, error = %e, "Cannot start the graphics thread");
         }
-        Self { jobs }
+        Self { queue: Some(queue) }
+    }
+}
+
+impl Drop for GfxForwarder {
+    fn drop(&mut self) {
+        if let Some(queue) = &self.queue {
+            queue.close();
+        }
     }
 }
 
@@ -83,39 +353,54 @@ impl DvcProcessor for GfxForwarder {
     }
 
     fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>> {
-        let _ = self.jobs.send(Job::Start(channel_id));
+        // An error here makes the channel layer answer the Create Request with "no listener"
+        // and drop this processor, instead of leaving the server waiting on a dead channel.
+        let queue = self.queue.as_ref().filter(|q| !q.is_closed()).ok_or_else(|| channel_error(REFUSED_MESSAGE))?;
+        queue.push(Job::Start(channel_id), QUEUE_STALL).map_err(|Stalled| channel_error(STALL_MESSAGE))?;
         Ok(Vec::new())
     }
 
     fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
-        let _ = self.jobs.send(Job::Data(channel_id, payload.to_vec()));
+        let Some(queue) = &self.queue else {
+            return Ok(Vec::new());
+        };
+        if queue.frame_refused.load(Ordering::Relaxed) {
+            return Err(channel_error(FRAME_SIZE_MESSAGE));
+        }
+        // Blocks while the queue is over budget: the session loop stops reading, and TCP flow
+        // control slows the server down to the speed graphics are decoded at.
+        queue.push(Job::Data(channel_id, payload.to_vec()), QUEUE_STALL).map_err(|Stalled| {
+            gated!(warn, "The graphics thread is not keeping up and its queue is full; ending the session");
+            channel_error(STALL_MESSAGE)
+        })?;
         Ok(Vec::new())
     }
 
-    fn close(&mut self, channel_id: u32) {
-        let _ = self.jobs.send(Job::Close(channel_id));
+    fn close(&mut self, _channel_id: u32) {
+        if let Some(queue) = &self.queue {
+            queue.close();
+        }
     }
 }
 
 impl DvcClientProcessor for GfxForwarder {}
 
-fn run(
-    jobs: &std_mpsc::Receiver<Job>,
-    mut client: GraphicsPipelineClient,
-    shared: &GfxShared,
-    codecs: &AtomicU32,
-    reset: &AtomicBool,
-) {
+fn run(queue: &Queue, mut client: GraphicsPipelineClient, shared: &GfxShared, codecs: &AtomicU32, reset: &AtomicBool) {
     let mut capture = Capture::from_env();
-    while let Ok(job) = jobs.recv() {
+    let mut started_on = None;
+    while let Some(job) = queue.pop() {
         match job {
             Job::Start(id) => match client.start(id) {
-                Ok(msgs) => reply(shared, id, msgs),
-                Err(e) => warn!(error = %e, "Graphics pipeline failed to start"),
+                Ok(msgs) => {
+                    started_on = Some(id);
+                    reply(shared, id, msgs);
+                }
+                Err(e) => gated!(warn, error = %e, "Graphics pipeline failed to start"),
             },
             Job::Data(id, payload) => {
-                if let Some(c) = capture.as_mut() {
-                    c.record(&payload);
+                if capture.as_mut().is_some_and(|c| !c.record(&payload)) {
+                    warn!("Graphics recording stopped (write failed)");
+                    capture = None;
                 }
                 let started = Instant::now();
                 let result = client.process(id, &payload);
@@ -124,24 +409,32 @@ fn run(
                 record_codec_time(codecs.swap(0, Ordering::Relaxed), took);
                 match result {
                     Ok(msgs) => reply(shared, id, msgs),
-                    Err(e) => warn!(error = %e, "Graphics pipeline error"),
+                    Err(e) => {
+                        bastion_metrics::GFX_ERRORS.incr();
+                        gated!(warn, error = %e, "Graphics pipeline error");
+                    }
                 }
                 if reset.swap(false, Ordering::Relaxed) {
                     match client.request_protocol_reset() {
                         Some(pdu) => {
-                            info!("Requested a graphics stream reset");
+                            gated!(info, "Requested a graphics stream reset");
                             reply(shared, id, vec![Box::new(pdu)]);
                         }
-                        None => warn!("Graphics stream reset not possible"),
+                        None => gated!(warn, "Graphics stream reset not possible"),
                     }
                 }
-                composite(&mut client, shared);
-            }
-            Job::Close(id) => {
-                client.close(id);
-                break;
+                if !composite(&mut client, shared) {
+                    // Nothing sensible can be shown from here on; the session loop ends the
+                    // session when the server's next graphics message arrives.
+                    gated!(warn, "The server announced a desktop size beyond what Bastion supports");
+                    queue.frame_refused.store(true, Ordering::Relaxed);
+                    break;
+                }
             }
         }
+    }
+    if let Some(id) = started_on {
+        client.close(id);
     }
     debug!("Graphics thread finished");
 }
@@ -173,24 +466,26 @@ impl Capture {
         };
         match open() {
             Ok((path, file)) => {
-                warn!(path = %path.display(), "Recording the graphics channel (contains screen contents)");
+                gated!(warn, path = %path.display(), "Recording the graphics channel (contains screen contents)");
                 let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
                 std::io::Write::write_all(&mut out, CAPTURE_MAGIC).ok()?;
                 Some(Self { out })
             }
             Err(e) => {
-                warn!(error = %e, "Cannot record the graphics channel");
+                gated!(warn, error = %e, "Cannot record the graphics channel");
                 None
             }
         }
     }
 
-    fn record(&mut self, payload: &[u8]) {
+    /// Appends one message; `false` if writing failed (the caller then stops recording, so a
+    /// full disk is reported once rather than once per message).
+    fn record(&mut self, payload: &[u8]) -> bool {
         use std::io::Write as _;
-        let len = u32::try_from(payload.len()).unwrap_or(u32::MAX).to_le_bytes();
-        if self.out.write_all(&len).and_then(|()| self.out.write_all(payload)).is_err() {
-            warn!("Graphics recording stopped (write failed)");
-        }
+        let Ok(len) = u32::try_from(payload.len()) else {
+            return false;
+        };
+        self.out.write_all(&len.to_le_bytes()).and_then(|()| self.out.write_all(payload)).is_ok()
     }
 }
 
@@ -245,10 +540,10 @@ pub fn replay_capture(
         bastion_metrics::GFX_PROCESS.record(took);
         record_codec_time(codecs.swap(0, Ordering::Relaxed), took);
         if let Err(e) = result {
-            warn!(error = %e, "Graphics pipeline error during replay");
+            gated!(warn, error = %e, "Graphics pipeline error during replay");
         }
         let _ = reset.swap(false, Ordering::Relaxed);
-        composite(&mut client, &shared);
+        anyhow::ensure!(composite(&mut client, &shared), "the recording announces an unsupported desktop size");
         busy += started.elapsed();
         // The renderer would take the dirty list: hash what it would upload, then clear it.
         let mut f = shared.frame.lock();
@@ -278,22 +573,27 @@ fn reply(shared: &GfxShared, channel_id: u32, msgs: Vec<DvcMessage>) {
         Ok(svc) => {
             let _ = shared.replies.send(Command::GfxReply(GfxReply(svc)));
         }
-        Err(e) => warn!(error = %e, "Cannot encode graphics pipeline reply"),
+        Err(e) => gated!(warn, error = %e, "Cannot encode graphics pipeline reply"),
     }
 }
 
 /// Copies what the pipeline finished since the last call into the shared framebuffer.
-fn composite(client: &mut GraphicsPipelineClient, shared: &GfxShared) {
+///
+/// Returns `false` if the server reset the output to a size the shared frame refuses (the
+/// pipeline itself allows up to 32766 per side, far more than a texture can hold).
+fn composite(client: &mut GraphicsPipelineClient, shared: &GfxShared) -> bool {
     let reset = client.take_output_reset();
     if let Some((w, h)) = reset {
-        shared.frame.reset(u32::from(w), u32::from(h));
+        if !shared.frame.reset(u32::from(w), u32::from(h)) {
+            return false;
+        }
         shared.active.store(true, Ordering::Release);
     }
     // RemoteApp windows are not used.
     let _ = client.drain_window_updates();
     let output = client.drain_output();
     if output.is_empty() && reset.is_none() {
-        return;
+        return true;
     }
     let started = Instant::now();
     let copied = shared.frame.apply_regions(output.iter().map(|u| {
@@ -312,6 +612,7 @@ fn composite(client: &mut GraphicsPipelineClient, shared: &GfxShared) {
     if !shared.frame.needs_present.swap(true, Ordering::AcqRel) {
         (shared.waker)();
     }
+    true
 }
 
 /// The pipeline client with our H.264 decoder. `reset` lets the handler ask the graphics
@@ -333,7 +634,7 @@ pub(crate) fn gfx_client(
             // Software first (faster for remote-desktop streams), hardware if it can't keep up.
             adaptive: true,
         })
-        .map_err(|e| warn!(error = %e, "H.264 decoding unavailable"))
+        .map_err(|e| gated!(warn, error = %e, "H.264 decoding unavailable"))
         .ok()
         .map(|mut d| {
             if let Some(r) = &reset {
@@ -446,7 +747,7 @@ impl GraphicsPipelineHandler for GfxHandler {
     fn on_capabilities_confirmed(&mut self, caps: &ironrdp_egfx::pdu::CapabilitySet) {
         use ironrdp_egfx::pdu::CapabilitySet as C;
         // Which graphics mode the server chose decides whether H.264 can be used at all.
-        info!(?caps, "Graphics pipeline negotiated");
+        gated!(info, ?caps, "Graphics pipeline negotiated");
         if let Some(planes) = &self.planes {
             // Planes were needed to advertise V10.x. Windows streams AVC420 unless its "AVC444"
             // policy is on, and AVC420 is far faster through our own conversion, so turn them
@@ -487,7 +788,7 @@ impl GraphicsPipelineHandler for GfxHandler {
     }
 
     fn on_reset_graphics(&mut self, width: u32, height: u32) {
-        info!(width, height, "Graphics output reset");
+        gated!(info, width, height, "Graphics output reset");
     }
 
     fn on_surface_created(&mut self, surface: &ironrdp_egfx::client::Surface) {
@@ -646,6 +947,147 @@ mod tests {
 
         std::fs::write(&path, b"not a recording").unwrap();
         assert!(replay_capture(&path, &display).is_err());
+    }
+
+    #[test]
+    fn log_gate_lets_a_burst_through_per_window() {
+        let gate = LogGate::new();
+        assert_eq!((0..10_000).filter(|_| gate.allow_in(1)).count() as u64, LogGate::BURST);
+        assert_eq!((0..10_000).filter(|_| gate.allow_in(2)).count() as u64, LogGate::BURST);
+    }
+
+    #[test]
+    fn queue_holds_a_bounded_number_of_bytes_and_blocks_the_sender_beyond_it() {
+        let data = |n: usize| Job::Data(1, vec![0; n]);
+        let q = Arc::new(Queue::new(1000));
+        let short = Duration::from_millis(20);
+        // A message larger than the whole budget is still accepted when nothing is queued.
+        assert_eq!(q.push(data(5000), short), Ok(()));
+        // Nothing more fits until the thread takes it: the sender waits, then gives up.
+        assert_eq!(q.push(data(10), short), Err(Stalled));
+        assert_eq!(q.push(Job::Data(1, Vec::new()), short), Err(Stalled), "empty messages are charged too");
+        assert!(matches!(q.pop(), Some(Job::Data(1, d)) if d.len() == 5000));
+        assert_eq!(q.push(data(400), short), Ok(()));
+        assert_eq!(q.push(data(400), short), Ok(()));
+        assert_eq!(q.push(data(400), short), Err(Stalled), "1200 bytes > 1000");
+        assert_eq!(lock(&q.state).jobs.len(), 2, "a refused message is not queued");
+
+        // A blocked sender resumes as soon as the thread makes room (TCP back-pressure, not loss).
+        let q2 = q.clone();
+        let sender = std::thread::spawn(move || q2.push(data(400), Duration::from_secs(30)));
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(q.pop().is_some());
+        assert_eq!(sender.join().unwrap(), Ok(()));
+        assert_eq!(lock(&q.state).jobs.len(), 2);
+
+        // Closing frees everything, wakes a blocked sender, and hands out nothing more.
+        let q2 = q.clone();
+        let sender = std::thread::spawn(move || q2.push(data(900), Duration::from_secs(30)));
+        std::thread::sleep(Duration::from_millis(30));
+        q.close();
+        assert_eq!(sender.join().unwrap(), Ok(()));
+        assert!(q.pop().is_none());
+        let st = lock(&q.state);
+        assert_eq!((st.jobs.len(), st.bytes), (0, 0));
+    }
+
+    #[test]
+    fn a_session_has_one_live_pipeline_and_a_cap_on_threads() {
+        let mut p = Pipelines::default();
+        let queues: Vec<_> = (0..MAX_PIPELINE_THREADS + 2).map(|_| Arc::new(Queue::new(1))).collect();
+        for (i, q) in queues.iter().enumerate() {
+            // Threads never finish here (as if each were stuck in a message).
+            assert_eq!(p.admit(q), i < MAX_PIPELINE_THREADS, "pipeline {i}");
+            if (1..=MAX_PIPELINE_THREADS).contains(&i) {
+                assert!(queues[i - 1].is_closed(), "the previous pipeline is retired");
+            }
+        }
+        assert_eq!(p.threads, MAX_PIPELINE_THREADS);
+        assert!(p.current.is_none(), "a refused channel still retires the live one");
+        // Once a retired thread ends there is room again.
+        p.finished(&queues[0]);
+        let next = Arc::new(Queue::new(1));
+        assert!(p.admit(&next));
+        assert!(!next.is_closed());
+        p.finished(&next);
+        assert!(p.current.is_none());
+    }
+
+    fn test_shared() -> (GfxShared, mpsc::UnboundedReceiver<Command>) {
+        let (replies, rx) = mpsc::unbounded_channel();
+        let shared = GfxShared {
+            frame: Arc::new(SharedFrame::default()),
+            waker: Arc::new(|| {}),
+            replies,
+            active: Arc::default(),
+        };
+        (shared, rx)
+    }
+
+    fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn opening_channel_after_channel_never_accumulates_threads() {
+        let (shared, mut rx) = test_shared();
+        let display = bastion_core::profile::DisplaySettings { h264: false, ..Default::default() };
+        // What a hostile server does: Create Requests under ever new channel ids, never closed.
+        let mut open = Vec::new();
+        for id in 0..200u32 {
+            let mut fwd = GfxForwarder::spawn(&display, shared.clone());
+            // Refused ones answer "no listener" (start fails); admitted ones retire the last.
+            let _ = fwd.start(id);
+            open.push(fwd);
+            assert!(lock(&shared.frame.gfx).threads <= MAX_PIPELINE_THREADS);
+        }
+        // All but (at most) the newest end by themselves, although every forwarder is still held.
+        wait_for("retired graphics threads to end", || lock(&shared.frame.gfx).threads <= 1);
+        // A fresh channel is then accepted and works: it advertises capabilities.
+        while rx.try_recv().is_ok() {}
+        let mut fwd = GfxForwarder::spawn(&display, shared.clone());
+        fwd.start(999).expect("a new channel is accepted once the old threads are gone");
+        assert!(matches!(rx.blocking_recv(), Some(Command::GfxReply(_))));
+        drop(fwd);
+        drop(open);
+        wait_for("the last graphics thread to end", || lock(&shared.frame.gfx).threads == 0);
+        assert!(lock(&shared.frame.gfx).current.is_none());
+    }
+
+    #[test]
+    fn a_reset_to_an_unsupported_desktop_size_ends_the_session_without_allocating() {
+        use ironrdp_egfx::pdu::*;
+        let (shared, mut rx) = test_shared();
+        let display = bastion_core::profile::DisplaySettings { h264: false, ..Default::default() };
+        let mut fwd = GfxForwarder::spawn(&display, shared.clone());
+        fwd.start(7).unwrap();
+        assert!(rx.blocking_recv().is_some());
+        // Within the pipeline's own limits (32766 per side, 256 MiB), beyond any GPU texture.
+        let reset = || wire(GfxPdu::ResetGraphics(ResetGraphicsPdu { width: 32_766, height: 8, monitors: Vec::new() }));
+        fwd.process(
+            7,
+            &wire(GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::SMALL_CACHE,
+            }))),
+        )
+        .unwrap();
+        fwd.process(7, &reset()).unwrap();
+        // The graphics thread refuses the size; the next message on the channel reports it.
+        let mut error = None;
+        wait_for("the refused size to be reported", || {
+            error = fwd.process(7, &reset()).err();
+            error.is_some()
+        });
+        assert!(error.unwrap().to_string().contains(FRAME_SIZE_MESSAGE));
+        let f = shared.frame.lock();
+        assert_eq!((f.width, f.height, f.data.len(), f.generation), (0, 0, 0, 0));
+        drop(f);
+        assert!(!shared.active.load(Ordering::Relaxed), "the pipeline never took over the frame");
+        wait_for("the graphics thread to end", || lock(&shared.frame.gfx).threads == 0);
     }
 
     #[test]

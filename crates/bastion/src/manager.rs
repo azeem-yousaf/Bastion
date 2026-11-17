@@ -47,6 +47,82 @@ struct CredPrompt {
     error: Option<String>,
 }
 
+/// Largest file accepted as an `.rdp` file (the same bound `rdpfile::decode_text` applies to the
+/// decoded bytes). Real ones are a few kilobytes.
+pub const MAX_RDP_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Reads an `.rdp` file without trusting what the path points at: it must be a regular file of
+/// at most [`MAX_RDP_FILE_BYTES`], checked on the opened file *before* anything is read, and the
+/// read itself is capped. A device (`/dev/zero`), a FIFO, a directory or a huge/sparse file is
+/// refused instead of exhausting memory or blocking the UI thread.
+pub fn read_rdp_file(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    // Non-blocking so that opening a FIFO returns at once instead of waiting for a writer; it
+    // has no effect on regular files.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("{}", friendly_io_error(&e)))?;
+    let meta = file.metadata().map_err(|e| anyhow::anyhow!("{}", friendly_io_error(&e)))?;
+    if !meta.is_file() {
+        anyhow::bail!("it is not a regular file");
+    }
+    if meta.len() > MAX_RDP_FILE_BYTES {
+        anyhow::bail!("file is too large to be an .rdp file");
+    }
+    // The size can change after the check (or be misreported): never read past the cap.
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_RDP_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("{}", friendly_io_error(&e)))?;
+    if bytes.len() as u64 > MAX_RDP_FILE_BYTES {
+        anyhow::bail!("file is too large to be an .rdp file");
+    }
+    Ok(bytes)
+}
+
+fn friendly_io_error(e: &std::io::Error) -> &'static str {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => "the file does not exist",
+        std::io::ErrorKind::PermissionDenied => "you do not have permission to read it",
+        _ => "the file could not be read",
+    }
+}
+
+/// The start of a certificate fingerprint for the trusted-hosts list. Counts characters, not
+/// bytes: the value comes from `known_hosts.toml` and need not be the ASCII hex Bastion writes.
+pub fn short_fingerprint(fp: &str) -> String {
+    let mut short: String = fp.chars().take(23).collect();
+    short.push('…');
+    short
+}
+
+/// Drops egui's undo history for a password field. egui records the full text of every
+/// `TextEdit` (masked or not) there, and keeps it for as long as the window exists.
+fn scrub_secret_field(ctx: &egui::Context, id: egui::Id) {
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+        state.clear_undoer();
+        state.store(ctx, id);
+    }
+}
+
+/// Removes everything egui remembers about a password field once the prompt is closed.
+fn forget_secret_field(ctx: &egui::Context, id: egui::Id) {
+    scrub_secret_field(ctx, id);
+    ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(id));
+}
+
+/// Room reserved for a typed password, so that typing does not reallocate the buffer and leave
+/// un-wiped prefixes of the password behind on the heap.
+const SECRET_CAPACITY: usize = 256;
+
+fn empty_secret() -> Secret {
+    Secret::new(String::with_capacity(SECRET_CAPACITY))
+}
+
 pub struct Manager {
     paths: AppPaths,
     store: ProfileStore,
@@ -71,6 +147,8 @@ pub struct Manager {
     monitors: Vec<(String, String)>,
     /// Wake-on-LAN MAC address detection running in the background.
     detect_mac: Option<Receiver<Result<bastion_core::wol::MacAddr, String>>>,
+    /// egui ids of the credential prompt's password fields as last drawn.
+    secret_fields: Vec<egui::Id>,
 }
 
 impl Manager {
@@ -104,6 +182,7 @@ impl Manager {
             keyring_ok: secrets::keyring_available(),
             monitors: Vec::new(),
             detect_mac: None,
+            secret_fields: Vec::new(),
         })
     }
 
@@ -124,7 +203,7 @@ impl Manager {
 
     /// Imports a .rdp file given on the command line / via file association.
     pub fn import_file(&mut self, path: &std::path::Path) {
-        match std::fs::read(path).map_err(anyhow::Error::from).and_then(|b| rdpfile::decode_text(&b)) {
+        match read_rdp_file(path).and_then(|b| rdpfile::decode_text(&b)) {
             Ok(text) => {
                 let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 let (p, warnings) = rdpfile::import(&text, &name);
@@ -158,12 +237,18 @@ impl Manager {
         self.prompt = Some(CredPrompt {
             remember: p.security.remember_password && self.keyring_ok,
             profile: p,
-            password: Secret::default(),
+            password: empty_secret(),
             gateway_user,
-            gateway_password: Secret::default(),
+            gateway_password: empty_secret(),
             error: None,
         });
         None
+    }
+
+    /// egui ids of the credential prompt's password fields, as last drawn (used by tests to
+    /// check that nothing about them is left in egui's memory).
+    pub fn password_field_ids(&self) -> &[egui::Id] {
+        &self.secret_fields
     }
 
     fn pick(&mut self, kind: Pick) {
@@ -785,8 +870,7 @@ impl Manager {
             for (key, fp, at) in &entries {
                 let (kind, endpoint) = key.split_once('|').unwrap_or(("", key));
                 ui.label(format!("{endpoint} ({kind})"));
-                ui.label(egui::RichText::new(format!("{}…", &fp[..fp.len().min(23)])).monospace().small())
-                    .on_hover_text(fp);
+                ui.label(egui::RichText::new(short_fingerprint(fp)).monospace().small()).on_hover_text(fp);
                 if ui.small_button("Forget").on_hover_text(format!("Trusted {at}")).clicked() {
                     forget = Some((kind.to_owned(), endpoint.to_owned()));
                 }
@@ -831,6 +915,7 @@ impl Manager {
         let mut cancel = false;
         let needs_gw = p.profile.gateway.as_ref().is_some_and(|g| !g.same_credentials);
         let caps = bastion_session::keyboard::read_lock_state().caps;
+        let mut secret_fields = Vec::new();
 
         egui::Modal::new(egui::Id::unique("cred")).show(ui.ctx(), |ui| {
             ui.set_width(380.0);
@@ -847,6 +932,9 @@ impl Manager {
                 let r = field(ui, "Password", |ui| {
                     ui.add(egui::TextEdit::singleline(p.password.as_mut_string()).password(true))
                 });
+                // No undo history for passwords: egui would keep plain copies of every state.
+                scrub_secret_field(ui.ctx(), r.id);
+                secret_fields.push(r.id);
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     submit = true;
                 }
@@ -855,9 +943,11 @@ impl Manager {
                 }
                 if needs_gw {
                     field(ui, "Gateway user", |ui| ui.add(egui::TextEdit::singleline(&mut p.gateway_user)));
-                    field(ui, "Gateway password", |ui| {
+                    let r = field(ui, "Gateway password", |ui| {
                         ui.add(egui::TextEdit::singleline(p.gateway_password.as_mut_string()).password(true))
                     });
+                    scrub_secret_field(ui.ctx(), r.id);
+                    secret_fields.push(r.id);
                 }
             });
             if caps {
@@ -878,8 +968,11 @@ impl Manager {
             });
         });
 
+        self.secret_fields = secret_fields;
         if cancel {
+            // Dropping the prompt wipes both passwords (`Secret` zeroizes on drop).
             self.prompt = None;
+            self.forget_secret_fields(ui.ctx());
             return None;
         }
         if !submit {
@@ -890,6 +983,7 @@ impl Manager {
             return None;
         }
         let mut prompt = self.prompt.take()?;
+        self.forget_secret_fields(ui.ctx());
         if let Some(gw) = prompt.profile.gateway.as_mut()
             && needs_gw
         {
@@ -906,11 +1000,19 @@ impl Manager {
                 let _ = secrets::store(prompt.profile.id, SecretKind::Gateway, &prompt.gateway_password);
             }
         }
+        // Moved, not copied: the prompt keeps no second copy of either password.
         Some(ConnectRequest {
-            profile: prompt.profile.clone(),
-            password: prompt.password.clone(),
-            gateway_password: needs_gw.then(|| prompt.gateway_password.clone()),
+            password: std::mem::take(&mut prompt.password),
+            gateway_password: needs_gw.then(|| std::mem::take(&mut prompt.gateway_password)),
+            profile: prompt.profile,
         })
+    }
+
+    /// Clears egui's per-widget state (cursor, undo history) of the prompt's password fields.
+    fn forget_secret_fields(&self, ctx: &egui::Context) {
+        for id in &self.secret_fields {
+            forget_secret_field(ctx, *id);
+        }
     }
 
     /// Called when a session fails to sign in, so a stored wrong password is not reused silently.
@@ -1067,4 +1169,88 @@ fn empty_state(ui: &mut egui::Ui) {
         ui.heading("Welcome to Bastion");
         ui.label(egui::RichText::new("Create a connection or import an .rdp file to get started.").color(theme::MUTED));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_is_shortened_by_characters_not_bytes() {
+        let ascii = "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01";
+        assert_eq!(short_fingerprint(ascii), "AB:CD:EF:01:23:45:67:89…");
+        assert_eq!(short_fingerprint("AB:CD"), "AB:CD…");
+        assert_eq!(short_fingerprint(""), "…");
+        // Byte 23 falls inside a multi-byte character: `&fp[..23]` panicked here.
+        let odd = "AB:CD:EF:01:23:45:67:8\u{2014}9 \u{201c}renewed\u{201d}";
+        assert!(!odd.is_char_boundary(23));
+        assert_eq!(short_fingerprint(odd), "AB:CD:EF:01:23:45:67:8\u{2014}…");
+        assert_eq!(short_fingerprint(&"é".repeat(40)), format!("{}…", "é".repeat(23)));
+    }
+
+    #[test]
+    fn rdp_file_is_read_when_small_and_regular() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok.rdp");
+        std::fs::write(&path, "full address:s:pc01\r\n").unwrap();
+        assert_eq!(read_rdp_file(&path).unwrap(), b"full address:s:pc01\r\n");
+        // A symlink to a regular file is fine (files are often linked into place).
+        let link = dir.path().join("link.rdp");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(read_rdp_file(&link).unwrap().len(), 21);
+        // Exactly at the limit is accepted.
+        let edge = dir.path().join("edge.rdp");
+        std::fs::write(&edge, vec![b' '; MAX_RDP_FILE_BYTES as usize]).unwrap();
+        assert_eq!(read_rdp_file(&edge).unwrap().len() as u64, MAX_RDP_FILE_BYTES);
+    }
+
+    #[test]
+    fn huge_or_sparse_rdp_file_is_refused_without_reading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.rdp");
+        // 64 GiB sparse: reading it would exhaust memory; the metadata check refuses it at once.
+        std::fs::File::create(&path).unwrap().set_len(64 << 30).unwrap();
+        let started = std::time::Instant::now();
+        let err = read_rdp_file(&path).unwrap_err().to_string();
+        assert_eq!(err, "file is too large to be an .rdp file");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let over = dir.path().join("over.rdp");
+        std::fs::write(&over, vec![b' '; MAX_RDP_FILE_BYTES as usize + 1]).unwrap();
+        assert!(read_rdp_file(&over).is_err());
+    }
+
+    #[test]
+    fn devices_fifos_and_directories_are_not_rdp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // A symlink to an endless device, as shipped inside a hostile archive.
+        let zero = dir.path().join("invoice.rdp");
+        std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
+        assert_eq!(read_rdp_file(&zero).unwrap_err().to_string(), "it is not a regular file");
+        // A FIFO with no writer: opening it must not block the (UI) thread.
+        let fifo = dir.path().join("pipe.rdp");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(read_rdp_file(&fifo).map_err(|e| e.to_string())));
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("reading a FIFO must not hang");
+        assert_eq!(result.unwrap_err(), "it is not a regular file");
+        assert_eq!(read_rdp_file(dir.path()).unwrap_err().to_string(), "it is not a regular file");
+        let missing = read_rdp_file(&dir.path().join("missing.rdp")).unwrap_err().to_string();
+        assert_eq!(missing, "the file does not exist");
+    }
+
+    #[test]
+    fn importing_an_endless_file_shows_a_friendly_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted(dir.path());
+        let mut m = Manager::new(paths, Arc::new(Mutex::new(TrustStore::in_memory())), Arc::new(|| {})).unwrap();
+        let zero = dir.path().join("Server.rdp");
+        std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
+        m.import_file(&zero);
+        let (msg, error) = m.banner.clone().expect("banner");
+        assert!(error);
+        assert!(msg.starts_with("Could not import ") && msg.ends_with("Server.rdp: it is not a regular file"), "{msg}");
+        assert!(m.draft.is_none());
+    }
 }

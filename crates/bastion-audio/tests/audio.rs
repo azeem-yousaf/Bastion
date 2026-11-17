@@ -288,3 +288,313 @@ fn packet_rescaling_preserves_duration() {
     assert_eq!(rescale_packet(1764, s(44_100, 2), s(22_050, 1)), 440);
     assert_eq!(rescale_packet(320, s(16_000, 1), s(44_100, 2)), 1764);
 }
+
+// ---- Hostile servers -------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use bastion_audio::capture::{MAX_PACKET_BYTES, checked_rescale_packet, is_capturable, rescale_packet};
+use ironrdp_rdpsnd::codec::alaw_format;
+
+/// A microphone that delivers audio in real time (a read takes as long as the audio it returns),
+/// or, while `stuck` is set, not at all.
+#[derive(Clone, Default)]
+struct RealTimeHost {
+    opened: Arc<Mutex<Vec<(PcmSpec, usize)>>>,
+    stuck: Arc<AtomicBool>,
+}
+
+struct RealTimeIn(PcmSpec, Arc<AtomicBool>);
+impl CaptureDevice for RealTimeIn {
+    fn read(&mut self, buf: &mut [u8]) -> Result<()> {
+        while self.1.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let bytes_per_sec = u64::from(self.0.rate) * self.0.bytes_per_frame() as u64;
+        std::thread::sleep(Duration::from_micros(buf.len() as u64 * 1_000_000 / bytes_per_sec.max(1)));
+        buf.fill(0);
+        Ok(())
+    }
+}
+
+impl AudioHost for RealTimeHost {
+    fn open_playback(&self, _: Option<&str>, _: PcmSpec, _: Duration) -> Result<Box<dyn PlaybackDevice>> {
+        anyhow::bail!("unused")
+    }
+    fn open_capture(&self, _: Option<&str>, spec: PcmSpec, frag: usize) -> Result<Box<dyn CaptureDevice>> {
+        self.opened.lock().unwrap().push((spec, frag));
+        Ok(Box::new(RealTimeIn(spec, self.stuck.clone())))
+    }
+}
+
+/// The Open PDU's capture WAVEFORMATEX is not negotiated; a server can put anything in it.
+#[test]
+fn hostile_capture_formats_are_refused_before_anything_is_opened_or_allocated() {
+    let host = RealTimeHost::default();
+    let mut c = PulseCapture::with_host(Arc::new(host.clone()), CaptureOptions::default());
+    let alaw = alaw_format(2, 48_000);
+    assert!(is_capturable(&alaw));
+
+    // The audited case: 256 channels (0 after truncation to u8) at 0 Hz with a compressed encode
+    // format used to rescale a 192 kB packet into a ~37 GB buffer.
+    let evil = |channels: u16, rate: u32| AudioFormat {
+        format: WaveFormat::PCM,
+        n_channels: channels,
+        n_samples_per_sec: rate,
+        n_avg_bytes_per_sec: 0,
+        n_block_align: channels.wrapping_mul(2),
+        bits_per_sample: 16,
+        data: None,
+    };
+    for (channels, rate, packet) in [
+        (256, 0, 192_000),
+        (0xFF00, 0, 130_560),
+        (0, 48_000, 1920),
+        (2, 0, 1920),
+        (2, 1, 192_000),
+        (2, 1_000, 192_000),
+        (9, 48_000, 1920),
+        (2, u32::MAX, 1920),
+    ] {
+        for encode in [&alaw, &pcm(2, 48_000)] {
+            let rc = c.open(&evil(channels, rate), encode, packet, Box::new(|_| {}));
+            assert_eq!(rc, OpenReplyPdu::E_FAIL, "{channels} ch / {rate} Hz must be refused");
+        }
+    }
+    // Sizes outside what MS-RDPEAI allows, and a block alignment that contradicts the layout.
+    assert_eq!(c.open(&pcm(2, 48_000), &pcm(2, 48_000), 0, Box::new(|_| {})), OpenReplyPdu::E_FAIL);
+    assert_eq!(c.open(&pcm(2, 48_000), &pcm(2, 48_000), MAX_PACKET_BYTES + 4, Box::new(|_| {})), OpenReplyPdu::E_FAIL);
+    assert_eq!(c.open(&pcm(2, 48_000), &alaw, usize::MAX, Box::new(|_| {})), OpenReplyPdu::E_FAIL);
+    let misaligned = AudioFormat { n_block_align: 0, ..pcm(2, 48_000) };
+    assert_eq!(c.open(&misaligned, &pcm(2, 48_000), 1920, Box::new(|_| {})), OpenReplyPdu::E_FAIL);
+    // A valid shape whose rescaled packet would exceed the cap: 1 s of 8 kHz mono → 48 kHz stereo is
+    // fine (exactly the cap), 2 s is not.
+    assert_eq!(c.open(&pcm(1, 8_000), &alaw, 32_000, Box::new(|_| {})), OpenReplyPdu::E_FAIL);
+
+    assert!(host.opened.lock().unwrap().is_empty(), "no device may be opened for a refused format");
+
+    // The same handler still works for a sane request afterwards.
+    assert_eq!(c.open(&pcm(1, 8_000), &alaw, 16_000, Box::new(|_| {})), OpenReplyPdu::S_OK);
+    c.close();
+    assert_eq!(host.opened.lock().unwrap()[0].0, PcmSpec { rate: 48_000, channels: 2 });
+}
+
+#[test]
+fn packet_rescaling_is_checked_and_bounded() {
+    let s = |rate, channels| PcmSpec { rate, channels };
+    // Degenerate shapes used to divide by a clamped 1 and multiply the size by the target rate.
+    assert_eq!(checked_rescale_packet(192_000, s(0, 0), s(48_000, 2)), None);
+    assert_eq!(checked_rescale_packet(192_000, s(0, 2), s(48_000, 2)), None);
+    assert_eq!(checked_rescale_packet(192_000, s(48_000, 2), s(0, 2)), None);
+    assert_eq!(checked_rescale_packet(192_000, s(48_000, 2), s(48_000, 0)), None);
+    assert_eq!(checked_rescale_packet(usize::MAX, s(1, 1), s(u32::MAX, 255)), None);
+    assert_eq!(checked_rescale_packet(192_000, s(8_000, 1), s(48_000, 2)), None);
+    // Legitimate conversions are unchanged, up to exactly the cap.
+    assert_eq!(checked_rescale_packet(1764, s(44_100, 2), s(22_050, 1)), Some(440));
+    assert_eq!(checked_rescale_packet(16_000, s(8_000, 1), s(48_000, 2)), Some(MAX_PACKET_BYTES));
+    // The infallible variant never overflows and never exceeds the cap.
+    for (bytes, from, to) in [
+        (192_000, s(0, 0), s(48_000, 2)),
+        (usize::MAX, s(1, 1), s(u32::MAX, 255)),
+        (usize::MAX, s(0, 0), s(u32::MAX, 3)),
+        (192_000, s(8_000, 1), s(192_000, 8)),
+    ] {
+        let n = rescale_packet(bytes, from, to);
+        assert!(n <= MAX_PACKET_BYTES, "{n}");
+        assert_eq!(n % to.bytes_per_frame(), 0);
+    }
+    assert_eq!(rescale_packet(1000, s(48_000, 2), s(48_000, 0)), 0);
+}
+
+#[test]
+fn format_change_cannot_inflate_the_packet_size() {
+    let host = RealTimeHost::default();
+    let mut c = PulseCapture::with_host(Arc::new(host.clone()), CaptureOptions::default());
+    // 3 s packets of 8 kHz mono are within the Open limits (48 000 frames)…
+    assert_eq!(c.open(&pcm(1, 8_000), &pcm(1, 8_000), 48_000, Box::new(|_| {})), OpenReplyPdu::S_OK);
+    // …but the same duration at 48 kHz stereo would be 576 kB per packet.
+    assert!(!c.set_format(&pcm(2, 48_000), 48_000), "oversized packet after a format change must be refused");
+    // Formats that never went through negotiation are refused too.
+    assert!(!c.set_format(&AudioFormat { n_channels: 256, ..pcm(2, 48_000) }, 48_000));
+    assert!(!c.set_format(&AudioFormat { n_samples_per_sec: 0, ..pcm(2, 48_000) }, 48_000));
+    c.close();
+    assert!(host.opened.lock().unwrap().iter().all(|(_, frag)| *frag <= MAX_PACKET_BYTES));
+    assert_eq!(host.opened.lock().unwrap().len(), 1, "refused format changes must not reopen the device");
+}
+
+#[test]
+fn negotiation_refuses_formats_with_inconsistent_parameters() {
+    let p = PulsePlayback::with_host(Arc::new(MockHost::default()), PlaybackOptions::default());
+    let c = PulseCapture::with_host(Arc::new(MockHost::default()), CaptureOptions::default());
+    let bad = [
+        AudioFormat { n_block_align: 0, ..pcm(2, 44_100) },
+        AudioFormat { n_block_align: 3, ..pcm(2, 44_100) },
+        AudioFormat { n_block_align: 0, ..alaw_format(1, 8_000) },
+        AudioFormat { n_samples_per_sec: 0, ..pcm(2, 44_100) },
+        AudioFormat { n_channels: 0, ..pcm(2, 44_100) },
+        AudioFormat { n_channels: 258, ..pcm(2, 44_100) },
+        AudioFormat { bits_per_sample: 24, n_block_align: 6, ..pcm(2, 44_100) },
+    ];
+    assert!(p.choose_formats(&bad).is_empty());
+    assert!(c.choose_formats(&bad).is_empty());
+    // …while the usual ones still pass, in server order.
+    let good = [pcm(2, 44_100), alaw_format(1, 8_000), ima_adpcm_format(2, 22_050, 2048)];
+    assert_eq!(p.choose_formats(&good), good);
+    assert_eq!(c.choose_formats(&good), good);
+}
+
+#[test]
+fn wave_in_an_unvalidated_format_is_dropped_without_opening_a_device() {
+    let host = MockHost::default();
+    let mut p = PulsePlayback::with_host(Arc::new(host.clone()), PlaybackOptions::default());
+    for f in [
+        AudioFormat { n_channels: 256, n_block_align: 512, ..pcm(2, 44_100) }, // truncates to 0 channels
+        AudioFormat { n_channels: 6, n_block_align: 12, ..pcm(2, 44_100) },
+        AudioFormat { n_samples_per_sec: 1, ..pcm(2, 44_100) },
+        AudioFormat { n_samples_per_sec: u32::MAX, ..pcm(2, 44_100) },
+        AudioFormat { n_block_align: 0, ..pcm(2, 44_100) },
+    ] {
+        p.wave(&f, 0, Cow::Owned(bytes(&[1, 2, 3, 4])));
+    }
+    assert_eq!(p.playback_latency(), Duration::ZERO);
+    // A good wave afterwards plays, and it is the only thing that ever reached a device.
+    p.wave(&pcm(2, 44_100), 0, Cow::Owned(bytes(&[9, 8])));
+    wait_until(|| host.log.lock().unwrap().written.len() == 2);
+    let log = host.log.lock().unwrap();
+    assert_eq!(log.written, vec![9, 8]);
+    assert_eq!(log.opened.len(), 1);
+}
+
+#[test]
+fn playback_queue_memory_is_bounded_when_the_device_stalls() {
+    let host = MockHost { write_delay: Duration::from_millis(300), ..Default::default() };
+    let mut p = PulsePlayback::with_host(Arc::new(host), PlaybackOptions::default());
+    let second = bytes(&vec![0i16; 8_000]); // 1 s of 8 kHz mono per wave
+    for _ in 0..200 {
+        p.wave(&pcm(1, 8_000), 0, Cow::Borrowed(&second));
+    }
+    assert!(p.playback_latency() <= Duration::from_secs(11), "queued {:?}", p.playback_latency());
+    p.close();
+}
+
+/// Packet duration is the server's choice (up to 48 000 frames: 6 s at 8 kHz). Stopping must not
+/// wait for a whole packet to be recorded.
+#[test]
+fn closing_the_microphone_does_not_wait_for_a_long_packet() {
+    let host = RealTimeHost::default();
+    let mut c = PulseCapture::with_host(Arc::new(host.clone()), CaptureOptions::default());
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let d = delivered.clone();
+    let rc = c.open(
+        &pcm(1, 8_000),
+        &pcm(1, 8_000),
+        96_000,
+        Box::new(move |_| {
+            d.fetch_add(1, Ordering::Relaxed);
+        }),
+    );
+    assert_eq!(rc, OpenReplyPdu::S_OK);
+    // The device is read in short slices, not one 6 s read.
+    let (_, fragment) = host.opened.lock().unwrap()[0];
+    assert!(fragment <= 8_000 * 2 / 10, "fragment {fragment} is more than 100 ms of audio");
+    std::thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    c.close();
+    assert!(started.elapsed() < Duration::from_secs(1), "close took {:?}", started.elapsed());
+    // Restarting (what a second Open or a format change does) is just as quick.
+    assert_eq!(c.open(&pcm(1, 8_000), &pcm(1, 8_000), 96_000, Box::new(|_| {})), OpenReplyPdu::S_OK);
+    let started = Instant::now();
+    assert!(c.set_format(&pcm(2, 8_000), 96_000));
+    drop(c);
+    assert!(started.elapsed() < Duration::from_secs(1), "restart + drop took {:?}", started.elapsed());
+    assert_eq!(delivered.load(Ordering::Relaxed), 0, "no partial packet may be delivered");
+}
+
+/// A sound server that stops delivering audio must not freeze the session thread, and a server
+/// that keeps re-opening the microphone must not pile up stuck threads.
+#[test]
+fn stuck_microphone_never_blocks_close_and_cannot_pile_up_threads() {
+    let host = RealTimeHost::default();
+    host.stuck.store(true, Ordering::Relaxed);
+    let mut c = PulseCapture::with_host(Arc::new(host.clone()), CaptureOptions::default());
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let mut results = Vec::new();
+    for _ in 0..8 {
+        let d = delivered.clone();
+        results.push(c.open(
+            &pcm(1, 16_000),
+            &pcm(1, 16_000),
+            640,
+            Box::new(move |_| {
+                d.fetch_add(1, Ordering::Relaxed);
+            }),
+        ));
+        let started = Instant::now();
+        c.close();
+        assert!(started.elapsed() < Duration::from_secs(2), "close blocked for {:?}", started.elapsed());
+    }
+    let opened = host.opened.lock().unwrap().len();
+    assert!((1..=3).contains(&opened), "{opened} capture streams opened while the microphone was stuck");
+    assert_eq!(results.iter().filter(|rc| **rc == OpenReplyPdu::S_OK).count(), opened);
+    assert_eq!(*results.last().unwrap(), OpenReplyPdu::E_FAIL);
+
+    // Once the device recovers, the abandoned threads exit without delivering stale audio and the
+    // microphone can be opened again.
+    host.stuck.store(false, Ordering::Relaxed);
+    wait_until(|| {
+        let rc = c.open(&pcm(1, 16_000), &pcm(1, 16_000), 640, Box::new(|_| {}));
+        c.close();
+        rc == OpenReplyPdu::S_OK
+    });
+    assert_eq!(delivered.load(Ordering::Relaxed), 0, "a closed capture must not deliver packets");
+}
+
+/// Counts info-and-above log events on the current thread.
+struct CountLogs(Arc<AtomicUsize>);
+
+impl tracing::Subscriber for CountLogs {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() <= tracing::Level::INFO {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Every one of these handlers runs once per server PDU; none may log once per PDU.
+#[test]
+fn server_driven_log_lines_are_rate_limited() {
+    let lines = Arc::new(AtomicUsize::new(0));
+    tracing::subscriber::with_default(CountLogs(lines.clone()), || {
+        let mut c = PulseCapture::with_host(Arc::new(MockHost::default()), CaptureOptions::default());
+        let mut p = PulsePlayback::with_host(Arc::new(MockHost::default()), PlaybackOptions::default());
+        let unplayable = [AudioFormat { format: WaveFormat::AAC_MS, ..pcm(2, 44_100) }];
+        let evil = AudioFormat { n_channels: 256, ..pcm(2, 44_100) };
+        for _ in 0..300 {
+            c.choose_formats(&[pcm(2, 44_100)]);
+            c.open(&evil, &pcm(2, 44_100), 1764, Box::new(|_| {}));
+            c.set_format(&pcm(2, 44_100), 1764);
+            p.choose_formats(&unplayable);
+            p.choose_formats(&[pcm(2, 44_100)]);
+            p.wave(&evil, 0, Cow::Owned(vec![0; 4]));
+        }
+        for i in 0..60 {
+            // Open/close and alternating wave formats: each used to log two or three lines.
+            assert_eq!(c.open(&pcm(1, 16_000), &pcm(1, 16_000), 640, Box::new(|_| {})), OpenReplyPdu::S_OK);
+            c.close();
+            p.wave(&pcm(if i % 2 == 0 { 1 } else { 2 }, 44_100), 0, Cow::Owned(vec![0; 4]));
+        }
+    });
+    let lines = lines.load(Ordering::Relaxed);
+    // 2 040 server PDUs above; each call site may log a burst of 5 per 30 s window.
+    assert!(lines <= 120, "{lines} log lines for 2 040 server PDUs");
+}

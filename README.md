@@ -65,18 +65,28 @@ it visible (remembered for later sessions); *Unpin* lets it hide again.
   - If a pinned certificate changes, Bastion shows a prominent warning and requires explicit
     confirmation.
   - The per-connection *Skip certificate verification* switch exists for isolated labs only.
-- **Network Level Authentication (CredSSP)** is always used, so your password is never sent
-  to an unauthenticated server.
+- **Network Level Authentication (CredSSP)** is required, so your password is never sent
+  to an unauthenticated server. A computer (or anything on the network path) that tries to
+  fall back to TLS-only sign-in is refused before any credentials leave your machine.
 - **Passwords** live only in the OS keyring (Secret Service).
   - They are never written to Bastion's files.
-  - In memory they are wiped on drop.
-  - They are never logged; logs are additionally scrubbed for secret-looking values.
+  - Bastion wipes its own copies from memory when they are no longer needed (the protocol
+    libraries keep an unwiped copy while a connection is open).
+  - They are never logged, whatever the log level: the sign-in libraries' debug output is
+    always suppressed, and logs are additionally scrubbed for secret-looking values. Log
+    files are readable only by you.
+- **Imported `.rdp` files** never switch on folder or webcam sharing; the import tells you
+  what it left off and which gateway would receive your credentials.
+- **One instance:** starting Bastion again (or opening a `.rdp` file) while it is running
+  shows the running instance's window instead of starting a second copy.
 - **Process hardening:** core dumps are disabled and the process is non-dumpable, so other
   processes cannot read its memory.
 - **Folder sharing** is off by default.
   - Shared folders are sandboxed: no `..`, no following symlinks, and no crossing mount points.
   - *Read-only* mode refuses every modifying request at the protocol level.
-- **Clipboard file transfers** are size-limited and path-sanitised.
+- **Clipboard file transfers** are size-limited and path-sanitised (hidden-file names from
+  the remote side arrive with a visible name). Selections that a password manager marks as
+  secret are never offered to a remote computer.
 - **No telemetry:** nothing is ever sent anywhere except to your gateway and PC.
 
 Configuration lives in `~/.config/bastion/` (mode 0700): `profiles.toml` and

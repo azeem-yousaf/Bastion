@@ -12,6 +12,9 @@
 //!   own thread) with an X11/XWayland fallback. Remote data is delay-rendered: nothing crosses
 //!   the wire until a local application pastes.
 //!
+//! * What a server can make us queue is bounded in `flow`: requests waiting for the worker by
+//!   count, responses waiting for the socket by bytes.
+//!
 //! # Formats
 //!
 //! | local                                   | remote                              |
@@ -24,6 +27,7 @@
 mod backend;
 mod convert;
 mod files;
+mod flow;
 mod os;
 mod uri;
 mod worker;
@@ -38,6 +42,7 @@ use std::thread::JoinHandle;
 use anyhow::{Result, anyhow};
 use ironrdp_cliprdr::backend::{ClipboardMessageProxy, CliprdrBackendFactory};
 
+pub use crate::flow::{FlowControl, SentGuard};
 use crate::worker::{Command, Config, Worker};
 
 /// How long [`Clipboard::new`] waits for the OS clipboard to open.
@@ -65,6 +70,7 @@ pub struct Clipboard {
     opts: ClipboardOptions,
     done: mpsc::Receiver<()>,
     thread: Option<JoinHandle<()>>,
+    flow: FlowControl,
 }
 
 impl core::fmt::Debug for Clipboard {
@@ -82,6 +88,7 @@ impl Clipboard {
         let (done_tx, done) = mpsc::channel();
         let events = commands.clone();
         let config = Config::new(opts.files, opts.max_transfer_bytes);
+        let flow = config.flow.clone();
         let thread = std::thread::Builder::new()
             .name("bastion-clipboard".to_owned())
             .spawn(move || {
@@ -95,13 +102,16 @@ impl Clipboard {
                 if ready_tx.send(Ok(())).is_err() {
                     return;
                 }
+                // Remote files a crashed or killed session left on disk must not wait for the
+                // next file paste to be removed.
+                files::sweep_at_startup();
                 Worker::new(os, proxy, config).run(&receiver);
                 let _ = done_tx.send(());
                 tracing::debug!("Clipboard worker stopped");
             })
             .map_err(|e| anyhow!("cannot start the clipboard thread: {e}"))?;
         match ready_rx.recv_timeout(STARTUP_TIMEOUT) {
-            Ok(Ok(())) => Ok(Self { commands, opts, done, thread: Some(thread) }),
+            Ok(Ok(())) => Ok(Self { commands, opts, done, thread: Some(thread), flow }),
             Ok(Err(error)) => Err(anyhow!("local clipboard unavailable: {error}")),
             Err(RecvTimeoutError::Timeout) => Err(anyhow!("local clipboard did not open in time")),
             Err(RecvTimeoutError::Disconnected) => Err(anyhow!("clipboard thread stopped unexpectedly")),
@@ -113,7 +123,15 @@ impl Clipboard {
             commands: self.commands.clone(),
             files: self.opts.files,
             max_transfer_bytes: self.opts.max_transfer_bytes,
+            flow: self.flow.shared(),
         })
+    }
+
+    /// The handle through which the session reports clipboard responses it has written to the
+    /// socket (see [`FlowControl::track`]). It bounds the response data queued behind a slow
+    /// link exactly; without it the clipboard falls back to assuming a fixed drain rate.
+    pub fn flow_control(&self) -> FlowControl {
+        self.flow.clone()
     }
 }
 
