@@ -32,6 +32,9 @@ pub struct View {
     /// Where the image was drawn last frame (window physical pixels).
     image_rect: Option<(f64, f64, f64, f64)>,
     pointer_in_ui: bool,
+    bar: BarState,
+    /// Where the session bar was drawn last frame (points).
+    bar_rect: Option<egui::Rect>,
     /// Full-screen state this window should have. Compositors drop full screen when a window is
     /// minimised (however that happens), so it is re-applied whenever the window regains focus.
     want_fullscreen: Option<Fullscreen>,
@@ -56,7 +59,6 @@ pub struct Session {
     input: InputState,
     /// Keyboard goes to the remote session (false after the release chord until clicked back).
     grabbed: bool,
-    show_bar: bool,
     texture: Option<(wgpu::Texture, wgpu::TextureView, u64)>,
     cursor_cache: HashMap<usize, CustomCursor>,
     remote_cursor: RemoteCursor,
@@ -81,7 +83,47 @@ enum RemoteCursor {
 }
 
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
-const BAR_HEIGHT: f32 = 34.0;
+/// Session-bar visibility for one window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarState {
+    Hidden,
+    /// Revealed by touching the top-centre edge; hides again when the pointer leaves.
+    Hover,
+    /// Shown deliberately (keyboard released with Ctrl+Alt+Home); stays until dismissed.
+    Pinned,
+}
+
+/// Half-width (points) of the top-edge zone that reveals the bar — away from the corners,
+/// where remote windows have their close/minimise buttons.
+const REVEAL_HALF_WIDTH: f32 = 220.0;
+/// How far below the bar the pointer may go before a hover-revealed bar hides.
+const HIDE_MARGIN: f32 = 30.0;
+
+/// Decides the bar state after a pointer move (all coordinates in points). Returns the new
+/// state and whether the pointer is over the bar (so input goes to the bar, not the remote).
+pub fn bar_on_pointer(
+    state: BarState,
+    pointer: egui::Pos2,
+    window_width: f32,
+    fullscreen: bool,
+    bar_rect: Option<egui::Rect>,
+) -> (BarState, bool) {
+    let over_bar = state != BarState::Hidden && bar_rect.is_some_and(|r| r.expand(2.0).contains(pointer));
+    let in_reveal_zone = fullscreen && pointer.y <= 1.5 && (pointer.x - window_width / 2.0).abs() <= REVEAL_HALF_WIDTH;
+    let next = match state {
+        BarState::Hidden if in_reveal_zone => BarState::Hover,
+        BarState::Hover => {
+            let bottom = bar_rect.map_or(40.0, |r| r.bottom());
+            if !over_bar && !in_reveal_zone && pointer.y > bottom + HIDE_MARGIN {
+                BarState::Hidden
+            } else {
+                BarState::Hover
+            }
+        }
+        other => other,
+    };
+    (next, over_bar)
+}
 
 impl Session {
     /// Creates the session's window(s) and starts connecting.
@@ -145,6 +187,8 @@ impl Session {
                             tex_id: None,
                             image_rect: None,
                             pointer_in_ui: false,
+                            bar: BarState::Hidden,
+                            bar_rect: None,
                             want_fullscreen: Some(Fullscreen::Borderless(Some(monitor.clone()))),
                             minimized: false,
                         },
@@ -178,6 +222,8 @@ impl Session {
                         tex_id: None,
                         image_rect: None,
                         pointer_in_ui: false,
+                        bar: BarState::Hidden,
+                        bar_rect: None,
                         want_fullscreen: (mode == DisplayMode::Fullscreen).then_some(Fullscreen::Borderless(None)),
                         minimized: false,
                     },
@@ -195,7 +241,6 @@ impl Session {
             notices: Vec::new(),
             input: InputState::new(),
             grabbed: true,
-            show_bar: false,
             texture: None,
             cursor_cache: HashMap::new(),
             remote_cursor: RemoteCursor::Default,
@@ -435,19 +480,28 @@ impl Session {
                     KeyOutcome::ReleaseChord(ev) => {
                         self.send(ev);
                         self.grabbed = false;
-                        self.show_bar = true;
+                        if let Some(v) = self.views.get_mut(&id) {
+                            v.bar = BarState::Pinned;
+                        }
                         self.request_redraw();
                     }
                     KeyOutcome::Ignore => {}
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let in_bar = self.show_bar && position.y < f64::from(BAR_HEIGHT) * view.gfx.window.scale_factor();
-                let reveal = position.y < 3.0 && view.gfx.window.fullscreen().is_some();
-                if reveal && !self.show_bar {
-                    self.show_bar = true;
+                let scale = view.gfx.window.scale_factor();
+                let pointer = egui::pos2((position.x / scale) as f32, (position.y / scale) as f32);
+                let width = (f64::from(view.gfx.window.inner_size().width) / scale) as f32;
+                let fullscreen = view.gfx.window.fullscreen().is_some();
+                let (bar, over_bar) = bar_on_pointer(view.bar, pointer, width, fullscreen, view.bar_rect);
+                if bar != view.bar {
+                    view.bar = bar;
+                    if bar == BarState::Hidden {
+                        view.bar_rect = None;
+                    }
                     view.gfx.window.request_redraw();
                 }
+                let in_bar = over_bar;
                 let was = view.pointer_in_ui;
                 view.pointer_in_ui = in_bar || egui_resp.consumed;
                 if was != view.pointer_in_ui {
@@ -473,7 +527,8 @@ impl Session {
                 if !self.grabbed && *state == ElementState::Pressed {
                     // Clicking back into the session re-captures the keyboard.
                     self.grabbed = true;
-                    self.show_bar = false;
+                    view.bar = BarState::Hidden;
+                    view.bar_rect = None;
                     view.gfx.window.request_redraw();
                 }
                 let b = match button {
@@ -564,6 +619,13 @@ impl Session {
         );
     }
 
+    fn hide_bars(&mut self) {
+        for v in self.views.values_mut() {
+            v.bar = BarState::Hidden;
+            v.bar_rect = None;
+        }
+    }
+
     /// Keeps the Wayland shortcut inhibitor in sync with grab state.
     fn update_inhibitors(&mut self) {
         let want = self.grab_shortcuts && self.grabbed && self.connected() && self.cert.is_none();
@@ -598,7 +660,6 @@ impl Session {
         let mut cert = self.cert.take();
         let mut actions = Vec::new();
         let grabbed = self.grabbed;
-        let show_bar = self.show_bar || !self.grabbed;
 
         let Some(view) = self.views.get_mut(&id) else { return };
         let src = match view.region {
@@ -607,6 +668,8 @@ impl Session {
         };
         let tex_id = view.tex_id;
         let fullscreen = view.gfx.window.fullscreen().is_some();
+        let show_bar = view.bar != BarState::Hidden;
+        let mut bar_rect = None;
         let mut image_rect = None;
         let ppp = view.gfx.window.scale_factor();
 
@@ -636,7 +699,7 @@ impl Session {
                 }
 
                 if show_bar && disconnected.is_none() && phase_text.is_none() {
-                    session_bar(ui, &name, grabbed, fullscreen, &mut actions);
+                    bar_rect = Some(session_bar(ui, &name, grabbed, fullscreen, &mut actions));
                 }
                 if let Some(text) = &phase_text {
                     status_card(ui, &name, &host, text, &mut actions);
@@ -653,6 +716,7 @@ impl Session {
             });
         });
         view.image_rect = image_rect;
+        view.bar_rect = bar_rect;
         self.cert = cert;
         for a in actions {
             self.action(a, id);
@@ -689,9 +753,9 @@ impl Session {
             }
             Action::Grab => {
                 self.grabbed = true;
-                self.show_bar = false;
+                self.hide_bars();
             }
-            Action::HideBar => self.show_bar = false,
+            Action::HideBar => self.hide_bars(),
             Action::Minimize => {
                 // Minimise every window of this session (all monitors) and give the keyboard back.
                 let ev = self.input.release_all();
@@ -851,7 +915,14 @@ pub fn certificate_dialog(ui: &mut egui::Ui, rej: &CertificateRejection, ack: &m
     });
 }
 
-pub fn session_bar(ui: &mut egui::Ui, name: &str, grabbed: bool, fullscreen: bool, actions: &mut Vec<Action>) {
+/// Draws the session bar and returns where it was drawn (points).
+pub fn session_bar(
+    ui: &mut egui::Ui,
+    name: &str,
+    grabbed: bool,
+    fullscreen: bool,
+    actions: &mut Vec<Action>,
+) -> egui::Rect {
     egui::Area::new(egui::Id::unique("session-bar"))
         .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 4.0))
         .order(egui::Order::Foreground)
@@ -891,7 +962,9 @@ pub fn session_bar(ui: &mut egui::Ui, name: &str, grabbed: bool, fullscreen: boo
                         }
                     });
                 });
-        });
+        })
+        .response
+        .rect
 }
 
 fn toast(ui: &mut egui::Ui, idx: usize, text: &str) {
@@ -904,4 +977,50 @@ fn toast(ui: &mut egui::Ui, idx: usize, text: &str) {
                 ui.label(egui::RichText::new(text).color(theme::WARN));
             });
         });
+}
+
+#[cfg(test)]
+mod bar_tests {
+    use super::*;
+
+    const W: f32 = 2327.0; // the user's 4K monitor at 165 %, in points
+    fn bar() -> Option<egui::Rect> {
+        Some(egui::Rect::from_min_max(egui::pos2(W / 2.0 - 280.0, 4.0), egui::pos2(W / 2.0 + 280.0, 40.0)))
+    }
+
+    #[test]
+    fn top_right_corner_never_reveals_the_bar() {
+        // Reaching for a remote browser's close button.
+        let (s, over) = bar_on_pointer(BarState::Hidden, egui::pos2(W - 10.0, 0.0), W, true, None);
+        assert_eq!((s, over), (BarState::Hidden, false));
+        let (s, _) = bar_on_pointer(BarState::Hidden, egui::pos2(15.0, 0.0), W, true, None);
+        assert_eq!(s, BarState::Hidden);
+    }
+
+    #[test]
+    fn top_centre_reveals_only_in_full_screen() {
+        assert_eq!(bar_on_pointer(BarState::Hidden, egui::pos2(W / 2.0, 0.0), W, true, None).0, BarState::Hover);
+        assert_eq!(bar_on_pointer(BarState::Hidden, egui::pos2(W / 2.0, 0.0), W, false, None).0, BarState::Hidden);
+    }
+
+    #[test]
+    fn only_the_bar_itself_captures_the_pointer() {
+        // Bar visible, pointer at the top edge but far right: input goes to the remote PC.
+        let (_, over) = bar_on_pointer(BarState::Hover, egui::pos2(W - 10.0, 2.0), W, true, bar());
+        assert!(!over);
+        let (_, over) = bar_on_pointer(BarState::Hover, egui::pos2(W / 2.0, 20.0), W, true, bar());
+        assert!(over);
+    }
+
+    #[test]
+    fn hover_bar_hides_when_pointer_leaves_but_pinned_stays() {
+        let away = egui::pos2(W / 2.0, 300.0);
+        assert_eq!(bar_on_pointer(BarState::Hover, away, W, true, bar()).0, BarState::Hidden);
+        assert_eq!(bar_on_pointer(BarState::Pinned, away, W, true, bar()).0, BarState::Pinned);
+        // Moving along the bar itself keeps it.
+        assert_eq!(
+            bar_on_pointer(BarState::Hover, egui::pos2(W / 2.0 + 200.0, 30.0), W, true, bar()).0,
+            BarState::Hover
+        );
+    }
 }

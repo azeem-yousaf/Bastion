@@ -239,7 +239,7 @@ fn session_bar_offers_minimise() {
     let mut h = Harness::builder().with_size(egui::vec2(900.0, 120.0)).wgpu().build_ui_state(
         |ui, actions: &mut Vec<Action>| {
             bastion::theme::apply(ui.ctx());
-            bastion::session::session_bar(ui, "Work PC", true, true, actions);
+            let _ = bastion::session::session_bar(ui, "Work PC", true, true, actions);
         },
         Vec::new(),
     );

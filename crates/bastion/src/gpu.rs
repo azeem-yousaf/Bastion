@@ -13,10 +13,15 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    pub fn new(first_window: Arc<Window>) -> Result<(Self, wgpu::Surface<'static>)> {
+    /// `display` must be the event loop's display connection, *not* a window: wgpu keeps it for
+    /// its whole lifetime, and holding a window there would keep that window alive forever.
+    pub fn new(
+        display: winit::event_loop::OwnedDisplayHandle,
+        first_window: Arc<Window>,
+    ) -> Result<(Self, wgpu::Surface<'static>)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
-            ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(first_window.clone()))
+            ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(display))
         });
         let surface = instance.create_surface(first_window).context("create window surface")?;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {

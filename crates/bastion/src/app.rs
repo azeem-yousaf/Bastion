@@ -92,7 +92,7 @@ impl App {
         let gfx = match &self.gpu {
             Some(gpu) => WindowGfx::new(gpu, window, None)?,
             None => {
-                let (gpu, surface) = Gpu::new(window.clone())?;
+                let (gpu, surface) = Gpu::new(event_loop.owned_display_handle(), window.clone())?;
                 let gfx = WindowGfx::new(&gpu, window, Some(surface))?;
                 self.gpu = Some(gpu);
                 gfx

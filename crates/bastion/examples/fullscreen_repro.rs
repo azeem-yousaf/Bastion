@@ -76,7 +76,7 @@ impl ApplicationHandler for Repro {
             let gfx = match &self.gpu {
                 Some(g) => WindowGfx::new(g, w, None).unwrap(),
                 None => {
-                    let (g, s) = Gpu::new(w.clone()).unwrap();
+                    let (g, s) = Gpu::new(el.owned_display_handle(), w.clone()).unwrap();
                     let gfx = WindowGfx::new(&g, w, Some(s)).unwrap();
                     self.gpu = Some(g);
                     gfx
