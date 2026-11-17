@@ -137,6 +137,7 @@ impl SessionHandle {
             waker,
             frame: frame.clone(),
             input_queued: input_queued.clone(),
+            gfx_codecs: Arc::default(),
             input_tx: input_tx.clone(),
             input_rx: Arc::new(tokio::sync::Mutex::new(input_rx)),
         };
@@ -197,6 +198,8 @@ struct EngineCtx {
     waker: Waker,
     frame: Arc<SharedFrame>,
     input_queued: Arc<bastion_metrics::Stamp>,
+    /// Codecs the graphics handler saw in the PDU being processed (see `record_codec_time`).
+    gfx_codecs: Arc<std::sync::atomic::AtomicU32>,
     input_tx: mpsc::UnboundedSender<InputEvents>,
     /// Owned by the running session's input task (locked for its lifetime).
     input_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<InputEvents>>>,
@@ -641,8 +644,54 @@ fn gateway_error_message(e: &ironrdp_error::Error<ironrdp_mstsgu::GwErrorKind>, 
     }
 }
 
+/// Codecs seen by the graphics handler during the PDU being processed (bit mask).
+mod codec_bits {
+    pub const AVC420: u32 = 1;
+    pub const AVC444: u32 = 1 << 1;
+    pub const CLEARCODEC: u32 = 1 << 2;
+    pub const PLANAR: u32 = 1 << 3;
+    pub const PROGRESSIVE: u32 = 1 << 4;
+    pub const REMOTEFX: u32 = 1 << 5;
+    pub const OTHER: u32 = 1 << 6;
+}
+
+/// The codec bit for a decoded update. Progressive tiles arrive as "uncompressed" after
+/// decoding and were already marked by `on_wire_to_surface2`.
+fn codec_bit(codec: ironrdp_egfx::pdu::Codec1Type, progressive_seen: bool) -> Option<u32> {
+    use codec_bits as b;
+    use ironrdp_egfx::pdu::Codec1Type as C;
+    Some(match codec {
+        C::Avc420 => b::AVC420,
+        C::Avc444 | C::Avc444v2 => b::AVC444,
+        C::ClearCodec => b::CLEARCODEC,
+        C::Planar => b::PLANAR,
+        C::RemoteFx => b::REMOTEFX,
+        C::Uncompressed if progressive_seen => return None,
+        _ => b::OTHER,
+    })
+}
+
+/// Attributes one PDU's processing time to the codec that produced its graphics.
+fn record_codec_time(mask: u32, d: Duration) {
+    use codec_bits as b;
+    let h = match mask {
+        0 => return,
+        b::AVC420 => &bastion_metrics::GFX_AVC420,
+        b::AVC444 => &bastion_metrics::GFX_AVC444,
+        b::CLEARCODEC => &bastion_metrics::GFX_CLEARCODEC,
+        b::PLANAR => &bastion_metrics::GFX_PLANAR,
+        b::PROGRESSIVE => &bastion_metrics::GFX_PROGRESSIVE,
+        b::REMOTEFX => &bastion_metrics::GFX_REMOTEFX,
+        b::OTHER => &bastion_metrics::GFX_OTHER,
+        _ => &bastion_metrics::GFX_MIXED,
+    };
+    h.record(d);
+}
+
 #[derive(Debug)]
 struct GfxHandler {
+    /// Codecs used in the current PDU, read and cleared by the session loop.
+    codecs: Arc<std::sync::atomic::AtomicU32>,
     /// The decoder's YUV-planes switch (`None` without H.264).
     planes: Option<Arc<AtomicBool>>,
     /// The server has sent AVC444 in this session: planes stay on.
@@ -651,7 +700,36 @@ struct GfxHandler {
     cmds: Option<mpsc::UnboundedSender<Command>>,
 }
 
+impl GfxHandler {
+    fn mark(&self, bit: u32) {
+        self.codecs.fetch_or(bit, Ordering::Relaxed);
+    }
+}
+
 impl GraphicsPipelineHandler for GfxHandler {
+    fn on_bitmap_updated(&mut self, update: &ironrdp_egfx::client::BitmapUpdate) {
+        let seen = self.codecs.load(Ordering::Relaxed);
+        if let Some(bit) = codec_bit(update.codec_id, seen & codec_bits::PROGRESSIVE != 0) {
+            self.mark(bit);
+        }
+    }
+
+    fn on_wire_to_surface2(&mut self, _pdu: &ironrdp_egfx::pdu::WireToSurface2Pdu) {
+        self.mark(codec_bits::PROGRESSIVE);
+    }
+
+    fn on_solid_fill(&mut self, _pdu: &ironrdp_egfx::pdu::SolidFillPdu) {
+        self.mark(codec_bits::OTHER);
+    }
+
+    fn on_surface_to_surface(&mut self, _pdu: &ironrdp_egfx::pdu::SurfaceToSurfacePdu) {
+        self.mark(codec_bits::OTHER);
+    }
+
+    fn on_cache_to_surface(&mut self, _pdu: &ironrdp_egfx::pdu::CacheToSurfacePdu) {
+        self.mark(codec_bits::OTHER);
+    }
+
     fn on_capabilities_confirmed(&mut self, caps: &ironrdp_egfx::pdu::CapabilitySet) {
         use ironrdp_egfx::pdu::CapabilitySet as C;
         // Which graphics mode the server chose decides whether H.264 can be used at all.
@@ -719,6 +797,7 @@ fn timezone() -> TimezoneInfo {
 fn gfx_client(
     display: &bastion_core::profile::DisplaySettings,
     cmds: Option<mpsc::UnboundedSender<Command>>,
+    codecs: Arc<std::sync::atomic::AtomicU32>,
 ) -> GraphicsPipelineClient {
     let decoder = display.h264.then(|| {
         bastion_video::FfmpegH264Decoder::new(bastion_video::DecoderOptions {
@@ -735,7 +814,7 @@ fn gfx_client(
     });
     let decoder = decoder.flatten();
     let planes = decoder.as_ref().map(bastion_video::FfmpegH264Decoder::yuv420_switch);
-    let handler = GfxHandler { planes, avc444: false, cmds };
+    let handler = GfxHandler { codecs, planes, avc444: false, cmds };
     GraphicsPipelineClient::new(
         Box::new(handler),
         decoder.map(|d| Box::new(d) as Box<dyn ironrdp_egfx::decode::H264Decoder>),
@@ -759,7 +838,8 @@ fn build_connector(
     let display = p.display.clone();
     drdynvc = drdynvc.with_dynamic_channel_factory(ironrdp_egfx::CHANNEL_NAME, {
         let cmds = ctx.cmd_tx.clone();
-        move || gfx_client(&display, Some(cmds.clone()))
+        let codecs = ctx.gfx_codecs.clone();
+        move || gfx_client(&display, Some(cmds.clone()), codecs.clone())
     });
 
     let audio_host: Arc<dyn bastion_audio::AudioHost> =
@@ -996,18 +1076,28 @@ async fn input_task(t: InputTask) {
     }
 }
 
-fn publish(ctx: &EngineCtx, image: &DecodedImage, r: &ironrdp_pdu::geometry::InclusiveRectangle) {
-    let rect = Rect {
+/// Copies the changed regions from the decoder image into the shared framebuffer.
+///
+/// `exact` are IronRDP's per-update damage regions; `union` (their bounding box, which can
+/// span both monitors) is only used when there are none.
+fn publish(
+    ctx: &EngineCtx,
+    image: &DecodedImage,
+    union: &ironrdp_pdu::geometry::InclusiveRectangle,
+    exact: &[ironrdp_pdu::geometry::InclusiveRectangle],
+) {
+    let to_rect = |r: &ironrdp_pdu::geometry::InclusiveRectangle| Rect {
         x: u32::from(r.left),
         y: u32::from(r.top),
         w: u32::from(r.right.saturating_sub(r.left)) + 1,
         h: u32::from(r.bottom.saturating_sub(r.top)) + 1,
     };
+    let rects: Vec<Rect> = if exact.is_empty() { vec![to_rect(union)] } else { exact.iter().map(to_rect).collect() };
     let started = std::time::Instant::now();
-    ctx.frame.update_from(image.data(), u32::from(image.width()), u32::from(image.height()), rect);
+    let copied = ctx.frame.update_rects(image.data(), u32::from(image.width()), u32::from(image.height()), &rects);
     bastion_metrics::FRAME_PUBLISH.since(started);
     bastion_metrics::FRAME_UPDATES.incr();
-    bastion_metrics::FRAME_PIXELS.add(u64::from(rect.w) * u64::from(rect.h));
+    bastion_metrics::FRAME_PIXELS.add(copied);
     if !ctx.frame.needs_present.swap(true, Ordering::AcqRel) {
         (ctx.waker)();
     }
@@ -1096,7 +1186,9 @@ async fn active_session(
                 bastion_metrics::NET_RX.add(payload.len() as u64);
                 let started = std::time::Instant::now();
                 let out = session_try!(stage.process(&mut image, action, &payload, reader.last_read_at()));
-                bastion_metrics::RDP_PROCESS.since(started);
+                let took = started.elapsed();
+                bastion_metrics::RDP_PROCESS.record(took);
+                record_codec_time(ctx.gfx_codecs.swap(0, Ordering::Relaxed), took);
                 out
             }
             Some((_, msgs)) = async { match mic_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {
@@ -1214,7 +1306,7 @@ async fn active_session(
         for out in outputs {
             match out {
                 ActiveStageOutput::ResponseFrame(f) => write_frame!(f),
-                ActiveStageOutput::GraphicsUpdate(r) => publish(ctx, &image, &r),
+                ActiveStageOutput::GraphicsUpdate(r) => publish(ctx, &image, &r, &stage.take_damage_regions()),
                 ActiveStageOutput::PointerDefault => ctx.emit(Event::Pointer(PointerEvent::Default)),
                 ActiveStageOutput::PointerHidden => ctx.emit(Event::Pointer(PointerEvent::Hidden)),
                 ActiveStageOutput::PointerPosition { x, y } => {
@@ -1295,7 +1387,7 @@ mod tests {
     use super::*;
 
     fn advertised(display: &bastion_core::profile::DisplaySettings) -> Vec<CapabilitySet> {
-        let mut client = gfx_client(display, None);
+        let mut client = gfx_client(display, None, Arc::default());
         let msgs = client.start(1).expect("start");
         let bytes = ironrdp_core::encode_vec(msgs[0].as_ref()).expect("encode");
         match ironrdp_core::decode::<GfxPdu>(&bytes).expect("decode") {
@@ -1316,7 +1408,7 @@ mod tests {
     fn handler() -> (GfxHandler, Arc<AtomicBool>, mpsc::UnboundedReceiver<Command>) {
         let planes = Arc::new(AtomicBool::new(true));
         let (tx, rx) = mpsc::unbounded_channel();
-        (GfxHandler { planes: Some(planes.clone()), avc444: false, cmds: Some(tx) }, planes, rx)
+        (GfxHandler { codecs: Arc::default(), planes: Some(planes.clone()), avc444: false, cmds: Some(tx) }, planes, rx)
     }
 
     fn avc444_frame() -> GfxPdu {
@@ -1360,6 +1452,27 @@ mod tests {
         h.on_unhandled_pdu(&avc444_frame());
         assert!(planes.load(Ordering::Relaxed));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn graphics_time_is_attributed_to_the_codec_used() {
+        use ironrdp_egfx::pdu::Codec1Type as C;
+        assert_eq!(codec_bit(C::ClearCodec, false), Some(codec_bits::CLEARCODEC));
+        assert_eq!(codec_bit(C::Avc420, false), Some(codec_bits::AVC420));
+        // Progressive tiles surface as "uncompressed" updates; they still count as progressive.
+        assert_eq!(codec_bit(C::Uncompressed, true), None);
+        assert_eq!(codec_bit(C::Uncompressed, false), Some(codec_bits::OTHER));
+
+        let (mut h, _, _rx) = handler();
+        let pdu = ironrdp_egfx::pdu::WireToSurface2Pdu {
+            surface_id: 0,
+            codec_id: ironrdp_egfx::pdu::Codec2Type::RemoteFxProgressive,
+            codec_context_id: 0,
+            pixel_format: ironrdp_egfx::pdu::PixelFormat::XRgb,
+            bitmap_data: Vec::new(),
+        };
+        h.on_wire_to_surface2(&pdu);
+        assert_eq!(h.codecs.swap(0, Ordering::Relaxed), codec_bits::PROGRESSIVE);
     }
 
     #[test]

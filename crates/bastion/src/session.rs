@@ -224,6 +224,14 @@ enum RemoteCursor {
 }
 
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(300);
+/// Events egui reports as "needs repaint" that must not schedule one: egui says so for
+/// `RedrawRequested` itself, so honouring it re-requested a frame after every frame and each
+/// visible window rendered at the monitor refresh rate forever (~300 frames/s over two
+/// monitors).
+pub fn is_redraw_echo(event: &WindowEvent) -> bool {
+    matches!(event, WindowEvent::RedrawRequested)
+}
+
 /// Session-bar visibility for one window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BarState {
@@ -572,14 +580,14 @@ impl Session {
         let egui_resp = view.gfx.egui.on_window_event(&view.gfx.window, event);
         let modal = self.cert.is_some() || !matches!(self.phase, Phase::Connected);
         // egui asks to repaint on every pointer move; that only matters while one of our
-        // overlays is on screen. Over the bare remote desktop it rendered every window at the
-        // mouse's rate (~300 frames/s) for nothing — new remote pixels trigger their own redraw.
+        // overlays is on screen — new remote pixels trigger their own redraw.
         let overlay = modal
             || view.bar != BarState::Hidden
             || view.prompt_rect.is_some()
             || !self.notices.is_empty()
             || !self.grabbed;
-        if egui_resp.repaint && (overlay || !matches!(event, WindowEvent::CursorMoved { .. })) {
+        if egui_resp.repaint && !is_redraw_echo(event) && (overlay || !matches!(event, WindowEvent::CursorMoved { .. }))
+        {
             bastion_metrics::UI_REDRAW_INPUT.incr();
             view.gfx.window.request_redraw();
         }
@@ -773,28 +781,33 @@ impl Session {
                 }
             }
             self.texture = Some((tex, view, f.generation));
-            f.dirty = Some(bastion_session::Rect { x: 0, y: 0, w: f.width, h: f.height });
+            f.dirty = vec![bastion_session::Rect { x: 0, y: 0, w: f.width, h: f.height }];
         }
-        let Some(d) = f.dirty.take() else { return };
+        let rects = std::mem::take(&mut f.dirty);
+        if rects.is_empty() {
+            return;
+        }
         if let Some(t) = f.dirty_since.take() {
             bastion_metrics::FRAME_LATENCY.since(t);
         }
         let started = Instant::now();
         let (tex, _, _) = self.texture.as_ref().expect("texture exists");
-        let offset = (u64::from(d.y) * u64::from(f.width) + u64::from(d.x)) * 4;
-        gpu.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: d.x, y: d.y, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            &f.data,
-            wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(f.width * 4), rows_per_image: Some(d.h) },
-            wgpu::Extent3d { width: d.w, height: d.h, depth_or_array_layers: 1 },
-        );
+        for d in &rects {
+            let offset = (u64::from(d.y) * u64::from(f.width) + u64::from(d.x)) * 4;
+            gpu.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: d.x, y: d.y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &f.data,
+                wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(f.width * 4), rows_per_image: Some(d.h) },
+                wgpu::Extent3d { width: d.w, height: d.h, depth_or_array_layers: 1 },
+            );
+            bastion_metrics::UI_UPLOAD_BYTES.add(d.area() * 4);
+        }
         bastion_metrics::UI_UPLOAD.since(started);
-        bastion_metrics::UI_UPLOAD_BYTES.add(u64::from(d.w) * u64::from(d.h) * 4);
     }
 
     fn hide_bars(&mut self) {
@@ -1227,6 +1240,14 @@ mod bar_tests {
     const W: f32 = 2327.0; // the user's 4K monitor at 165 %, in points
     fn bar() -> Option<egui::Rect> {
         Some(egui::Rect::from_min_max(egui::pos2(W / 2.0 - 280.0, 4.0), egui::pos2(W / 2.0 + 280.0, 40.0)))
+    }
+
+    #[test]
+    fn a_redraw_never_schedules_another() {
+        // egui-winit reports repaint=true for RedrawRequested; following it looped forever.
+        assert!(is_redraw_echo(&WindowEvent::RedrawRequested));
+        assert!(!is_redraw_echo(&WindowEvent::Occluded(false)));
+        assert!(!is_redraw_echo(&WindowEvent::Focused(true)));
     }
 
     #[test]

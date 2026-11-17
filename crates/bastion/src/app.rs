@@ -20,7 +20,10 @@ use crate::session::Session;
 
 #[derive(Debug, Clone, Copy)]
 pub enum UserEvent {
+    /// Something in a session changed (pixels, status…).
     Wake,
+    /// The connection manager has news (device list, file picker…).
+    ManagerWake,
     TrayOpen,
     TrayQuit,
 }
@@ -63,7 +66,7 @@ impl App {
             paths.clone(),
             trust.clone(),
             Arc::new(move || {
-                let _ = p.send_event(UserEvent::Wake);
+                let _ = p.send_event(UserEvent::ManagerWake);
             }),
         )?;
         let tray = crate::tray::start(proxy.clone());
@@ -247,6 +250,11 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             },
+            UserEvent::ManagerWake => {
+                if let Some(w) = &self.manager_win {
+                    w.window.request_redraw();
+                }
+            }
             UserEvent::Wake => {}
         }
         for live in &mut self.sessions {
@@ -256,9 +264,7 @@ impl ApplicationHandler<UserEvent> for App {
                 live.session.request_redraw();
             }
         }
-        if let Some(w) = &self.manager_win {
-            w.window.request_redraw();
-        }
+        // The manager is not redrawn for session wake-ups (every remote frame): it has its own.
         self.reap_sessions(event_loop);
     }
 
@@ -268,7 +274,7 @@ impl ApplicationHandler<UserEvent> for App {
         if self.manager_win.as_ref().is_some_and(|w| w.window.id() == id) {
             let win = self.manager_win.as_mut().expect("checked");
             let resp = win.egui.on_window_event(&win.window, &event);
-            if resp.repaint {
+            if resp.repaint && !crate::session::is_redraw_echo(&event) {
                 win.window.request_redraw();
             }
             match event {

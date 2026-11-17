@@ -1,7 +1,9 @@
 //! Shared framebuffer between the session thread (writer) and the renderer (reader).
 //!
 //! Only dirty rectangles are copied out of the decoder's image, and the renderer only
-//! uploads the accumulated dirty region to the GPU — so idle desktops cost ~nothing.
+//! uploads those rectangles to the GPU — so idle desktops cost ~nothing. Rectangles are kept
+//! as a short list rather than one bounding box: on a 6400×2160 multi-monitor desktop a small
+//! change on each screen would otherwise copy and upload nearly the whole 55 MB frame.
 
 use std::sync::Mutex;
 
@@ -13,7 +15,15 @@ pub struct Rect {
     pub h: u32,
 }
 
+/// More dirty rectangles than this are collapsed into their bounding box (per-rectangle upload
+/// overhead would outweigh the saved bytes).
+pub const MAX_DIRTY_RECTS: usize = 32;
+
 impl Rect {
+    pub fn area(self) -> u64 {
+        u64::from(self.w) * u64::from(self.h)
+    }
+
     pub fn union(self, o: Rect) -> Rect {
         let x0 = self.x.min(o.x);
         let y0 = self.y.min(o.y);
@@ -29,7 +39,8 @@ pub struct FrameState {
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>,
-    pub dirty: Option<Rect>,
+    /// Regions changed since the renderer last uploaded (see [`MAX_DIRTY_RECTS`]).
+    pub dirty: Vec<Rect>,
     /// Bumped whenever the size changes (renderer must recreate its texture).
     pub generation: u64,
     /// When the pending dirty region first became dirty (for frame-latency metrics).
@@ -44,6 +55,20 @@ pub struct SharedFrame {
     pub needs_present: std::sync::atomic::AtomicBool,
 }
 
+/// Adds `r` to the dirty list, merging it with rectangles it overlaps or abuts when the merge
+/// covers no extra pixels beyond the two (so merging never inflates the upload much).
+fn add_dirty(list: &mut Vec<Rect>, mut r: Rect) {
+    while let Some(i) = list.iter().position(|d| d.union(r).area() <= d.area() + r.area()) {
+        r = list.swap_remove(i).union(r);
+    }
+    list.push(r);
+    if list.len() > MAX_DIRTY_RECTS {
+        let all = list.iter().copied().reduce(Rect::union).expect("non-empty");
+        list.clear();
+        list.push(all);
+    }
+}
+
 impl SharedFrame {
     pub fn lock(&self) -> std::sync::MutexGuard<'_, FrameState> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
@@ -51,31 +76,40 @@ impl SharedFrame {
 
     /// Copies `rect` from `src` (tightly packed RGBA, `src_width` wide) into the shared frame.
     pub fn update_from(&self, src: &[u8], src_width: u32, src_height: u32, rect: Rect) {
+        self.update_rects(src, src_width, src_height, &[rect]);
+    }
+
+    /// Copies each of `rects` from `src` under one lock. Returns the number of pixels copied.
+    pub fn update_rects(&self, src: &[u8], src_width: u32, src_height: u32, rects: &[Rect]) -> u64 {
         let mut st = self.lock();
         if st.width != src_width || st.height != src_height {
             st.width = src_width;
             st.height = src_height;
             st.data = src.to_vec();
             st.generation += 1;
-            st.dirty = Some(Rect { x: 0, y: 0, w: src_width, h: src_height });
+            st.dirty = vec![Rect { x: 0, y: 0, w: src_width, h: src_height }];
             st.dirty_since.get_or_insert_with(std::time::Instant::now);
-            return;
-        }
-        let rect = clamp(rect, src_width, src_height);
-        if rect.w == 0 || rect.h == 0 {
-            return;
+            return u64::from(src_width) * u64::from(src_height);
         }
         let stride = src_width as usize * 4;
-        let row_bytes = rect.w as usize * 4;
-        for row in rect.y..rect.y + rect.h {
-            let off = row as usize * stride + rect.x as usize * 4;
-            st.data[off..off + row_bytes].copy_from_slice(&src[off..off + row_bytes]);
+        let mut copied = 0;
+        for &rect in rects {
+            let rect = clamp(rect, src_width, src_height);
+            if rect.w == 0 || rect.h == 0 {
+                continue;
+            }
+            let row_bytes = rect.w as usize * 4;
+            for row in rect.y..rect.y + rect.h {
+                let off = row as usize * stride + rect.x as usize * 4;
+                st.data[off..off + row_bytes].copy_from_slice(&src[off..off + row_bytes]);
+            }
+            add_dirty(&mut st.dirty, rect);
+            copied += rect.area();
         }
-        st.dirty = Some(match st.dirty {
-            Some(d) => d.union(rect),
-            None => rect,
-        });
-        st.dirty_since.get_or_insert_with(std::time::Instant::now);
+        if copied > 0 {
+            st.dirty_since.get_or_insert_with(std::time::Instant::now);
+        }
+        copied
     }
 }
 
@@ -95,9 +129,37 @@ mod tests {
         let src = vec![7u8; 10 * 10 * 4];
         f.update_from(&src, 10, 10, Rect { x: 0, y: 0, w: 1, h: 1 });
         assert_eq!(f.lock().generation, 1);
-        f.lock().dirty = None;
+        f.lock().dirty.clear();
         f.update_from(&src, 10, 10, Rect { x: 2, y: 2, w: 2, h: 2 });
         f.update_from(&src, 10, 10, Rect { x: 8, y: 8, w: 5, h: 5 });
-        assert_eq!(f.lock().dirty, Some(Rect { x: 2, y: 2, w: 8, h: 8 }));
+        // Far apart: kept separate (clamped to the frame), not one 8×8 bounding box.
+        assert_eq!(f.lock().dirty, vec![Rect { x: 2, y: 2, w: 2, h: 2 }, Rect { x: 8, y: 8, w: 2, h: 2 }]);
+    }
+
+    #[test]
+    fn overlapping_and_adjacent_rects_merge() {
+        let mut d = Vec::new();
+        add_dirty(&mut d, Rect { x: 0, y: 0, w: 10, h: 10 });
+        add_dirty(&mut d, Rect { x: 10, y: 0, w: 10, h: 10 }); // abuts: merges, no waste
+        add_dirty(&mut d, Rect { x: 5, y: 5, w: 2, h: 2 }); // inside: absorbed
+        assert_eq!(d, vec![Rect { x: 0, y: 0, w: 20, h: 10 }]);
+    }
+
+    #[test]
+    fn small_changes_on_two_monitors_stay_small() {
+        // A clock on each screen of a 6400×2160 desktop: ~0.03 % of the pixels, not ~100 %.
+        let mut d = Vec::new();
+        add_dirty(&mut d, Rect { x: 2400, y: 1400, w: 100, h: 30 });
+        add_dirty(&mut d, Rect { x: 6200, y: 2120, w: 100, h: 30 });
+        assert_eq!(d.iter().map(|r| r.area()).sum::<u64>(), 6000);
+    }
+
+    #[test]
+    fn too_many_rects_collapse_to_their_bounds() {
+        let mut d = Vec::new();
+        for i in 0..=MAX_DIRTY_RECTS as u32 {
+            add_dirty(&mut d, Rect { x: i * 10, y: (i % 2) * 50, w: 2, h: 2 });
+        }
+        assert_eq!(d.len(), 1);
     }
 }

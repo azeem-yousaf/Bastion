@@ -184,6 +184,18 @@ pub static NET_WRITE: Histogram = Histogram::new("net.write", 20);
 /// Time to process one server PDU, including bitmap/RemoteFX/GFX decoding.
 pub static RDP_PROCESS: Histogram = Histogram::new("rdp.process", 30);
 
+/// `rdp.process` time of PDUs whose graphics used a single codec (the decoder's cost), so
+/// the slow one can be identified. `mixed` = several codecs in one PDU.
+pub static GFX_AVC420: Histogram = Histogram::new("rdp.gfx.avc420", 30);
+pub static GFX_AVC444: Histogram = Histogram::new("rdp.gfx.avc444", 30);
+pub static GFX_CLEARCODEC: Histogram = Histogram::new("rdp.gfx.clearcodec", 30);
+pub static GFX_PLANAR: Histogram = Histogram::new("rdp.gfx.planar", 30);
+pub static GFX_PROGRESSIVE: Histogram = Histogram::new("rdp.gfx.progressive", 30);
+pub static GFX_REMOTEFX: Histogram = Histogram::new("rdp.gfx.remotefx", 30);
+/// Uncompressed, alpha, solid fills and cache/surface copies.
+pub static GFX_OTHER: Histogram = Histogram::new("rdp.gfx.other", 30);
+pub static GFX_MIXED: Histogram = Histogram::new("rdp.gfx.mixed", 30);
+
 /// Graphics updates published to the screen.
 pub static FRAME_UPDATES: Counter = Counter::count("frame.updates");
 /// Pixels copied into the shared framebuffer.
@@ -275,6 +287,14 @@ static COUNTERS: &[&Counter] = &[
 static HISTOGRAMS: &[&Histogram] = &[
     &NET_WRITE,
     &RDP_PROCESS,
+    &GFX_AVC420,
+    &GFX_AVC444,
+    &GFX_CLEARCODEC,
+    &GFX_PLANAR,
+    &GFX_PROGRESSIVE,
+    &GFX_REMOTEFX,
+    &GFX_OTHER,
+    &GFX_MIXED,
     &FRAME_PUBLISH,
     &FRAME_LATENCY,
     &VIDEO_DECODE,
