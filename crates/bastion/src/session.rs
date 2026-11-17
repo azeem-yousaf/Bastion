@@ -96,6 +96,19 @@ pub struct Session {
     /// Connection quality indicator (sampled while connected).
     quality: crate::quality::Meter,
     next_quality_sample: Option<Instant>,
+    /// Monitors the session was full screen on before the user chose "Exit full screen"
+    /// (empty = single full screen on the current monitor), restored by "Full screen".
+    restore_fullscreen: Option<Vec<String>>,
+    /// Full-screen switch that needs new windows; applied by `apply_monitor_changes`.
+    pending_switch: Option<Switch>,
+}
+
+/// A full-screen switch from the session bar that re-creates the session's windows.
+enum Switch {
+    /// Leave multi-monitor full screen for one ordinary window.
+    Windowed,
+    /// Go back to full screen on these monitors (those still connected).
+    Fullscreen(Vec<String>),
 }
 
 /// Which windows a session shows.
@@ -341,6 +354,8 @@ impl Session {
             rebuilt_layout: None,
             quality: crate::quality::Meter::default(),
             next_quality_sample: None,
+            restore_fullscreen: None,
+            pending_switch: None,
         })
     }
 
@@ -386,6 +401,24 @@ impl Session {
     /// Applies a pending monitor change (a monitor was unplugged, or the user accepted a new
     /// one). Needs the event loop to create windows, so the app calls it between events.
     pub fn apply_monitor_changes(&mut self, event_loop: &ActiveEventLoop, gpu: &Gpu, screens: &[Screen]) {
+        match self.pending_switch.take() {
+            Some(Switch::Windowed) => {
+                self.offer.clear();
+                self.pending_monitors = None;
+                self.reconfigure(event_loop, gpu, Target::Window);
+                return;
+            }
+            Some(Switch::Fullscreen(keys)) => {
+                let target = match Target::from_keys(screens, &keys) {
+                    // None of those monitors is connected any more: full screen where the window is.
+                    Target::Window => Target::Fullscreen(None),
+                    t => t,
+                };
+                self.reconfigure(event_loop, gpu, target);
+                return;
+            }
+            None => {}
+        }
         if std::mem::take(&mut self.want_extend) {
             let now = monitors::keys(screens);
             let offered: Vec<String> = self.offer.drain(..).map(|(k, _)| k).collect();
@@ -1012,6 +1045,16 @@ impl Session {
         }
     }
 
+    /// Switches a lone window in or out of full screen in place.
+    fn set_single_fullscreen(&mut self, id: WindowId, fs: Option<Fullscreen>) {
+        if let Some(v) = self.views.get_mut(&id) {
+            v.want_fullscreen = fs.clone();
+            v.gfx.window.set_fullscreen(fs);
+        }
+        // Leaving (or re-entering) full screen frees the window from its monitor.
+        self.in_use.clear();
+    }
+
     fn action(&mut self, a: Action, id: WindowId) {
         match a {
             Action::TrustCert(accept) => {
@@ -1033,15 +1076,24 @@ impl Session {
                 }
             }
             Action::ToggleFullscreen => {
-                if let Some(v) = self.views.get_mut(&id) {
-                    let fs =
-                        if v.gfx.window.fullscreen().is_some() { None } else { Some(Fullscreen::Borderless(None)) };
-                    v.want_fullscreen = fs.clone();
-                    v.gfx.window.set_fullscreen(fs);
-                }
-                if self.views.len() == 1 {
-                    // Leaving (or re-entering) full screen frees the window from its monitor.
-                    self.in_use.clear();
+                let leaving = self.views.get(&id).is_some_and(|v| v.gfx.window.fullscreen().is_some());
+                if leaving {
+                    // Remember the arrangement so "Full screen" brings it back.
+                    self.restore_fullscreen = Some(self.in_use.clone());
+                    if self.views.len() > 1 {
+                        // One window per monitor becomes one ordinary window.
+                        self.pending_switch = Some(Switch::Windowed);
+                    } else {
+                        self.set_single_fullscreen(id, None);
+                    }
+                } else {
+                    match self.restore_fullscreen.take().unwrap_or_default() {
+                        keys if keys.is_empty() => {
+                            self.set_single_fullscreen(id, Some(Fullscreen::Borderless(None)));
+                        }
+                        // Particular monitor(s): needs new windows placed on them.
+                        keys => self.pending_switch = Some(Switch::Fullscreen(keys)),
+                    }
                 }
             }
             Action::Grab => {
