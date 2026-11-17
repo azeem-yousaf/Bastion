@@ -578,6 +578,7 @@ dependencies = [
  "anyhow",
  "directories",
  "encoding_rs",
+ "flate2",
  "hex",
  "ironrdp-propertyset",
  "ironrdp-rdpfile",

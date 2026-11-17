@@ -20,7 +20,7 @@ cargo run -p bastion --example fullscreen_repro   # Wayland/KWin minimise/restor
 
 rustfmt uses `max_width = 120`. Clippy runs with `-D warnings` on all targets, so `ci.sh` fails on any lint. When chaining commands, check `ci.sh`'s exit code before committing (don't pipe it into grep and continue on success).
 
-Logs: `~/.local/state/bastion/logs/`; config: `~/.config/bastion/{profiles,known_hosts,settings}.toml`; passwords live only in the Secret Service keyring.
+Logs: `~/.local/state/bastion/logs/` (today plain, earlier days `.log.gz`, deleted after 7 days by `logging::maintain_logs`, run at startup and hourly); config: `~/.config/bastion/{profiles,known_hosts,settings}.toml`; passwords live only in the Secret Service keyring.
 
 ## Workspace layout and data flow
 

@@ -72,7 +72,8 @@ In full screen, move the mouse to the top edge to reveal the session bar.
 - **No telemetry:** nothing is ever sent anywhere except to your gateway and PC.
 
 Configuration lives in `~/.config/bastion/` (mode 0700): `profiles.toml` and
-`known_hosts.toml`. Logs are in `~/.local/state/bastion/logs/` (kept for 7 days).
+`known_hosts.toml`. Logs are in `~/.local/state/bastion/logs/`: today's as plain text, earlier days gzip-compressed
+(`zless` reads them), deleted after 7 days.
 
 ## Troubleshooting
 
