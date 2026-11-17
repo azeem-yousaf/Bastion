@@ -32,8 +32,11 @@ pub struct View {
     /// Where the image was drawn last frame (window physical pixels).
     image_rect: Option<(f64, f64, f64, f64)>,
     pointer_in_ui: bool,
-    /// Set while minimised: the full-screen state to restore (Wayland drops it on minimise).
-    restore: Option<Option<Fullscreen>>,
+    /// Full-screen state this window should have. Compositors drop full screen when a window is
+    /// minimised (however that happens), so it is re-applied whenever the window regains focus.
+    want_fullscreen: Option<Fullscreen>,
+    /// Minimised via the session bar (so sibling monitor windows are restored together).
+    minimized: bool,
 }
 
 enum Phase {
@@ -126,7 +129,7 @@ impl Session {
                 }
                 tracing::info!(?layout, "Multi-monitor layout");
                 let (bx, by, _, _) = layout.bounds();
-                for (window, spec) in windows.into_iter().zip(&layout.monitors) {
+                for ((window, spec), monitor) in windows.into_iter().zip(&layout.monitors).zip(&monitors) {
                     let region = ((spec.x - bx) as u32, (spec.y - by) as u32, spec.width, spec.height);
                     let gfx = WindowGfx::new(gpu, window.clone(), None)?;
                     views.insert(
@@ -138,7 +141,8 @@ impl Session {
                             tex_id: None,
                             image_rect: None,
                             pointer_in_ui: false,
-                            restore: None,
+                            want_fullscreen: Some(Fullscreen::Borderless(Some(monitor.clone()))),
+                            minimized: false,
                         },
                     );
                 }
@@ -170,7 +174,8 @@ impl Session {
                         tex_id: None,
                         image_rect: None,
                         pointer_in_ui: false,
-                        restore: None,
+                        want_fullscreen: (mode == DisplayMode::Fullscreen).then_some(Fullscreen::Borderless(None)),
+                        minimized: false,
                     },
                 );
                 DesktopLayout::single(size.width.max(640), size.height.max(480), scale)
@@ -383,16 +388,26 @@ impl Session {
                 self.send(ev);
             }
             WindowEvent::Focused(true) => {
-                // Coming back from minimise: restore every window of the session (all monitors)
-                // and re-apply full screen, which the compositor drops when minimising.
-                for v in self.views.values_mut() {
-                    if let Some(fs) = v.restore.take() {
-                        v.gfx.window.set_minimized(false);
-                        if fs.is_some() {
-                            v.gfx.window.set_fullscreen(fs);
-                        }
-                        v.gfx.window.request_redraw();
+                // Back from minimise (taskbar, shortcut or our button): re-apply full screen, which
+                // the compositor drops on minimise. Sibling monitor windows minimised together via
+                // the session bar are brought back too.
+                let restore_all = self.views.get(&id).is_some_and(|v| v.minimized);
+                for (vid, v) in self.views.iter_mut() {
+                    if *vid != id && !(restore_all && v.minimized) {
+                        continue;
                     }
+                    v.minimized = false;
+                    if let Some(fs) = v.want_fullscreen.clone() {
+                        // Always re-send: winit's cached state can lag the compositor's.
+                        v.gfx.window.set_fullscreen(Some(fs));
+                    }
+                    if *vid != id {
+                        v.gfx.window.focus_window();
+                    }
+                    v.gfx.window.request_redraw();
+                }
+                if restore_all && let Some(v) = self.views.get(&id) {
+                    v.gfx.window.focus_window();
                 }
                 if self.connected() {
                     let locks = bastion_session::keyboard::read_lock_state();
@@ -658,9 +673,10 @@ impl Session {
                 }
             }
             Action::ToggleFullscreen => {
-                if let Some(v) = self.views.get(&id) {
+                if let Some(v) = self.views.get_mut(&id) {
                     let fs =
                         if v.gfx.window.fullscreen().is_some() { None } else { Some(Fullscreen::Borderless(None)) };
+                    v.want_fullscreen = fs.clone();
                     v.gfx.window.set_fullscreen(fs);
                 }
             }
@@ -674,7 +690,7 @@ impl Session {
                 let ev = self.input.release_all();
                 self.send(ev);
                 for v in self.views.values_mut() {
-                    v.restore = Some(v.gfx.window.fullscreen());
+                    v.minimized = true;
                     v.gfx.window.set_minimized(true);
                 }
             }
