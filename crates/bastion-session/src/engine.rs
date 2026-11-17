@@ -8,7 +8,7 @@
 //! auto-reconnect cookie) → … → disconnected.
 
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -105,8 +105,14 @@ pub enum Event {
     },
 }
 
+/// Input events as sent by the UI.
+type InputEvents = SmallVec<[FastPathInputEvent; 2]>;
+
 pub struct SessionHandle {
     cmd: mpsc::UnboundedSender<Command>,
+    /// Input bypasses the command queue: a dedicated task writes it to the socket so it never
+    /// waits behind graphics decoding (see `input_task`).
+    input: mpsc::UnboundedSender<InputEvents>,
     events: std::sync::mpsc::Receiver<Event>,
     pub frame: Arc<SharedFrame>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -120,6 +126,7 @@ impl SessionHandle {
         let (ev_tx, ev_rx) = std::sync::mpsc::channel();
         let frame = Arc::new(SharedFrame::default());
         let input_queued = Arc::new(bastion_metrics::Stamp::default());
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
         let ctx = EngineCtx {
             params,
             cmd_tx: cmd_tx.clone(),
@@ -127,6 +134,8 @@ impl SessionHandle {
             waker,
             frame: frame.clone(),
             input_queued: input_queued.clone(),
+            input_tx: input_tx.clone(),
+            input_rx: Arc::new(tokio::sync::Mutex::new(input_rx)),
         };
         let thread = std::thread::Builder::new()
             .name("bastion-session".into())
@@ -141,14 +150,19 @@ impl SessionHandle {
                 rt.block_on(run(ctx, cmd_rx));
             })
             .expect("spawn session thread");
-        Self { cmd: cmd_tx, events: ev_rx, frame, thread: Some(thread), input_queued }
+        Self { cmd: cmd_tx, input: input_tx, events: ev_rx, frame, thread: Some(thread), input_queued }
     }
 
     pub fn send(&self, cmd: Command) {
-        if matches!(cmd, Command::Input(_)) {
-            self.input_queued.mark();
+        match cmd {
+            Command::Input(events) => {
+                self.input_queued.mark();
+                let _ = self.input.send(events);
+            }
+            other => {
+                let _ = self.cmd.send(other);
+            }
         }
-        let _ = self.cmd.send(cmd);
     }
 
     pub fn try_event(&self) -> Option<Event> {
@@ -180,6 +194,9 @@ struct EngineCtx {
     waker: Waker,
     frame: Arc<SharedFrame>,
     input_queued: Arc<bastion_metrics::Stamp>,
+    input_tx: mpsc::UnboundedSender<InputEvents>,
+    /// Owned by the running session's input task (locked for its lifetime).
+    input_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<InputEvents>>>,
 }
 
 impl EngineCtx {
@@ -623,7 +640,20 @@ fn gateway_error_message(e: &ironrdp_error::Error<ironrdp_mstsgu::GwErrorKind>, 
 
 #[derive(Debug)]
 struct GfxHandler;
-impl GraphicsPipelineHandler for GfxHandler {}
+impl GraphicsPipelineHandler for GfxHandler {
+    fn on_capabilities_confirmed(&mut self, caps: &ironrdp_egfx::pdu::CapabilitySet) {
+        // Which graphics mode the server chose decides whether H.264 can be used at all.
+        info!(?caps, "Graphics pipeline negotiated");
+    }
+
+    fn on_reset_graphics(&mut self, width: u32, height: u32) {
+        info!(width, height, "Graphics output reset");
+    }
+
+    fn on_surface_created(&mut self, surface: &ironrdp_egfx::client::Surface) {
+        debug!(?surface, "Graphics surface created");
+    }
+}
 
 fn timezone() -> TimezoneInfo {
     // `time`'s local-offset API refuses to work in multi-threaded processes; ask libc directly.
@@ -818,6 +848,82 @@ fn drive_channel(p: &Profile, client_name: &str) -> anyhow::Result<ironrdp_rdpdr
 }
 
 /// Copies the changed rectangle from the decoder image into the shared framebuffer.
+type Writer = ironrdp_tokio::TokioFramed<tokio::io::WriteHalf<Erased>>;
+
+/// Aborts a spawned task when the session loop exits (on any path).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct InputTask {
+    rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<InputEvents>>>,
+    queued: Arc<bastion_metrics::Stamp>,
+    writer: Arc<tokio::sync::Mutex<Writer>>,
+    paused: Arc<AtomicBool>,
+    /// Copies of the written input for keep-active (only when it is enabled).
+    seen: Option<mpsc::UnboundedSender<InputEvents>>,
+}
+
+/// Writes user input to the socket as soon as it arrives.
+///
+/// This runs as its own task (on another runtime worker) because the session loop decodes
+/// graphics synchronously; input handled there waited for every decode — up to hundreds of
+/// milliseconds under heavy screen updates. Encoding fast-path input needs no session state
+/// (the pointer is drawn locally, not into the framebuffer), so it is done here directly.
+async fn input_task(t: InputTask) {
+    use ironrdp_pdu::input::fast_path::FastPathInput;
+    let mut rx = t.rx.lock().await;
+    // Input typed while (re)connecting is stale; don't replay it into the new session.
+    while rx.try_recv().is_ok() {}
+    let _ = t.queued.take();
+    let mut bytes = Vec::new();
+    while let Some(mut batch) = rx.recv().await {
+        // Everything already queued goes out in one write (same order).
+        while let Ok(more) = rx.try_recv() {
+            batch.extend(more);
+        }
+        let waited = t.queued.take().unwrap_or_default();
+        let since = std::time::Instant::now().checked_sub(waited);
+        if t.paused.load(Ordering::Acquire) {
+            continue;
+        }
+        bastion_metrics::INPUT_BATCHES.incr();
+        bastion_metrics::INPUT_QUEUE.record(waited);
+        bytes.clear();
+        for chunk in batch.chunks(FastPathInput::MAX_EVENTS) {
+            match FastPathInput::new(chunk.to_vec())
+                .map_err(|e| e.to_string())
+                .and_then(|pdu| ironrdp_core::encode_vec(&pdu).map_err(|e| e.to_string()))
+            {
+                Ok(frame) => bytes.extend_from_slice(&frame),
+                Err(e) => warn!(error = %e, "Cannot encode input"),
+            }
+        }
+        if bytes.is_empty() {
+            continue;
+        }
+        let started = std::time::Instant::now();
+        if let Err(e) = t.writer.lock().await.write_all(&bytes).await {
+            // The session loop notices the broken connection on its next read.
+            debug!(error = %e, "Input write failed");
+            return;
+        }
+        bastion_metrics::NET_WRITE.since(started);
+        bastion_metrics::NET_TX.add(bytes.len() as u64);
+        if let Some(t) = since {
+            // Queued by the UI → encoded → written to the socket.
+            bastion_metrics::INPUT_LATENCY.since(t);
+        }
+        if let Some(seen) = &t.seen {
+            let _ = seen.send(batch);
+        }
+    }
+}
+
 fn publish(ctx: &EngineCtx, image: &DecodedImage, r: &ironrdp_pdu::geometry::InclusiveRectangle) {
     let rect = Rect {
         x: u32::from(r.left),
@@ -844,7 +950,11 @@ async fn active_session(
     cookie: &mut Option<ServerAutoReconnect>,
     layout: &DesktopLayout,
 ) -> SessionEnd {
-    let (mut reader, mut writer) = split_tokio_framed(framed);
+    let (mut reader, writer) = split_tokio_framed(framed);
+    // Shared with the input task; each write holds the lock only for that write.
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    let input_paused = Arc::new(AtomicBool::new(false));
+    let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<InputEvents>();
     let size = conn.desktop_size;
     let mut image = DecodedImage::new(PixelFormat::RgbA32, size.width, size.height);
     let activation = conn.activation_factory;
@@ -869,6 +979,13 @@ async fn active_session(
         info!(interval_secs = i.as_secs(), "Keep-active enabled");
         KeepActive::new(i, tokio::time::Instant::now())
     });
+    let _input = AbortOnDrop(tokio::spawn(input_task(InputTask {
+        rx: ctx.input_rx.clone(),
+        queued: ctx.input_queued.clone(),
+        writer: writer.clone(),
+        paused: input_paused.clone(),
+        seen: keep_active.is_some().then_some(seen_tx),
+    })));
     // Only polled when keep-active is enabled; the far-future fallback is never reached.
     let idle_deadline = |k: &Option<KeepActive>| {
         k.as_ref().map_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400), KeepActive::deadline)
@@ -879,7 +996,7 @@ async fn active_session(
             let bytes: Vec<u8> = $bytes;
             if !bytes.is_empty() {
                 let started = std::time::Instant::now();
-                if let Err(e) = writer.write_all(&bytes).await {
+                if let Err(e) = writer.lock().await.write_all(&bytes).await {
                     return SessionEnd::NetworkError(format!("write failed: {e}"));
                 }
                 bastion_metrics::NET_WRITE.since(started);
@@ -896,8 +1013,6 @@ async fn active_session(
         };
     }
 
-    // Set while handling an input batch: when its oldest event was queued by the UI.
-    let mut input_since: Option<std::time::Instant> = None;
     loop {
         let outputs = tokio::select! {
             frame = reader.read_pdu() => {
@@ -920,21 +1035,15 @@ async fn active_session(
                 let Some(cmd) = cmd else { return SessionEnd::UserClosed };
                 match cmd {
                     Command::Input(events) => {
-                        bastion_metrics::INPUT_BATCHES.incr();
-                        if let Some(waited) = ctx.input_queued.take() {
-                            bastion_metrics::INPUT_QUEUE.record(waited);
-                            input_since = std::time::Instant::now().checked_sub(waited);
-                        }
-                        if let Some(k) = keep_active.as_mut() {
-                            k.on_input(&events, tokio::time::Instant::now());
-                        }
-                        session_try!(stage.process_fastpath_input(&mut image, &events))
+                        // Normally routed straight to the input task by `SessionHandle::send`.
+                        let _ = ctx.input_tx.send(events);
+                        Vec::new()
                     }
                     Command::Disconnect => {
                         let out = stage.graceful_shutdown().unwrap_or_default();
                         for o in out {
                             if let ActiveStageOutput::ResponseFrame(f) = o {
-                                let _ = writer.write_all(&f).await;
+                                let _ = writer.lock().await.write_all(&f).await;
                             }
                         }
                         return SessionEnd::UserClosed;
@@ -992,6 +1101,13 @@ async fn active_session(
                     Command::CertificateDecision { .. } => Vec::new(),
                 }
             }
+            Some(events) = seen_rx.recv() => {
+                // User input written by the input task: keep-active only needs to know about it.
+                if let Some(k) = keep_active.as_mut() {
+                    k.on_input(&events, tokio::time::Instant::now());
+                }
+                Vec::new()
+            }
             () = tokio::time::sleep_until(idle_deadline(&keep_active)), if keep_active.is_some() => {
                 let Some(k) = keep_active.as_mut() else { continue };
                 let events = k.nudge((image.width(), image.height()), tokio::time::Instant::now());
@@ -1038,6 +1154,8 @@ async fn active_session(
                 }
                 ActiveStageOutput::DeactivateAll => {
                     debug!("Deactivation-reactivation sequence");
+                    // No input while the connection is being re-activated.
+                    input_paused.store(true, Ordering::Release);
                     let mut seq = activation.create();
                     let mut buf = WriteBuf::new();
                     loop {
@@ -1065,6 +1183,7 @@ async fn active_session(
                                 false,
                                 static_channel_chunk_size,
                             );
+                            input_paused.store(false, Ordering::Release);
                             ctx.emit(Event::Status(Status::Connected {
                                 width: desktop_size.width,
                                 height: desktop_size.height,
@@ -1076,10 +1195,6 @@ async fn active_session(
                 ActiveStageOutput::MonitorLayout(m) => debug!(monitors = m.len(), "Server monitor layout"),
                 other => debug!(output = ?std::mem::discriminant(&other), "Unhandled session output"),
             }
-        }
-        if let Some(t) = input_since.take() {
-            // Queued by the UI → encoded → written to the socket.
-            bastion_metrics::INPUT_LATENCY.since(t);
         }
     }
 }

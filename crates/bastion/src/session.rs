@@ -566,10 +566,18 @@ impl Session {
     pub fn window_event(&mut self, gpu: &Gpu, id: WindowId, event: &WindowEvent) {
         let Some(view) = self.views.get_mut(&id) else { return };
         let egui_resp = view.gfx.egui.on_window_event(&view.gfx.window, event);
-        if egui_resp.repaint {
+        let modal = self.cert.is_some() || !matches!(self.phase, Phase::Connected);
+        // egui asks to repaint on every pointer move; that only matters while one of our
+        // overlays is on screen. Over the bare remote desktop it rendered every window at the
+        // mouse's rate (~300 frames/s) for nothing — new remote pixels trigger their own redraw.
+        let overlay = modal
+            || view.bar != BarState::Hidden
+            || view.prompt_rect.is_some()
+            || !self.notices.is_empty()
+            || !self.grabbed;
+        if egui_resp.repaint && (overlay || !matches!(event, WindowEvent::CursorMoved { .. })) {
             view.gfx.window.request_redraw();
         }
-        let modal = self.cert.is_some() || !matches!(self.phase, Phase::Connected);
 
         match event {
             WindowEvent::CloseRequested => {
