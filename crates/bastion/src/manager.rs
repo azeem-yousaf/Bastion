@@ -67,6 +67,8 @@ pub struct Manager {
     confirm_delete: bool,
     waker: Arc<dyn Fn() + Send + Sync>,
     keyring_ok: bool,
+    /// Connected monitors (key, label) for the multi-monitor selection.
+    monitors: Vec<(String, String)>,
 }
 
 impl Manager {
@@ -98,7 +100,19 @@ impl Manager {
             confirm_delete: false,
             waker,
             keyring_ok: secrets::keyring_available(),
+            monitors: Vec::new(),
         })
+    }
+
+    /// Updates the list of connected monitors offered in the display settings.
+    pub fn set_monitors(&mut self, screens: &[crate::monitors::Screen]) {
+        self.set_monitor_list(screens.iter().map(|s| (s.key.clone(), s.label.clone())).collect());
+    }
+
+    /// Same as [`Self::set_monitors`] from plain (key, label) pairs (used by tests).
+    pub fn set_monitor_list(&mut self, monitors: Vec<(String, String)>) {
+        self.monitors = monitors;
+        (self.waker)();
     }
 
     pub fn profile(&self, id: Uuid) -> Option<&Profile> {
@@ -352,7 +366,8 @@ impl Manager {
                         format!("Window{}", if p.display.dynamic_resolution { ", resizes remote desktop" } else { "" })
                     }
                     DisplayMode::Fullscreen => "Full screen".into(),
-                    DisplayMode::AllMonitors => "Full screen on all monitors".into(),
+                    DisplayMode::AllMonitors if p.display.monitors.is_empty() => "Full screen on all monitors".into(),
+                    DisplayMode::AllMonitors => format!("Full screen on {}", p.display.monitors.join(", ")),
                 },
             );
             row(
@@ -476,7 +491,10 @@ impl Manager {
                 theme::section(ui, "Mode");
                 ui.radio_value(&mut d.display.mode, DisplayMode::Window, "Window");
                 ui.radio_value(&mut d.display.mode, DisplayMode::Fullscreen, "Full screen");
-                ui.radio_value(&mut d.display.mode, DisplayMode::AllMonitors, "Full screen across all monitors");
+                ui.radio_value(&mut d.display.mode, DisplayMode::AllMonitors, "Full screen on multiple monitors");
+                if d.display.mode == DisplayMode::AllMonitors {
+                    monitor_selection(ui, &mut d.display.monitors, &self.monitors);
+                }
                 if d.display.mode == DisplayMode::Window {
                     form(ui, "size", |ui| {
                         field(ui, "Initial width", |ui| ui.add(egui::DragValue::new(&mut d.display.width).range(640..=8192)));
@@ -836,6 +854,46 @@ fn field(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> egui
     let r = add(ui).labelled_by(l.id);
     ui.end_row();
     r
+}
+
+/// Chooses the monitors a multi-monitor session uses. An empty selection means "all".
+fn monitor_selection(ui: &mut egui::Ui, selection: &mut Vec<String>, connected: &[(String, String)]) {
+    ui.indent("monitors", |ui| {
+        let mut all = selection.is_empty();
+        if ui.checkbox(&mut all, "Use all monitors").changed() {
+            *selection = if all { Vec::new() } else { connected.iter().map(|(k, _)| k.clone()).collect() };
+        }
+        if all {
+            return;
+        }
+        // Connected monitors, then remembered ones that aren't plugged in right now.
+        let mut rows: Vec<(String, String)> = connected.to_vec();
+        for k in selection.iter() {
+            if !rows.iter().any(|(r, _)| r == k) {
+                rows.push((k.clone(), format!("{k} (not connected)")));
+            }
+        }
+        for (key, label) in rows {
+            let mut on = selection.contains(&key);
+            // The last selected monitor can't be unticked (an empty selection means "all").
+            let last = on && selection.len() == 1;
+            let resp = ui.add_enabled(!last, egui::Checkbox::new(&mut on, label));
+            if resp.changed() {
+                if on {
+                    selection.push(key);
+                } else {
+                    selection.retain(|k| *k != key);
+                }
+            }
+        }
+        ui.label(
+            egui::RichText::new(
+                "If a monitor is unplugged the session continues on the others; plugging one in asks first.",
+            )
+            .small()
+            .color(theme::MUTED),
+        );
+    });
 }
 
 fn device_combo(

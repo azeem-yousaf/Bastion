@@ -299,3 +299,59 @@ fn session_bar_offers_minimise() {
     h.run();
     assert_eq!(h.state(), &vec![Action::Minimize]);
 }
+
+#[test]
+fn multi_monitor_mode_can_use_selected_monitors() {
+    let f = fixture();
+    let mut m = manager(&f);
+    m.set_monitor_list(vec![
+        ("DP-1".into(), "DP-1 — 3840 × 2160".into()),
+        ("DP-2".into(), "DP-2 — 2560 × 1440".into()),
+        ("HDMI-A-1".into(), "HDMI-A-1 — 1920 × 1080".into()),
+    ]);
+    let mut h = harness(m);
+    h.run();
+    h.get_by_label("+  New connection").click();
+    h.run();
+    let inputs: Vec<_> = h.query_all_by_role(egui::accesskit::Role::TextInput).collect();
+    inputs[2].focus();
+    inputs[2].type_text("pc01");
+    h.run();
+
+    h.get_by_label("Display").click();
+    h.run();
+    h.get_by_label("Full screen on multiple monitors").click();
+    h.run();
+    // All monitors by default; unticking "all" lists them, all ticked.
+    h.get_by_label("Use all monitors").click();
+    h.run();
+    h.get_by_label("DP-2 — 2560 × 1440").click();
+    h.run();
+    h.snapshot("editor_display_monitor_selection");
+
+    h.get_by_label("Save").click();
+    h.run();
+    let store = ProfileStore::load(&f.paths).unwrap();
+    let p = &store.profiles()[0];
+    assert_eq!(p.display.mode, bastion_core::profile::DisplayMode::AllMonitors);
+    assert_eq!(p.display.monitors, vec!["DP-1".to_owned(), "HDMI-A-1".to_owned()]);
+}
+
+#[test]
+fn new_monitor_prompt_offers_multiple_monitors() {
+    let labels = vec!["DP-2 — 2560 × 1440".to_owned()];
+    let mut h = Harness::builder().with_size(egui::vec2(700.0, 300.0)).wgpu().build_ui_state(
+        move |ui, actions: &mut Vec<Action>| {
+            bastion::theme::apply(ui.ctx());
+            let _ = bastion::session::monitor_prompt(ui, &labels, actions);
+        },
+        Vec::new(),
+    );
+    h.run();
+    h.snapshot("monitor_prompt");
+    h.get_by_label("Use multiple monitors").click();
+    h.run();
+    h.get_by_label("Not now").click();
+    h.run();
+    assert_eq!(h.state(), &vec![Action::UseNewMonitors, Action::DismissNewMonitors]);
+}

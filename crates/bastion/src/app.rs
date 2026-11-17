@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bastion_core::AppPaths;
 use bastion_core::trust::TrustStore;
@@ -15,6 +15,7 @@ use winit::window::{Window, WindowId};
 
 use crate::gpu::{Gpu, WindowGfx};
 use crate::manager::{ConnectRequest, Manager};
+use crate::monitors::{self, Screen};
 use crate::session::Session;
 
 #[derive(Debug, Clone, Copy)]
@@ -41,7 +42,14 @@ pub struct App {
     client_name: String,
     tray: Option<crate::tray::TrayHandle>,
     tray_sessions: usize,
+    /// Connected monitors as last acted on.
+    screens: Vec<Screen>,
+    /// A monitor change waiting to settle: (first seen, keys). Hot-plugging often produces a
+    /// burst of output changes (and KDE re-arranges screens), so act once it is stable.
+    monitor_change: Option<(Instant, Vec<String>)>,
 }
+
+const MONITOR_SETTLE: Duration = Duration::from_millis(1500);
 
 impl App {
     pub fn new(
@@ -71,6 +79,8 @@ impl App {
             keyboard_layout: bastion_session::keyboard::detect_klid(),
             tray,
             tray_sessions: 0,
+            screens: Vec::new(),
+            monitor_change: None,
             client_name: host.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(15).collect(),
         })
     }
@@ -112,6 +122,7 @@ impl App {
             event_loop,
             gpu,
             request.profile.clone(),
+            &self.screens,
             move |layout| ConnectParams {
                 profile,
                 password,
@@ -130,6 +141,42 @@ impl App {
             Ok(session) => self.sessions.push(Live { session, request }),
             Err(e) => tracing::error!(error = %e, "Could not open session window"),
         }
+    }
+
+    /// Detects monitors being plugged in or out; returns when to check again while a change is
+    /// settling.
+    fn watch_monitors(&mut self, event_loop: &ActiveEventLoop) -> Option<Instant> {
+        let now = monitors::snapshot(event_loop);
+        let keys = monitors::keys(&now);
+        if keys == monitors::keys(&self.screens) {
+            self.monitor_change = None;
+            if now != self.screens {
+                // Same monitors, new geometry/modes: just refresh the handles and labels.
+                self.screens = now;
+                self.manager.set_monitors(&self.screens);
+            }
+            return None;
+        }
+        match &self.monitor_change {
+            Some((at, pending)) if *pending == keys => {
+                if at.elapsed() < MONITOR_SETTLE {
+                    return Some(*at + MONITOR_SETTLE);
+                }
+            }
+            _ => {
+                self.monitor_change = Some((Instant::now(), keys));
+                return Some(Instant::now() + MONITOR_SETTLE);
+            }
+        }
+        self.monitor_change = None;
+        let before = monitors::keys(&self.screens);
+        tracing::info!(?before, now = ?keys, "Local monitors changed");
+        self.screens = now;
+        self.manager.set_monitors(&self.screens);
+        for live in &mut self.sessions {
+            live.session.monitors_changed(&before, &self.screens);
+        }
+        None
     }
 
     fn reap_sessions(&mut self, event_loop: &ActiveEventLoop) {
@@ -172,6 +219,9 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.exit();
                 return;
             }
+            self.screens = monitors::snapshot(event_loop);
+            self.manager.set_monitors(&self.screens);
+            tracing::info!(monitors = ?monitors::keys(&self.screens), "Local monitors");
             if let Some(path) = self.startup_import.take() {
                 self.manager.import_file(&path);
             }
@@ -253,9 +303,12 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let mut deadline: Option<Instant> = None;
+        let mut deadline: Option<Instant> = self.watch_monitors(event_loop);
         for live in &mut self.sessions {
             live.session.poll(event_loop);
+            if let Some(gpu) = self.gpu.as_ref() {
+                live.session.apply_monitor_changes(event_loop, gpu, &self.screens);
+            }
             if let Some(d) = live.session.next_deadline() {
                 deadline = Some(deadline.map_or(d, |x| x.min(d)));
             }

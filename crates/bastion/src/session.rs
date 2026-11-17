@@ -20,6 +20,7 @@ use winit::window::{CursorIcon, CustomCursor, Fullscreen, Window, WindowId};
 
 use crate::gpu::{Gpu, WindowGfx};
 use crate::input::{Events, InputState, KeyOutcome, map_point};
+use crate::monitors::{self, Screen};
 use crate::theme;
 
 pub struct View {
@@ -35,6 +36,8 @@ pub struct View {
     bar: BarState,
     /// Where the session bar was drawn last frame (points).
     bar_rect: Option<egui::Rect>,
+    /// Where the "new monitor" prompt was drawn last frame (points).
+    prompt_rect: Option<egui::Rect>,
     /// Full-screen state this window should have. Compositors drop full screen when a window is
     /// minimised (however that happens), so it is re-applied whenever the window regains focus.
     want_fullscreen: Option<Fullscreen>,
@@ -73,6 +76,144 @@ pub struct Session {
     grab_shortcuts: bool,
     /// Set when sign-in failed, so a remembered (wrong) password is discarded.
     pub auth_failed: bool,
+    /// Monitors (keys) the full-screen windows were created on; empty for a window or a
+    /// single full screen on "the current monitor".
+    in_use: Vec<String>,
+    /// Newly connected monitors offered to the user: (key, label).
+    offer: Vec<(String, String)>,
+    /// The user accepted the offer; applied by `apply_monitor_changes`.
+    want_extend: bool,
+    /// Monitors to move the session to; applied by `apply_monitor_changes`.
+    pending_monitors: Option<Vec<String>>,
+    /// Layout after a monitor change, re-sent after a reconnect (which uses the old one).
+    rebuilt_layout: Option<DesktopLayout>,
+}
+
+/// Which windows a session shows.
+enum Target {
+    Window,
+    /// One full-screen window; `None` = whichever monitor the compositor picks.
+    Fullscreen(Option<Screen>),
+    /// One full-screen window per monitor (at least two).
+    Monitors(Vec<Screen>),
+}
+
+impl Target {
+    fn from_keys(screens: &[Screen], keys: &[String]) -> Self {
+        let mut chosen: Vec<Screen> = screens.iter().filter(|s| keys.contains(&s.key)).cloned().collect();
+        match chosen.len() {
+            0 => Target::Window,
+            1 => Target::Fullscreen(chosen.pop()),
+            _ => Target::Monitors(chosen),
+        }
+    }
+}
+
+struct Built {
+    views: HashMap<WindowId, View>,
+    layout: DesktopLayout,
+    in_use: Vec<String>,
+}
+
+impl View {
+    fn new(gfx: WindowGfx, region: Option<(u32, u32, u32, u32)>, want_fullscreen: Option<Fullscreen>) -> Self {
+        Self {
+            inhibitor: None,
+            gfx,
+            region,
+            tex_id: None,
+            image_rect: None,
+            pointer_in_ui: false,
+            bar: BarState::Hidden,
+            bar_rect: None,
+            prompt_rect: None,
+            want_fullscreen,
+            minimized: false,
+        }
+    }
+}
+
+/// Creates the window(s) for `target` and the matching remote desktop layout.
+fn build(
+    event_loop: &ActiveEventLoop,
+    gpu: &Gpu,
+    title: &str,
+    profile: &Profile,
+    target: Target,
+) -> anyhow::Result<Built> {
+    let follow_scale = profile.display.follow_local_scale;
+    let base = || Window::default_attributes().with_title(title.to_owned()).with_name("bastion", "bastion");
+    let mut views = HashMap::new();
+    match target {
+        Target::Monitors(screens) => {
+            // Create one fullscreen window per monitor first: the window knows the true
+            // fractional scale (e.g. 165%), the monitor handle only the rounded one.
+            let mut windows = Vec::new();
+            for s in &screens {
+                let attrs = base().with_fullscreen(Some(Fullscreen::Borderless(Some(s.handle.clone()))));
+                windows.push(Arc::new(event_loop.create_window(attrs)?));
+            }
+            let locals: Vec<_> = screens
+                .iter()
+                .map(|s| {
+                    // winit reports logical position x integer output scale; undo that.
+                    let m = &s.handle;
+                    let sc = m.scale_factor().max(1.0);
+                    let pos = m.position();
+                    bastion_session::LocalMonitor {
+                        logical_x: (f64::from(pos.x) / sc).round() as i32,
+                        logical_y: (f64::from(pos.y) / sc).round() as i32,
+                        width: m.size().width,
+                        height: m.size().height,
+                        scale: sc,
+                    }
+                })
+                .collect();
+            let mut layout = bastion_session::pack_monitors(&locals, follow_scale);
+            if follow_scale {
+                for (spec, w) in layout.monitors.iter_mut().zip(&windows) {
+                    spec.scale = (w.scale_factor() * 100.0).round() as u32;
+                }
+                layout = layout.normalized();
+            }
+            tracing::info!(?layout, "Multi-monitor layout");
+            let (bx, by, _, _) = layout.bounds();
+            for ((window, spec), s) in windows.into_iter().zip(&layout.monitors).zip(&screens) {
+                let region = ((spec.x - bx) as u32, (spec.y - by) as u32, spec.width, spec.height);
+                let gfx = WindowGfx::new(gpu, window.clone(), None)?;
+                let fs = Some(Fullscreen::Borderless(Some(s.handle.clone())));
+                views.insert(window.id(), View::new(gfx, Some(region), fs));
+            }
+            Ok(Built { views, layout, in_use: screens.into_iter().map(|s| s.key).collect() })
+        }
+        Target::Fullscreen(screen) => {
+            let fs = Fullscreen::Borderless(screen.as_ref().map(|s| s.handle.clone()));
+            let attrs = base()
+                .with_inner_size(winit::dpi::LogicalSize::new(profile.display.width, profile.display.height))
+                .with_min_inner_size(winit::dpi::LogicalSize::new(320, 240))
+                .with_fullscreen(Some(fs.clone()));
+            let window = Arc::new(event_loop.create_window(attrs)?);
+            // A known monitor gives the real size; otherwise the window's (corrected on resize).
+            let size = screen.as_ref().map_or_else(|| window.inner_size(), |s| s.handle.size());
+            let scale = if follow_scale { (window.scale_factor() * 100.0).round() as u32 } else { 100 };
+            let gfx = WindowGfx::new(gpu, window.clone(), None)?;
+            views.insert(window.id(), View::new(gfx, None, Some(fs)));
+            let layout = DesktopLayout::single(size.width.max(640), size.height.max(480), scale);
+            Ok(Built { views, layout, in_use: screen.into_iter().map(|s| s.key).collect() })
+        }
+        Target::Window => {
+            let attrs = base()
+                .with_inner_size(winit::dpi::LogicalSize::new(profile.display.width, profile.display.height))
+                .with_min_inner_size(winit::dpi::LogicalSize::new(320, 240));
+            let window = Arc::new(event_loop.create_window(attrs)?);
+            let size = window.inner_size();
+            let scale = if follow_scale { (window.scale_factor() * 100.0).round() as u32 } else { 100 };
+            let gfx = WindowGfx::new(gpu, window.clone(), None)?;
+            views.insert(window.id(), View::new(gfx, None, None));
+            let layout = DesktopLayout::single(size.width.max(640), size.height.max(480), scale);
+            Ok(Built { views, layout, in_use: Vec::new() })
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -131,114 +272,36 @@ impl Session {
         event_loop: &ActiveEventLoop,
         gpu: &Gpu,
         profile: Profile,
+        screens: &[Screen],
         params_without_layout: impl FnOnce(DesktopLayout) -> bastion_session::ConnectParams,
         waker: bastion_session::Waker,
         grab_shortcuts: bool,
     ) -> anyhow::Result<Self> {
         let title = format!("{} — Bastion", profile.display_name());
-        let session_title = title.clone();
-        let mut views = HashMap::new();
-        let layout = match profile.display.mode {
+        let mut notices = Vec::new();
+        let target = match profile.display.mode {
+            DisplayMode::Window => Target::Window,
+            DisplayMode::Fullscreen => Target::Fullscreen(None),
             DisplayMode::AllMonitors => {
-                let monitors: Vec<_> = event_loop.available_monitors().collect();
-                // Create one fullscreen window per monitor first: the window knows the true
-                // fractional scale (e.g. 165%), the monitor handle only the rounded one.
-                let mut windows = Vec::new();
-                for m in &monitors {
-                    let attrs = Window::default_attributes()
-                        .with_title(title.clone())
-                        .with_name("bastion", "bastion")
-                        .with_fullscreen(Some(Fullscreen::Borderless(Some(m.clone()))));
-                    windows.push(Arc::new(event_loop.create_window(attrs)?));
+                let selection = &profile.display.monitors;
+                let chosen = monitors::choose(&monitors::keys(screens), selection);
+                let missing: Vec<&str> = selection.iter().filter(|k| !chosen.contains(k)).map(String::as_str).collect();
+                if !missing.is_empty() && !chosen.is_empty() {
+                    tracing::info!(?missing, ?chosen, "Selected monitors not connected");
+                    notices.push((Instant::now(), format!("Not connected: {}", missing.join(", "))));
                 }
-                let locals: Vec<_> = monitors
-                    .iter()
-                    .map(|m| {
-                        // winit reports logical position x integer output scale; undo that.
-                        let s = m.scale_factor().max(1.0);
-                        let pos = m.position();
-                        bastion_session::LocalMonitor {
-                            logical_x: (f64::from(pos.x) / s).round() as i32,
-                            logical_y: (f64::from(pos.y) / s).round() as i32,
-                            width: m.size().width,
-                            height: m.size().height,
-                            scale: s,
-                        }
-                    })
-                    .collect();
-                let mut layout = bastion_session::pack_monitors(&locals, profile.display.follow_local_scale);
-                if profile.display.follow_local_scale {
-                    for (spec, w) in layout.monitors.iter_mut().zip(&windows) {
-                        spec.scale = (w.scale_factor() * 100.0).round() as u32;
-                    }
-                    layout = layout.normalized();
-                }
-                tracing::info!(?layout, "Multi-monitor layout");
-                let (bx, by, _, _) = layout.bounds();
-                for ((window, spec), monitor) in windows.into_iter().zip(&layout.monitors).zip(&monitors) {
-                    let region = ((spec.x - bx) as u32, (spec.y - by) as u32, spec.width, spec.height);
-                    let gfx = WindowGfx::new(gpu, window.clone(), None)?;
-                    views.insert(
-                        window.id(),
-                        View {
-                            inhibitor: None,
-                            gfx,
-                            region: Some(region),
-                            tex_id: None,
-                            image_rect: None,
-                            pointer_in_ui: false,
-                            bar: BarState::Hidden,
-                            bar_rect: None,
-                            want_fullscreen: Some(Fullscreen::Borderless(Some(monitor.clone()))),
-                            minimized: false,
-                        },
-                    );
-                }
-                layout
-            }
-            mode => {
-                let mut attrs = Window::default_attributes()
-                    .with_title(title)
-                    .with_name("bastion", "bastion")
-                    .with_inner_size(winit::dpi::LogicalSize::new(profile.display.width, profile.display.height))
-                    .with_min_inner_size(winit::dpi::LogicalSize::new(320, 240));
-                if mode == DisplayMode::Fullscreen {
-                    attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
-                }
-                let window = Arc::new(event_loop.create_window(attrs)?);
-                let size = window.inner_size();
-                let scale = if profile.display.follow_local_scale {
-                    (window.scale_factor() * 100.0).round() as u32
-                } else {
-                    100
-                };
-                let gfx = WindowGfx::new(gpu, window.clone(), None)?;
-                views.insert(
-                    window.id(),
-                    View {
-                        inhibitor: None,
-                        gfx,
-                        region: None,
-                        tex_id: None,
-                        image_rect: None,
-                        pointer_in_ui: false,
-                        bar: BarState::Hidden,
-                        bar_rect: None,
-                        want_fullscreen: (mode == DisplayMode::Fullscreen).then_some(Fullscreen::Borderless(None)),
-                        minimized: false,
-                    },
-                );
-                DesktopLayout::single(size.width.max(640), size.height.max(480), scale)
+                Target::from_keys(screens, &chosen)
             }
         };
-        let handle = SessionHandle::spawn(params_without_layout(layout), waker);
+        let built = build(event_loop, gpu, &title, &profile, target)?;
+        let handle = SessionHandle::spawn(params_without_layout(built.layout.clone()), waker);
         Ok(Self {
             profile,
             handle,
-            views,
+            views: built.views,
             phase: Phase::Connecting("Starting…".into()),
             cert: None,
-            notices: Vec::new(),
+            notices,
             input: InputState::new(),
             grabbed: true,
             texture: None,
@@ -249,9 +312,100 @@ impl Session {
             want_reconnect: false,
             auth_failed: false,
             grab_shortcuts,
-            title: session_title,
+            title,
             last_sibling_restore: None,
+            in_use: built.in_use,
+            offer: Vec::new(),
+            want_extend: false,
+            pending_monitors: None,
+            rebuilt_layout: None,
         })
+    }
+
+    /// Full-screen monitors this session is on right now (empty for a windowed session).
+    fn monitors_in_use(&self, screens: &[Screen]) -> Vec<String> {
+        if !self.in_use.is_empty() {
+            return self.in_use.clone();
+        }
+        // Single full screen on "the current monitor": ask where the window is.
+        self.views
+            .values()
+            .filter(|v| v.want_fullscreen.is_some())
+            .filter_map(|v| v.gfx.window.current_monitor())
+            .filter_map(|m| screens.iter().find(|s| s.handle == m).map(|s| s.key.clone()))
+            .collect()
+    }
+
+    fn is_fullscreen(&self) -> bool {
+        self.views.values().any(|v| v.want_fullscreen.is_some())
+    }
+
+    /// Reacts to monitors being plugged in or out (`before` = previously connected keys).
+    pub fn monitors_changed(&mut self, before: &[String], screens: &[Screen]) {
+        let now = monitors::keys(screens);
+        let in_use = self.monitors_in_use(screens);
+        let plan = monitors::plan(&in_use, before, &now, &self.profile.display.monitors, self.is_fullscreen());
+        tracing::info!(?before, ?now, ?in_use, ?plan, "Monitors changed");
+        self.offer.retain(|(k, _)| now.contains(k));
+        for k in plan.offer {
+            if !self.offer.iter().any(|(o, _)| *o == k)
+                && let Some(s) = screens.iter().find(|s| s.key == k)
+            {
+                self.offer.push((k, s.label.clone()));
+            }
+        }
+        if let Some(keys) = plan.use_monitors {
+            self.offer.retain(|(k, _)| !keys.contains(k));
+            self.pending_monitors = Some(keys);
+        }
+        self.request_redraw();
+    }
+
+    /// Applies a pending monitor change (a monitor was unplugged, or the user accepted a new
+    /// one). Needs the event loop to create windows, so the app calls it between events.
+    pub fn apply_monitor_changes(&mut self, event_loop: &ActiveEventLoop, gpu: &Gpu, screens: &[Screen]) {
+        if std::mem::take(&mut self.want_extend) {
+            let now = monitors::keys(screens);
+            let offered: Vec<String> = self.offer.drain(..).map(|(k, _)| k).collect();
+            let in_use = self.monitors_in_use(screens);
+            self.pending_monitors = Some(monitors::accept(&in_use, &offered, &now));
+        }
+        let Some(keys) = self.pending_monitors.take() else { return };
+        let target = Target::from_keys(screens, &keys);
+        if matches!(target, Target::Window) {
+            return;
+        }
+        let lost = keys.len() < self.in_use.len();
+        self.reconfigure(event_loop, gpu, target);
+        if lost {
+            let msg = match self.in_use.as_slice() {
+                [one] => format!("A monitor was disconnected. Now full screen on {one}."),
+                many => format!("A monitor was disconnected. Now using {} monitors.", many.len()),
+            };
+            self.notices.push((Instant::now(), msg));
+        }
+    }
+
+    /// Re-creates the session's windows for a new monitor arrangement and tells the remote
+    /// computer about the new layout. The connection itself is kept.
+    fn reconfigure(&mut self, event_loop: &ActiveEventLoop, gpu: &Gpu, target: Target) {
+        let ev = self.input.release_all();
+        self.send(ev);
+        match build(event_loop, gpu, &self.title, &self.profile, target) {
+            Ok(built) => {
+                tracing::info!(layout = ?built.layout, monitors = ?built.in_use, "Session moved to new monitors");
+                // Old windows (and their GPU surfaces) are dropped here.
+                self.views = built.views;
+                self.in_use = built.in_use;
+                self.texture = None;
+                self.pending_layout = None;
+                self.handle.send(Command::Layout(built.layout.clone()));
+                self.rebuilt_layout = Some(built.layout);
+                self.apply_cursor(self.remote_cursor.clone());
+                self.request_redraw();
+            }
+            Err(e) => tracing::error!(error = %e, "Could not move the session to the new monitors"),
+        }
     }
 
     pub fn owns(&self, id: WindowId) -> bool {
@@ -291,6 +445,11 @@ impl Session {
                     if self.connected() {
                         let locks = bastion_session::keyboard::read_lock_state();
                         self.send(self.input.sync_locks(locks));
+                        // A reconnect starts with the original layout; restore the monitor
+                        // arrangement chosen since (the engine ignores an unchanged layout).
+                        if let Some(l) = &self.rebuilt_layout {
+                            self.handle.send(Command::Layout(l.clone()));
+                        }
                     }
                 }
                 Event::Pointer(p) => self.set_remote_cursor(event_loop, p),
@@ -501,7 +660,7 @@ impl Session {
                     }
                     view.gfx.window.request_redraw();
                 }
-                let in_bar = over_bar;
+                let in_bar = over_bar || view.prompt_rect.is_some_and(|r| r.expand(2.0).contains(pointer));
                 let was = view.pointer_in_ui;
                 view.pointer_in_ui = in_bar || egui_resp.consumed;
                 if was != view.pointer_in_ui {
@@ -660,6 +819,11 @@ impl Session {
         let mut cert = self.cert.take();
         let mut actions = Vec::new();
         let grabbed = self.grabbed;
+        let offer: Vec<String> = if self.connected() && self.cert.is_none() {
+            self.offer.iter().map(|(_, l)| l.clone()).collect()
+        } else {
+            Vec::new()
+        };
 
         let Some(view) = self.views.get_mut(&id) else { return };
         let src = match view.region {
@@ -670,6 +834,7 @@ impl Session {
         let fullscreen = view.gfx.window.fullscreen().is_some();
         let show_bar = view.bar != BarState::Hidden;
         let mut bar_rect = None;
+        let mut prompt_rect = None;
         let mut image_rect = None;
         let ppp = view.gfx.window.scale_factor();
 
@@ -701,6 +866,9 @@ impl Session {
                 if show_bar && disconnected.is_none() && phase_text.is_none() {
                     bar_rect = Some(session_bar(ui, &name, grabbed, fullscreen, &mut actions));
                 }
+                if !offer.is_empty() {
+                    prompt_rect = Some(monitor_prompt(ui, &offer, &mut actions));
+                }
                 if let Some(text) = &phase_text {
                     status_card(ui, &name, &host, text, &mut actions);
                 }
@@ -717,6 +885,7 @@ impl Session {
         });
         view.image_rect = image_rect;
         view.bar_rect = bar_rect;
+        view.prompt_rect = prompt_rect;
         self.cert = cert;
         for a in actions {
             self.action(a, id);
@@ -750,6 +919,10 @@ impl Session {
                     v.want_fullscreen = fs.clone();
                     v.gfx.window.set_fullscreen(fs);
                 }
+                if self.views.len() == 1 {
+                    // Leaving (or re-entering) full screen frees the window from its monitor.
+                    self.in_use.clear();
+                }
             }
             Action::Grab => {
                 self.grabbed = true;
@@ -766,6 +939,8 @@ impl Session {
                 }
             }
             Action::Refresh => self.handle.send(Command::RefreshScreen),
+            Action::UseNewMonitors => self.want_extend = true,
+            Action::DismissNewMonitors => self.offer.clear(),
         }
         self.request_redraw();
     }
@@ -784,6 +959,9 @@ pub enum Action {
     Grab,
     HideBar,
     Refresh,
+    /// Extend the session onto newly connected monitors.
+    UseNewMonitors,
+    DismissNewMonitors,
 }
 
 fn card_frame() -> egui::Frame {
@@ -962,6 +1140,40 @@ pub fn session_bar(
                         }
                     });
                 });
+        })
+        .response
+        .rect
+}
+
+/// Asks whether to extend the session onto newly connected monitors; returns where it was drawn
+/// (points) so only the prompt itself captures the pointer.
+pub fn monitor_prompt(ui: &mut egui::Ui, labels: &[String], actions: &mut Vec<Action>) -> egui::Rect {
+    egui::Area::new(egui::Id::unique("monitor-prompt"))
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -48.0))
+        .order(egui::Order::Foreground)
+        .show(ui.ctx(), |ui| {
+            card_frame().inner_margin(egui::Margin::symmetric(18, 14)).show(ui, |ui| {
+                ui.set_max_width(460.0);
+                let (title, question) = if labels.len() == 1 {
+                    ("New monitor connected", "Extend this session onto it?")
+                } else {
+                    ("New monitors connected", "Extend this session onto them?")
+                };
+                ui.label(egui::RichText::new(title).strong());
+                for l in labels {
+                    ui.label(egui::RichText::new(l).color(theme::MUTED));
+                }
+                ui.label(question);
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if theme::primary_button(ui, "Use multiple monitors").clicked() {
+                        actions.push(Action::UseNewMonitors);
+                    }
+                    if ui.button("Not now").clicked() {
+                        actions.push(Action::DismissNewMonitors);
+                    }
+                });
+            });
         })
         .response
         .rect

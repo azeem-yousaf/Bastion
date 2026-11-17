@@ -6,6 +6,7 @@ pub mod inhibit;
 pub mod input;
 pub mod kwin;
 pub mod manager;
+pub mod monitors;
 pub mod session;
 pub mod theme;
 pub mod tray;

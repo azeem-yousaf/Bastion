@@ -157,7 +157,8 @@ pub enum DisplayMode {
     Window,
     /// Fullscreen on the monitor the window is on.
     Fullscreen,
-    /// Fullscreen spanning every monitor (multi-monitor session).
+    /// Fullscreen spanning several monitors (multi-monitor session): every monitor, or the
+    /// ones listed in [`DisplaySettings::monitors`].
     AllMonitors,
 }
 
@@ -176,6 +177,8 @@ pub struct DisplaySettings {
     pub h264: bool,
     /// Prefer hardware (NVDEC/VAAPI) decode when available.
     pub hardware_decode: bool,
+    /// Monitors (connector names such as `DP-1`) used in multi-monitor mode. Empty = all.
+    pub monitors: Vec<String>,
 }
 
 impl Default for DisplaySettings {
@@ -188,6 +191,7 @@ impl Default for DisplaySettings {
             follow_local_scale: true,
             h264: true,
             hardware_decode: true,
+            monitors: Vec::new(),
         }
     }
 }
