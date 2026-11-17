@@ -74,6 +74,48 @@ impl SharedFrame {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Sets the frame size announced by the graphics pipeline. A new size clears the frame (the
+    /// server repaints after a reset); the same size keeps the pixels.
+    pub fn reset(&self, width: u32, height: u32) {
+        let mut st = self.lock();
+        if st.width != width || st.height != height {
+            st.width = width;
+            st.height = height;
+            st.data = vec![0; width as usize * height as usize * 4];
+            st.generation += 1;
+        }
+        st.dirty = vec![Rect { x: 0, y: 0, w: width, h: height }];
+        st.dirty_since.get_or_insert_with(std::time::Instant::now);
+    }
+
+    /// Writes regions of tightly packed RGBA rows (as the graphics pipeline produces them)
+    /// into the frame. Regions outside the frame are clipped. Returns the pixels written.
+    pub fn apply_regions<'a>(&self, regions: impl IntoIterator<Item = (Rect, &'a [u8])>) -> u64 {
+        let mut st = self.lock();
+        let (fw, fh) = (st.width, st.height);
+        let stride = fw as usize * 4;
+        let mut copied = 0;
+        for (rect, src) in regions {
+            let clip = clamp(rect, fw, fh);
+            if clip.w == 0 || clip.h == 0 || src.len() < rect.area() as usize * 4 {
+                continue;
+            }
+            let src_stride = rect.w as usize * 4;
+            let row_bytes = clip.w as usize * 4;
+            for row in 0..clip.h as usize {
+                let s = row * src_stride;
+                let d = (clip.y as usize + row) * stride + clip.x as usize * 4;
+                st.data[d..d + row_bytes].copy_from_slice(&src[s..s + row_bytes]);
+            }
+            add_dirty(&mut st.dirty, clip);
+            copied += clip.area();
+        }
+        if copied > 0 {
+            st.dirty_since.get_or_insert_with(std::time::Instant::now);
+        }
+        copied
+    }
+
     /// Copies `rect` from `src` (tightly packed RGBA, `src_width` wide) into the shared frame.
     pub fn update_from(&self, src: &[u8], src_width: u32, src_height: u32, rect: Rect) {
         self.update_rects(src, src_width, src_height, &[rect]);
@@ -134,6 +176,26 @@ mod tests {
         f.update_from(&src, 10, 10, Rect { x: 8, y: 8, w: 5, h: 5 });
         // Far apart: kept separate (clamped to the frame), not one 8×8 bounding box.
         assert_eq!(f.lock().dirty, vec![Rect { x: 2, y: 2, w: 2, h: 2 }, Rect { x: 8, y: 8, w: 2, h: 2 }]);
+    }
+
+    #[test]
+    fn regions_are_written_row_by_row_and_clipped() {
+        let f = SharedFrame::default();
+        f.reset(8, 4);
+        assert_eq!(f.lock().generation, 1);
+        f.lock().dirty.clear();
+        // A 3×2 region of distinct pixels at (6, 3): only the 2×1 part inside the frame lands.
+        let src: Vec<u8> = (0..3 * 2 * 4).map(|i| i as u8).collect();
+        let n = f.apply_regions([(Rect { x: 6, y: 3, w: 3, h: 2 }, &src[..])]);
+        assert_eq!(n, 2);
+        let st = f.lock();
+        assert_eq!(&st.data[(3 * 8 + 6) * 4..(3 * 8 + 8) * 4], &src[..8]);
+        assert_eq!(st.dirty, vec![Rect { x: 6, y: 3, w: 2, h: 1 }]);
+        drop(st);
+        // Same size again keeps the pixels and the texture generation.
+        f.reset(8, 4);
+        assert_eq!(f.lock().generation, 1);
+        assert_eq!(f.lock().data[(3 * 8 + 6) * 4], 0);
     }
 
     #[test]
