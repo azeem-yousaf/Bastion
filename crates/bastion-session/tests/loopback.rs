@@ -405,3 +405,267 @@ fn remote_audio_is_played_bit_exact() {
     wait_until("all audio samples played", || host.0.lock().unwrap().len() >= expected.len());
     assert_eq!(&host.0.lock().unwrap()[..expected.len()], &expected[..]);
 }
+
+// ───────────────────────── Mock RD Gateway ─────────────────────────
+//
+// A minimal MS-TSGU HTTP/WebSocket gateway: TLS, HTTP Basic authentication, the
+// handshake/tunnel/auth/channel exchange, then data packets relayed to the loopback RDP server.
+
+mod gateway {
+    use std::sync::{Arc, Mutex};
+
+    use base64::Engine as _;
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use http_body_util::Empty;
+    use hyper::body::Bytes;
+    use hyper::{Request, Response, StatusCode};
+    use hyper_util::rt::TokioIo;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    fn packet(ty: u16, payload: &[u8]) -> Vec<u8> {
+        let mut p = Vec::with_capacity(8 + payload.len());
+        p.extend(ty.to_le_bytes());
+        p.extend([0, 0]);
+        p.extend((8 + payload.len() as u32).to_le_bytes());
+        p.extend(payload);
+        p
+    }
+
+    pub struct Gateway {
+        pub port: u16,
+        pub fingerprint: String,
+        pub log: Arc<Mutex<Vec<String>>>,
+        _rt: tokio::runtime::Runtime,
+    }
+
+    impl Gateway {
+        pub fn saw(&self, s: &str) -> bool {
+            self.log.lock().unwrap().iter().any(|l| l == s)
+        }
+    }
+
+    pub fn start(rdp_port: u16, user: &str, password: &str) -> Gateway {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into(), "localhost".into()]).unwrap();
+        let fingerprint = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(cert.cert.der()).iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
+        };
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert.der().clone()], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log: Arc<Mutex<Vec<String>>> = Arc::default();
+        let expected =
+            format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}")));
+        let l = log.clone();
+        rt.spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else { return };
+                let (acceptor, expected, log) = (acceptor.clone(), expected.clone(), l.clone());
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(tcp).await else { return };
+                    let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let (expected, log) = (expected.clone(), log.clone());
+                        async move { Ok::<_, std::convert::Infallible>(handle(req, &expected, rdp_port, log)) }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(tls), service)
+                        .with_upgrades()
+                        .await;
+                });
+            }
+        });
+        Gateway { port, fingerprint, log, _rt: rt }
+    }
+
+    fn handle(
+        mut req: Request<hyper::body::Incoming>,
+        expected_auth: &str,
+        rdp_port: u16,
+        log: Arc<Mutex<Vec<String>>>,
+    ) -> Response<Empty<Bytes>> {
+        log.lock().unwrap().push(format!("HTTP {}", req.method()));
+        let auth = req.headers().get(hyper::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
+        if auth != expected_auth {
+            log.lock().unwrap().push(if auth.is_empty() { "AUTH NONE".into() } else { "AUTH BAD".into() });
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header(hyper::header::WWW_AUTHENTICATE, "Basic realm=\"RD Gateway\"")
+                .body(Empty::new())
+                .unwrap();
+        }
+        log.lock().unwrap().push("AUTH OK".into());
+        let Some(key) = req.headers().get(hyper::header::SEC_WEBSOCKET_KEY).cloned() else {
+            return Response::builder().status(StatusCode::BAD_REQUEST).body(Empty::new()).unwrap();
+        };
+        let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+        tokio::spawn(async move {
+            if let Ok(upgraded) = hyper::upgrade::on(&mut req).await {
+                let ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
+                tunnel(ws, rdp_port, log).await;
+            }
+        });
+        Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header(hyper::header::CONNECTION, "Upgrade")
+            .header(hyper::header::UPGRADE, "websocket")
+            .header(hyper::header::SEC_WEBSOCKET_ACCEPT, accept)
+            .body(Empty::new())
+            .unwrap()
+    }
+
+    async fn tunnel<S>(ws: WebSocketStream<S>, rdp_port: u16, log: Arc<Mutex<Vec<String>>>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut sink, mut stream) = ws.split();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            while let Some(p) = rx.recv().await {
+                if sink.send(Message::binary(p)).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let mut buf: Vec<u8> = Vec::new();
+        let mut rdp_write: Option<tokio::net::tcp::OwnedWriteHalf> = None;
+        while let Some(Ok(msg)) = stream.next().await {
+            let Message::Binary(data) = msg else { continue };
+            buf.extend_from_slice(&data);
+            while buf.len() >= 8 {
+                let ty = u16::from_le_bytes([buf[0], buf[1]]);
+                let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+                if buf.len() < len {
+                    break;
+                }
+                let pkt: Vec<u8> = buf.drain(..len).collect();
+                let payload = &pkt[8..];
+                match ty {
+                    0x01 => {
+                        log.lock().unwrap().push("HANDSHAKE".into());
+                        let _ = tx.send(packet(0x02, &[0, 0, 0, 0, 1, 0, 0, 0, 0, 0]));
+                    }
+                    0x04 => {
+                        log.lock().unwrap().push("TUNNEL".into());
+                        let _ = tx.send(packet(0x05, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+                    }
+                    0x06 => {
+                        log.lock().unwrap().push("TUNNEL AUTH".into());
+                        let _ = tx.send(packet(0x07, &[0; 8]));
+                    }
+                    0x08 => {
+                        // Channel create: resources are UTF-16 names; record the target host and port.
+                        let utf16: Vec<u16> =
+                            payload.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                        let text = String::from_utf16_lossy(&utf16);
+                        log.lock()
+                            .unwrap()
+                            .push(format!("CHANNEL target_contains_127.0.0.1={}", text.contains("127.0.0.1")));
+                        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", rdp_port)).await.unwrap();
+                        let (mut r, w) = tcp.into_split();
+                        rdp_write = Some(w);
+                        let tx2 = tx.clone();
+                        tokio::spawn(async move {
+                            let mut b = vec![0u8; 16 * 1024];
+                            while let Ok(n) = r.read(&mut b).await {
+                                if n == 0 {
+                                    break;
+                                }
+                                let mut payload = (n as u16).to_le_bytes().to_vec();
+                                payload.extend_from_slice(&b[..n]);
+                                if tx2.send(packet(0x0A, &payload)).is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                        let _ = tx.send(packet(0x09, &[0; 8]));
+                    }
+                    0x0A => {
+                        let n = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+                        if let Some(w) = rdp_write.as_mut() {
+                            if w.write_all(&payload[2..2 + n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    other => log.lock().unwrap().push(format!("PACKET {other:#x}")),
+                }
+            }
+        }
+    }
+}
+
+fn gateway_profile(server: &Server, gw: &gateway::Gateway) -> Profile {
+    let mut p = profile(server.port);
+    p.gateway = Some(bastion_core::profile::GatewaySettings {
+        host: "127.0.0.1".into(),
+        port: gw.port,
+        same_credentials: true,
+        ..Default::default()
+    });
+    p
+}
+
+#[test]
+fn connects_through_rd_gateway_with_cert_pinning_and_auth() {
+    let server = Server::start();
+    let gw = gateway::start(server.port, USER, PASSWORD);
+    let trust = Arc::new(Mutex::new(TrustStore::in_memory()));
+    let h = connect(gateway_profile(&server, &gw), PASSWORD, trust.clone());
+
+    // 1. The gateway's self-signed certificate is not trusted blindly.
+    let rej = wait_event(&h, |e| match e {
+        Event::CertificatePrompt(r) => Some(r.clone()),
+        _ => None,
+    });
+    assert_eq!(rej.kind, EndpointKind::Gateway);
+    assert_eq!(rej.fingerprint, gw.fingerprint);
+    h.send(Command::CertificateDecision { accept: true });
+
+    // 2. Then the RDP host's certificate (end-to-end TLS inside the tunnel).
+    let rej = wait_event(&h, |e| match e {
+        Event::CertificatePrompt(r) => Some(r.clone()),
+        _ => None,
+    });
+    assert_eq!(rej.kind, EndpointKind::Rdp);
+    assert_eq!(rej.fingerprint, server.fingerprint);
+    h.send(Command::CertificateDecision { accept: true });
+
+    wait_event(&h, |e| matches!(e, Event::Status(Status::Connected { .. })).then_some(()));
+    assert!(gw.saw("AUTH OK"), "gateway credentials must be sent: {:?}", gw.log.lock().unwrap());
+    for step in ["HANDSHAKE", "TUNNEL", "TUNNEL AUTH", "CHANNEL target_contains_127.0.0.1=true"] {
+        assert!(gw.saw(step), "missing {step}: {:?}", gw.log.lock().unwrap());
+    }
+
+    // 3. Desktop and input work through the tunnel.
+    wait_until("red desktop via gateway", || centre_pixel(&h).is_some_and(|p| p[0] > 180 && p[1] < 40));
+    let mut db = Database::new();
+    let a = Scancode::from_u8(false, 0x1E);
+    h.send(Command::Input(db.apply([Operation::KeyPressed(a), Operation::KeyReleased(a)])));
+    wait_until("key through gateway", || server.saw("KEY DOWN 30 false"));
+    assert_eq!(trust.lock().unwrap().entries().count(), 2, "gateway and host pinned separately");
+}
+
+#[test]
+fn wrong_gateway_password_is_reported_clearly() {
+    let server = Server::start();
+    let gw = gateway::start(server.port, USER, "the-real-password");
+    let trust = Arc::new(Mutex::new(TrustStore::in_memory()));
+    trust.lock().unwrap().pin(EndpointKind::Gateway, &format!("127.0.0.1:{}", gw.port), &[]).ok();
+    let mut p = gateway_profile(&server, &gw);
+    p.security.allow_insecure_tls = true; // focus this test on authentication
+    let h = connect(p, PASSWORD, trust);
+    let (reason, error) = wait_disconnect(&h);
+    assert!(error);
+    assert!(reason.contains("rejected your credentials"), "{reason}");
+    assert!(!reason.contains(".rs:"), "{reason}");
+}
