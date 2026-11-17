@@ -4,6 +4,7 @@ pub mod app;
 pub mod gpu;
 pub mod inhibit;
 pub mod input;
+pub mod kwin;
 pub mod manager;
 pub mod session;
 pub mod theme;

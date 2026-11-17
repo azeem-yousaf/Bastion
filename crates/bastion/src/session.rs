@@ -64,6 +64,9 @@ pub struct Session {
     pub want_close: bool,
     /// Ask the app to reconnect with the same parameters.
     pub want_reconnect: bool,
+    /// Window title shared by all of this session's windows (used to find them in KWin).
+    title: String,
+    last_sibling_restore: Option<Instant>,
     /// User setting: forward Alt+Tab/Super etc. to the remote computer.
     grab_shortcuts: bool,
     /// Set when sign-in failed, so a remembered (wrong) password is discarded.
@@ -91,6 +94,7 @@ impl Session {
         grab_shortcuts: bool,
     ) -> anyhow::Result<Self> {
         let title = format!("{} — Bastion", profile.display_name());
+        let session_title = title.clone();
         let mut views = HashMap::new();
         let layout = match profile.display.mode {
             DisplayMode::AllMonitors => {
@@ -200,6 +204,8 @@ impl Session {
             want_reconnect: false,
             auth_failed: false,
             grab_shortcuts,
+            title: session_title,
+            last_sibling_restore: None,
         })
     }
 
@@ -391,23 +397,24 @@ impl Session {
                 // Back from minimise (taskbar, shortcut or our button): re-apply full screen, which
                 // the compositor drops on minimise. Sibling monitor windows minimised together via
                 // the session bar are brought back too.
-                let restore_all = self.views.get(&id).is_some_and(|v| v.minimized);
-                for (vid, v) in self.views.iter_mut() {
-                    if *vid != id && !(restore_all && v.minimized) {
-                        continue;
-                    }
+                if let Some(v) = self.views.get_mut(&id) {
                     v.minimized = false;
                     if let Some(fs) = v.want_fullscreen.clone() {
                         // Always re-send: winit's cached state can lag the compositor's.
                         v.gfx.window.set_fullscreen(Some(fs));
                     }
-                    if *vid != id {
-                        v.gfx.window.focus_window();
-                    }
                     v.gfx.window.request_redraw();
                 }
-                if restore_all && let Some(v) = self.views.get(&id) {
-                    v.gfx.window.focus_window();
+                // Multi-monitor: restoring one window (taskbar, Alt+Tab) must bring the whole
+                // session back. Wayland apps cannot un-minimise themselves, so ask KWin.
+                if self.views.len() > 1
+                    && self.last_sibling_restore.is_none_or(|t| t.elapsed() > Duration::from_secs(1))
+                {
+                    self.last_sibling_restore = Some(Instant::now());
+                    for v in self.views.values_mut() {
+                        v.minimized = false;
+                    }
+                    crate::kwin::restore_windows(self.title.clone());
                 }
                 if self.connected() {
                     let locks = bastion_session::keyboard::read_lock_state();

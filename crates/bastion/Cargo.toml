@@ -31,6 +31,7 @@ pollster = "0.4"
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 gethostname = "1"
 libc = "0.2"
+zbus = { version = "5", default-features = false, features = ["blocking-api", "tokio"] }
 ksni = { version = "0.3", features = ["blocking"] }
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system"] }
