@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 
-use bastion_core::profile::{DisplayMode, GatewaySettings, KeepActive, Profile};
+use bastion_core::profile::{ConnectionSpeed, DisplayMode, GatewaySettings, KeepActive, Profile};
 use bastion_core::secrets::{self, Secret, SecretKind};
 use bastion_core::store::{AppSettings, ProfileStore};
 use bastion_core::trust::TrustStore;
@@ -750,6 +750,23 @@ impl Manager {
                 ui.checkbox(&mut d.display.dynamic_resolution, "Resize the remote desktop when the window is resized");
                 ui.checkbox(&mut d.display.follow_local_scale, "Use this computer's display scaling (HiDPI)");
                 theme::section(ui, "Performance");
+                form(ui, "speed", |ui| {
+                    field(ui, "Connection speed", |ui| {
+                        egui::ComboBox::from_id_salt("speed")
+                            .selected_text(d.display.speed.label())
+                            .width(260.0)
+                            .show_ui(ui, |ui| {
+                                for s in ConnectionSpeed::ALL {
+                                    ui.selectable_value(&mut d.display.speed, s, s.label());
+                                }
+                            })
+                            .response
+                    })
+                    .on_hover_text(
+                        "Fewer visual effects (wallpaper, animations, transparency) use less bandwidth. \
+                         Applies from the next connection.",
+                    );
+                });
                 ui.checkbox(&mut d.display.h264, "H.264 video codec (lower bandwidth, smoother video)");
                 ui.add_enabled(d.display.h264, egui::Checkbox::new(&mut d.display.hardware_decode, "Hardware decoding (NVDEC / VAAPI) when software can't keep up"))
                     .on_hover_text("Remote-desktop video usually decodes faster on the CPU; the graphics card takes over for heavy video");

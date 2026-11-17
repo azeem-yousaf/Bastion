@@ -540,6 +540,34 @@ fn multi_monitor_mode_can_use_selected_monitors() {
 }
 
 #[test]
+fn connection_speed_is_chosen_in_the_display_tab() {
+    use bastion_core::profile::ConnectionSpeed;
+    let f = fixture();
+    let mut h = harness(manager(&f));
+    h.run();
+    h.get_by_label("+  New connection").click();
+    h.run();
+    let inputs: Vec<_> = h.query_all_by_role(egui::accesskit::Role::TextInput).collect();
+    inputs[2].focus();
+    inputs[2].type_text("pc01");
+    h.run();
+
+    h.get_by_label("Display").click();
+    h.run();
+    // The picker is named by its row label (accessibility) and shows the default.
+    h.get_by_label("Connection speed").click();
+    h.run();
+    h.get_by_label(ConnectionSpeed::Low.label()).click();
+    h.run();
+    h.snapshot("editor_display_connection_speed");
+
+    h.get_by_label("Save").click();
+    h.run();
+    let store = ProfileStore::load(&f.paths).unwrap();
+    assert_eq!(store.profiles()[0].display.speed, ConnectionSpeed::Low);
+}
+
+#[test]
 fn new_monitor_prompt_offers_multiple_monitors() {
     let labels = vec!["DP-2 — 2560 × 1440".to_owned()];
     let mut h = Harness::builder().with_size(egui::vec2(700.0, 300.0)).wgpu().build_ui_state(

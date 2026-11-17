@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bastion_core::profile::Profile;
+use bastion_core::profile::{ConnectionSpeed, Profile};
 use bastion_core::secrets::Secret;
 use bastion_core::trust::{EndpointKind, TrustStore};
 use ironrdp_cliprdr::CliprdrClient;
@@ -1130,6 +1130,28 @@ fn gateway_error_message(e: &ironrdp_error::Error<ironrdp_mstsgu::GwErrorKind>, 
     }
 }
 
+/// What the client tells Windows at sign-in for a connection-speed choice: the network type
+/// (Windows measures the link itself only for `Autodetect`) and the visual effects to draw.
+fn experience(speed: ConnectionSpeed) -> (ironrdp_pdu::gcc::ConnectionType, PerformanceFlags) {
+    use ironrdp_pdu::gcc::ConnectionType;
+    let full = PerformanceFlags::ENABLE_FONT_SMOOTHING | PerformanceFlags::ENABLE_DESKTOP_COMPOSITION;
+    match speed {
+        ConnectionSpeed::Auto => (ConnectionType::Autodetect, full),
+        ConnectionSpeed::Lan => (ConnectionType::Lan, full),
+        ConnectionSpeed::Broadband => (ConnectionType::BroadbandHigh, full | PerformanceFlags::DISABLE_WALLPAPER),
+        // Font smoothing stays on: it costs little and text is unreadable without it. Visual
+        // styles stay on too (as mstsc does for slow links); Windows 10+ barely draws without them.
+        ConnectionSpeed::Low => (
+            ConnectionType::BroadbandLow,
+            PerformanceFlags::ENABLE_FONT_SMOOTHING
+                | PerformanceFlags::DISABLE_WALLPAPER
+                | PerformanceFlags::DISABLE_FULLWINDOWDRAG
+                | PerformanceFlags::DISABLE_MENUANIMATIONS
+                | PerformanceFlags::DISABLE_CURSOR_SHADOW,
+        ),
+    }
+}
+
 fn timezone() -> TimezoneInfo {
     // `time`'s local-offset API refuses to work in multi-threaded processes; ask libc directly.
     let offset_min = {
@@ -1246,7 +1268,7 @@ fn build_connector(
         keyboard_subtype: 0,
         keyboard_functional_keys_count: 12,
         keyboard_layout: ctx.params.keyboard_layout,
-        connection_type: ironrdp_pdu::gcc::ConnectionType::Autodetect,
+        connection_type: experience(p.display.speed).0,
         ime_file_name: String::new(),
         bitmap: Some(ironrdp_connector::BitmapConfig {
             lossy_compression: true,
@@ -1265,7 +1287,7 @@ fn build_connector(
         autologon: false,
         enable_audio_playback: p.audio.playback,
         enable_audio_capture: p.audio.microphone,
-        performance_flags: PerformanceFlags::ENABLE_FONT_SMOOTHING | PerformanceFlags::ENABLE_DESKTOP_COMPOSITION,
+        performance_flags: experience(p.display.speed).1,
         license_cache: None,
         timezone_info: timezone(),
         compression_type: None,
@@ -1807,6 +1829,32 @@ async fn active_session(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn connection_speed_sets_network_type_and_effects() {
+        use super::{ConnectionSpeed, PerformanceFlags, experience};
+        use ironrdp_pdu::gcc::ConnectionType;
+        let full = PerformanceFlags::ENABLE_FONT_SMOOTHING | PerformanceFlags::ENABLE_DESKTOP_COMPOSITION;
+        // Auto keeps the behaviour Bastion always had.
+        assert_eq!(experience(ConnectionSpeed::Auto), (ConnectionType::Autodetect, full));
+        assert_eq!(experience(ConnectionSpeed::Lan), (ConnectionType::Lan, full));
+        let (t, f) = experience(ConnectionSpeed::Broadband);
+        assert_eq!(t, ConnectionType::BroadbandHigh);
+        assert_eq!(f, full | PerformanceFlags::DISABLE_WALLPAPER);
+        let (t, f) = experience(ConnectionSpeed::Low);
+        assert_eq!(t, ConnectionType::BroadbandLow);
+        assert!(!f.contains(PerformanceFlags::ENABLE_DESKTOP_COMPOSITION));
+        assert!(f.contains(PerformanceFlags::ENABLE_FONT_SMOOTHING));
+        for off in [
+            PerformanceFlags::DISABLE_WALLPAPER,
+            PerformanceFlags::DISABLE_FULLWINDOWDRAG,
+            PerformanceFlags::DISABLE_MENUANIMATIONS,
+            PerformanceFlags::DISABLE_CURSOR_SHADOW,
+        ] {
+            assert!(f.contains(off), "{off:?} should be set for low bandwidth");
+        }
+        assert!(!f.contains(PerformanceFlags::DISABLE_THEMING));
+    }
+
     use ironrdp_pdu::nego::SecurityProtocol;
     use ironrdp_rdpeai::client::RdpeaiCaptureHandler;
     use ironrdp_rdpeai::pdu::OpenReplyPdu;

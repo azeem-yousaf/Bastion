@@ -178,6 +178,35 @@ pub enum DisplayMode {
     AllMonitors,
 }
 
+/// How much visual polish the remote desktop draws, traded against bandwidth. Sent at sign-in,
+/// so a change applies from the next connection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ConnectionSpeed {
+    /// Windows measures the connection and adapts (network auto-detect).
+    #[default]
+    Auto,
+    /// Fast local network: every visual effect on.
+    Lan,
+    /// Fast internet link: no desktop wallpaper.
+    Broadband,
+    /// Slow or metered link: wallpaper, animations, window contents while dragging, cursor
+    /// shadow and desktop composition (transparency) off.
+    Low,
+}
+
+impl ConnectionSpeed {
+    pub const ALL: [Self; 4] = [Self::Auto, Self::Lan, Self::Broadband, Self::Low];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Detect automatically",
+            Self::Lan => "Local network (all effects)",
+            Self::Broadband => "Broadband (no wallpaper)",
+            Self::Low => "Low bandwidth (no effects)",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct DisplaySettings {
@@ -195,6 +224,8 @@ pub struct DisplaySettings {
     pub hardware_decode: bool,
     /// Monitors (connector names such as `DP-1`) used in multi-monitor mode. Empty = all.
     pub monitors: Vec<String>,
+    /// Visual effects vs. bandwidth.
+    pub speed: ConnectionSpeed,
 }
 
 impl Default for DisplaySettings {
@@ -208,6 +239,7 @@ impl Default for DisplaySettings {
             h264: true,
             hardware_decode: true,
             monitors: Vec::new(),
+            speed: ConnectionSpeed::Auto,
         }
     }
 }

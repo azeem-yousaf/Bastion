@@ -19,6 +19,8 @@ connecting to Windows PCs through a **Remote Desktop Gateway**.
 - **Multi-monitor:** full screen across every monitor (or the ones you pick per connection), one
   borderless window per screen. Unplugging a monitor keeps the session on the others; plugging
   one in asks whether to extend the session onto it.
+- **Connection speed** per connection: let Windows detect it, or pick Local network, Broadband
+  (no wallpaper) or Low bandwidth (no wallpaper, animations or transparency) for slow links.
 - **Folder sharing** (off by default), optionally read-only.
 - **Connection quality indicator** in the session bar: a green / amber / red dot with the
   latency; hover for packet loss, frame rate and bandwidth. A notice appears if the connection

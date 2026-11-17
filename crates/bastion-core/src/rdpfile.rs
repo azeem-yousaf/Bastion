@@ -7,7 +7,9 @@
 use anyhow::{Result, bail};
 use ironrdp_propertyset::PropertySet;
 
-use crate::profile::{DEFAULT_GATEWAY_PORT, DEFAULT_RDP_PORT, DisplayMode, GatewaySettings, MAX_DESKTOP_SIZE, Profile};
+use crate::profile::{
+    ConnectionSpeed, DEFAULT_GATEWAY_PORT, DEFAULT_RDP_PORT, DisplayMode, GatewaySettings, MAX_DESKTOP_SIZE, Profile,
+};
 
 const MAX_RDP_FILE_BYTES: usize = 1024 * 1024;
 
@@ -137,6 +139,15 @@ pub fn import(text: &str, fallback_name: &str) -> (Profile, Vec<String>) {
         p.display.dynamic_resolution = v == 1;
     }
 
+    // Connection speed: `connection type` 1 modem, 2 low broadband, 3 satellite, 4 high
+    // broadband, 5 WAN, 6 LAN, 7 auto-detect; `networkautodetect:i:1` means auto-detect too.
+    p.display.speed = match (i("networkautodetect"), i("connection type")) {
+        (Some(1), _) | (_, Some(7)) | (_, None) => ConnectionSpeed::Auto,
+        (_, Some(6)) => ConnectionSpeed::Lan,
+        (_, Some(4 | 5)) => ConnectionSpeed::Broadband,
+        (_, Some(_)) => ConnectionSpeed::Low,
+    };
+
     // Audio: audiomode 0 = play here, 1 = play on remote, 2 = none.
     if let Some(m) = i("audiomode") {
         p.audio.playback = m == 0;
@@ -187,6 +198,21 @@ mod tests {
 full address:s:pc01.corp.local:3390\r\nusername:s:CORP\\alice\r\ngatewayhostname:s:rdg.corp.com\r\n\
 gatewayusagemethod:i:1\r\ngatewaycredentialssource:i:0\r\npromptcredentialonce:i:1\r\naudiomode:i:0\r\n\
 audiocapturemode:i:1\r\nredirectclipboard:i:1\r\ndrivestoredirect:s:*\r\n\r\n";
+
+    #[test]
+    fn imports_connection_speed() {
+        let speed = |extra: &str| import(&format!("full address:s:pc\r\n{extra}"), "x").0.display.speed;
+        assert_eq!(speed(""), ConnectionSpeed::Auto);
+        assert_eq!(speed("connection type:i:7\r\nnetworkautodetect:i:1\r\n"), ConnectionSpeed::Auto);
+        // mstsc writes the last manual choice even while auto-detect is on: auto-detect wins.
+        assert_eq!(speed("connection type:i:2\r\nnetworkautodetect:i:1\r\n"), ConnectionSpeed::Auto);
+        assert_eq!(speed("connection type:i:6\r\nnetworkautodetect:i:0\r\n"), ConnectionSpeed::Lan);
+        assert_eq!(speed("connection type:i:4\r\n"), ConnectionSpeed::Broadband);
+        assert_eq!(speed("connection type:i:5\r\n"), ConnectionSpeed::Broadband);
+        for slow in 1..=3 {
+            assert_eq!(speed(&format!("connection type:i:{slow}\r\n")), ConnectionSpeed::Low);
+        }
+    }
 
     #[test]
     fn imports_typical_file() {
