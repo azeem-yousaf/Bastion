@@ -665,6 +665,22 @@ fn timezone() -> TimezoneInfo {
     TimezoneInfo { bias: -offset_min, ..TimezoneInfo::default() }
 }
 
+/// The graphics pipeline (MS-RDPEGFX) client with our H.264 decoder.
+fn gfx_client(display: &bastion_core::profile::DisplaySettings) -> GraphicsPipelineClient {
+    let decoder = display.h264.then(|| {
+        bastion_video::create_decoder(bastion_video::DecoderOptions {
+            prefer_hardware: display.hardware_decode,
+            // Must be on: every modern pipeline version (V10.x) implies AVC444, which needs the
+            // YUV planes, so without them IronRDP advertises only V8/V8.1 — and Windows 10/11
+            // never uses H.264 in V8.1. It then confirmed V8.1 with AVC off and sent everything
+            // with CPU-decoded codecs (60–90 ms per update while video played). With V10.x
+            // Windows chooses AVC420 or AVC444 itself.
+            yuv420_planes: true,
+        })
+    });
+    GraphicsPipelineClient::new(Box::new(GfxHandler), decoder.flatten())
+}
+
 fn build_connector(
     ctx: &EngineCtx,
     layout: &DesktopLayout,
@@ -680,15 +696,7 @@ fn build_connector(
     // ── Dynamic channels ──
     let mut drdynvc = DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
     let display = p.display.clone();
-    drdynvc = drdynvc.with_dynamic_channel_factory(ironrdp_egfx::CHANNEL_NAME, move || {
-        let decoder = display.h264.then(|| {
-            bastion_video::create_decoder(bastion_video::DecoderOptions {
-                prefer_hardware: display.hardware_decode,
-                yuv420_planes: false,
-            })
-        });
-        GraphicsPipelineClient::new(Box::new(GfxHandler), decoder.flatten())
-    });
+    drdynvc = drdynvc.with_dynamic_channel_factory(ironrdp_egfx::CHANNEL_NAME, move || gfx_client(&display));
 
     let audio_host: Arc<dyn bastion_audio::AudioHost> =
         ctx.params.audio_host.clone().unwrap_or_else(|| Arc::new(bastion_audio::PulseHost));
@@ -1196,5 +1204,39 @@ async fn active_session(
                 other => debug!(output = ?std::mem::discriminant(&other), "Unhandled session output"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ironrdp_dvc::DvcProcessor as _;
+    use ironrdp_egfx::pdu::{CapabilitySet, GfxPdu};
+
+    use super::*;
+
+    fn advertised(display: &bastion_core::profile::DisplaySettings) -> Vec<CapabilitySet> {
+        let mut client = gfx_client(display);
+        let msgs = client.start(1).expect("start");
+        let bytes = ironrdp_core::encode_vec(msgs[0].as_ref()).expect("encode");
+        match ironrdp_core::decode::<GfxPdu>(&bytes).expect("decode") {
+            GfxPdu::CapabilitiesAdvertise(pdu) => pdu.0.iter().filter_map(|c| c.parsed().ok().flatten()).collect(),
+            other => panic!("expected a capabilities advertisement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn h264_advertises_modern_pipeline_versions() {
+        // Windows only uses H.264 with V10.x; offering just V8.1 silently disables it.
+        let display = bastion_core::profile::DisplaySettings { hardware_decode: false, ..Default::default() };
+        let caps = advertised(&display);
+        assert!(matches!(caps.first(), Some(CapabilitySet::V10_7 { .. })), "{caps:?}");
+        assert!(caps.iter().any(|c| matches!(c, CapabilitySet::V8_1 { .. })), "V8.1 kept as fallback: {caps:?}");
+    }
+
+    #[test]
+    fn without_h264_no_avc_is_advertised() {
+        let display = bastion_core::profile::DisplaySettings { h264: false, ..Default::default() };
+        let caps = advertised(&display);
+        assert!(!caps.iter().any(|c| matches!(c, CapabilitySet::V10_7 { .. })), "{caps:?}");
     }
 }

@@ -477,7 +477,10 @@ impl Session {
             self.handle.send(Command::Layout(layout.clone()));
             self.pending_layout = None;
         }
+        let before = self.notices.len();
         self.notices.retain(|(t, _)| t.elapsed() < Duration::from_secs(8));
+        // An expired notice must be painted away (nothing else may trigger a redraw).
+        changed |= self.notices.len() != before;
         if changed {
             self.request_redraw();
         }
@@ -852,6 +855,13 @@ impl Session {
         let mut image_rect = None;
         let ppp = view.gfx.window.scale_factor();
 
+        view.gfx.follow_repaints = show_bar
+            || phase_text.is_some()
+            || disconnected.is_some()
+            || cert.is_some()
+            || !offer.is_empty()
+            || !notices.is_empty()
+            || !grabbed;
         let render = bastion_metrics::UI_RENDER.start();
         bastion_metrics::UI_FRAMES.incr();
         view.gfx.frame(gpu, |ui| {

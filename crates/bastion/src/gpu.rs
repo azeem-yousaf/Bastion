@@ -53,6 +53,10 @@ pub struct WindowGfx {
     pub ctx: egui::Context,
     /// When egui asked to be repainted next (animations, delayed UI updates).
     pub next_repaint: Option<std::time::Instant>,
+    /// Follow egui's own repaint requests. Session windows turn this off while no overlay is
+    /// shown: egui asks for another frame after every frame that had input, which over the
+    /// bare remote desktop meant rendering at the mouse's event rate for nothing.
+    pub follow_repaints: bool,
 }
 
 impl WindowGfx {
@@ -102,7 +106,7 @@ impl WindowGfx {
             None,
             Some(gpu.device.limits().max_texture_dimension_2d as usize),
         );
-        Ok(Self { window, surface, config, renderer, egui, ctx, next_repaint: None })
+        Ok(Self { window, surface, config, renderer, egui, ctx, next_repaint: None, follow_repaints: true })
     }
 
     pub fn resize(&mut self, gpu: &Gpu, width: u32, height: u32) {
@@ -182,7 +186,7 @@ impl WindowGfx {
         gpu.queue.present(frame);
         self.free_textures(&frees);
         self.next_repaint = None;
-        if let Some(v) = full.viewport_output.get(&egui::ViewportId::ROOT) {
+        if let Some(v) = full.viewport_output.get(&egui::ViewportId::ROOT).filter(|_| self.follow_repaints) {
             if v.repaint_delay.is_zero() {
                 self.window.request_redraw();
             } else if v.repaint_delay < std::time::Duration::from_secs(60) {
