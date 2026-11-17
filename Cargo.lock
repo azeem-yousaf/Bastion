@@ -497,6 +497,7 @@ dependencies = [
  "anyhow",
  "bastion-audio",
  "bastion-core",
+ "bastion-metrics",
  "bastion-session",
  "egui",
  "egui-wgpu",
@@ -526,6 +527,7 @@ name = "bastion-audio"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bastion-metrics",
  "ironrdp-pdu",
  "ironrdp-rdpeai",
  "ironrdp-rdpsnd",
@@ -540,6 +542,7 @@ name = "bastion-camera"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bastion-metrics",
  "ironrdp-core",
  "ironrdp-dvc",
  "ironrdp-pdu",
@@ -554,6 +557,7 @@ name = "bastion-clipboard"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bastion-metrics",
  "image",
  "ironrdp-cliprdr",
  "ironrdp-cliprdr-format",
@@ -593,6 +597,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bastion-metrics"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
 name = "bastion-session"
 version = "0.1.0"
 dependencies = [
@@ -602,6 +613,7 @@ dependencies = [
  "bastion-camera",
  "bastion-clipboard",
  "bastion-core",
+ "bastion-metrics",
  "bastion-video",
  "futures-util",
  "gethostname",
@@ -646,6 +658,7 @@ dependencies = [
 name = "bastion-video"
 version = "0.1.0"
 dependencies = [
+ "bastion-metrics",
  "ffmpeg-next",
  "ironrdp-egfx",
  "tracing",

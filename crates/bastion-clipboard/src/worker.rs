@@ -608,6 +608,7 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
         let response = match result {
             Ok(data) => {
                 debug!(format = format.value(), bytes = data.len(), "Sending local clipboard data");
+                bastion_metrics::CLIPBOARD_BYTES.add(data.len() as u64);
                 FormatDataResponse::new_data(data)
             }
             Err(error) => {
@@ -628,7 +629,10 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
             },
             (Some(list), Some(index)) if request.flags.contains(FileContentsFlags::RANGE) => {
                 match list.read_range(index, request.position, request.requested_size.min(MAX_SERVE_CHUNK)) {
-                    Ok(data) => FileContentsResponse::new_data_response(request.stream_id, data),
+                    Ok(data) => {
+                        bastion_metrics::CLIPBOARD_BYTES.add(data.len() as u64);
+                        FileContentsResponse::new_data_response(request.stream_id, data)
+                    }
                     Err(error) => {
                         debug!(%error, index, "Could not read a copied file");
                         FileContentsResponse::new_error(request.stream_id)
@@ -755,6 +759,7 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
     }
 
     fn format_data_response(&mut self, data: Option<Vec<u8>>) {
+        bastion_metrics::CLIPBOARD_BYTES.add(data.as_ref().map_or(0, |d| d.len() as u64));
         let Some(request) = self.in_flight.pop_front() else {
             debug!("Discarding an unsolicited clipboard response");
             return;
@@ -860,6 +865,7 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
     }
 
     fn file_contents_response(&mut self, stream: u32, data: Option<Vec<u8>>) {
+        bastion_metrics::CLIPBOARD_BYTES.add(data.as_ref().map_or(0, |d| d.len() as u64));
         let FileJob::Downloading { download, stream_id } = &mut self.file_job else { return };
         if *stream_id != stream {
             return;

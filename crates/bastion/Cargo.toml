@@ -25,6 +25,7 @@ egui-winit.workspace = true
 egui-wgpu.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+bastion-metrics.workspace = true
 smallvec.workspace = true
 uuid = { version = "1", features = ["v4"] }
 pollster = "0.4"

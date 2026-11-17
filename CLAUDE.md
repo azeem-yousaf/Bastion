@@ -14,6 +14,7 @@ TEST_SERVER_LOG=debug cargo test -p bastion-session --test loopback   # show the
 cargo test -p <crate> <test_name>         # single unit/integration test
 ./install.sh                              # release build + install to ~/.local (desktop file, .rdp MIME); --uninstall
 BASTION_LOG=debug bastion                 # verbose logs (also: BASTION_NO_HWDEC=1 to force software H.264)
+BASTION_METRICS=5 bastion                 # performance summary line every 5 s (default 10, `off` disables)
 cargo run -p bastion --example fullscreen_repro   # Wayland/KWin minimise/restore diagnostic (opens real windows)
 ```
 
@@ -23,6 +24,7 @@ Logs: `~/.local/state/bastion/logs/`; config: `~/.config/bastion/{profiles,known
 
 ## Workspace layout and data flow
 
+- `bastion-metrics` — dependency-free, lock-free counters/histograms (`static`s, one per pipeline stage) recorded on hot paths in every crate; a reporter thread logs one `bastion::metrics` line per interval (nothing when idle, `warn` when a stage crosses its slow threshold). New metrics must be added to the `COUNTERS`/`HISTOGRAMS` lists to be reported. Logging is off-thread and batched (`non_blocking` + `BufWriter`; the worker flushes once per drained batch) — never log per frame/PDU, record a metric instead.
 - `bastion-core` — profiles (`Profile`), TOML storage (0600, atomic writes), keyring secrets (`Secret` zeroizes, redacted Debug), certificate pin store (`TrustStore`), `.rdp` import (UTF-16 decoding), logging with secret redaction.
 - `bastion-session` — the connection engine. `SessionHandle::spawn` runs a dedicated thread + Tokio runtime; the UI talks to it only via `Command` (input, layout, clipboard, cert decision, disconnect) and `Event` (status, pointer, cert prompt, notices, disconnected), plus `SharedFrame` (RGBA framebuffer with a dirty rect and a `needs_present` flag used to coalesce wakeups). `engine.rs` builds the IronRDP `ClientConnector` with all channels, connects (direct TCP or `ironrdp_mstsgu` RD Gateway), does TLS via our own verifier, runs the active-session `select!` loop, and handles auto-reconnect with the server's reconnect cookie.
 - `bastion-video` — FFmpeg `H264Decoder` for `ironrdp-egfx` (NVDEC → VAAPI → software, low-delay, falls back on repeated hw errors). Test fixtures are single-slice x264 streams.
@@ -41,6 +43,7 @@ Logs: `~/.local/state/bastion/logs/`; config: `~/.config/bastion/{profiles,known
 - Windows advertises audio as `WAVE_FORMAT_EXTENSIBLE`; use `bastion_audio::format::normalize`. For the mic, Windows typically opens with a PCM 44.1 kHz stereo *capture* format but an MS-ADPCM 22.05 kHz mono *encode* format — capture must be opened in the encode shape (`rescale_packet` keeps packet duration), and `set_format` must restart capture on rate/channel changes rather than refuse.
 - egui 0.37: enable `default_fonts` + `monochrome_emoji_fonts`; glyphs outside those fonts panic in tests. Texture deltas must be applied even when a frame is skipped. kittest enforces accessible labels (form widgets use `labelled_by`).
 - wgpu must be created with the event loop's `OwnedDisplayHandle`, never a window (it would keep that window alive forever).
+- Monitor hot-plug: winit has no monitor-change event, so `App::watch_monitors` compares `monitors::snapshot` (keyed by connector name, e.g. `DP-1`, which profiles store) on every `about_to_wait` and acts after it is stable for 1.5 s. Sessions re-create their windows (`Session::reconfigure`) and send `Command::Layout` without reconnecting; decisions live in the pure `monitors::plan`. Window creation needs the event loop, so UI actions only set flags applied in `apply_monitor_changes`.
 - Wayland: apps can't un-minimise their own windows, and per-monitor session windows minimise independently; restoring siblings goes through KWin scripting (`kwin::restore_windows`, matched by PID + exact title). winit reports monitor positions as logical position × *integer* scale; mixed-DPI layouts are built with `layout::pack_monitors` (edge-to-edge in pixels).
 - The session bar reveals only at the top-centre edge in fullscreen and only its own rect captures input (`session::bar_on_pointer`); corners belong to the remote desktop.
 - User-facing errors must be friendly and contain no source paths (`friendly_connector_error`, `gateway_error_message`); full detail goes to the log only.

@@ -32,6 +32,8 @@ pub struct FrameState {
     pub dirty: Option<Rect>,
     /// Bumped whenever the size changes (renderer must recreate its texture).
     pub generation: u64,
+    /// When the pending dirty region first became dirty (for frame-latency metrics).
+    pub dirty_since: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -56,6 +58,7 @@ impl SharedFrame {
             st.data = src.to_vec();
             st.generation += 1;
             st.dirty = Some(Rect { x: 0, y: 0, w: src_width, h: src_height });
+            st.dirty_since.get_or_insert_with(std::time::Instant::now);
             return;
         }
         let rect = clamp(rect, src_width, src_height);
@@ -72,6 +75,7 @@ impl SharedFrame {
             Some(d) => d.union(rect),
             None => rect,
         });
+        st.dirty_since.get_or_insert_with(std::time::Instant::now);
     }
 }
 

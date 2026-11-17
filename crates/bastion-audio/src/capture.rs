@@ -150,6 +150,7 @@ impl PulseCapture {
                     continue; // block codec still buffering
                 }
                 (sink.lock().unwrap_or_else(|p| p.into_inner()))(packet);
+                bastion_metrics::MIC_PACKETS.incr();
                 sent += 1;
                 if sent == 1 || sent.is_multiple_of(500) {
                     debug!(packets = sent, "Microphone audio sent");

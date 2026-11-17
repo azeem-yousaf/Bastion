@@ -9,6 +9,7 @@ ironrdp-rdpecam.workspace = true
 ironrdp-dvc.workspace = true
 v4l = "0.14"
 tracing.workspace = true
+bastion-metrics.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]

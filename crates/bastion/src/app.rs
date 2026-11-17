@@ -297,7 +297,12 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         if let Some(live) = self.sessions.iter_mut().find(|l| l.session.owns(id)) {
+            // Redraws are measured as ui.render; this is input/resize/focus handling.
+            let started = (!matches!(event, WindowEvent::RedrawRequested)).then(Instant::now);
             live.session.window_event(gpu, id, &event);
+            if let Some(t) = started {
+                bastion_metrics::UI_EVENT.since(t);
+            }
         }
         self.reap_sessions(event_loop);
     }

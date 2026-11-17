@@ -257,6 +257,13 @@ fn full_session_graphics_keyboard_and_mouse() {
     let pins = trust.lock().unwrap().entries().count();
     assert_eq!(pins, 1);
 
+    // Performance metrics saw the network, PDU processing, screen updates and input latency.
+    let report = bastion_metrics::collect(Duration::from_secs(1)).expect("metrics recorded");
+    println!("metrics: {}", report.line);
+    for part in ["net.rx=", "net.pdus=", "rdp.process[", "frame.updates=", "input.queue[", "input.latency["] {
+        assert!(report.line.contains(part), "missing {part} in {}", report.line);
+    }
+
     // User disconnect is a clean, non-error end.
     h.send(Command::Disconnect);
     let (_, error) = wait_disconnect(&h);

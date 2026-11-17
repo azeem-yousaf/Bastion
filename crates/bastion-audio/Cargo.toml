@@ -12,6 +12,7 @@ ironrdp-pdu.workspace = true
 libpulse-binding.workspace = true
 libpulse-simple-binding.workspace = true
 tracing.workspace = true
+bastion-metrics.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]

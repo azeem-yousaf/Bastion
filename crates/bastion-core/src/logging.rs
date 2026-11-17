@@ -16,7 +16,13 @@ use crate::paths::{AppPaths, ensure_private_dir};
 /// Keep the returned guard alive for the life of the process (flushes on drop).
 pub struct LogGuard {
     _file: tracing_appender::non_blocking::WorkerGuard,
+    _stderr: tracing_appender::non_blocking::WorkerGuard,
 }
+
+/// Lines queued for the log thread before new ones are dropped (never blocks the caller).
+const LOG_QUEUE_LINES: usize = 16_384;
+/// Size of the batch written to disk per flush.
+const LOG_WRITE_BUFFER: usize = 64 * 1024;
 
 const SENSITIVE_KEYS: &[&str] = &["password", "passwd", "pass", "pin", "secret", "gw_pass", "token"];
 
@@ -91,7 +97,18 @@ pub fn init(paths: &AppPaths, level: &str) -> Result<LogGuard> {
         .filename_suffix("log")
         .max_log_files(7)
         .build(&dir)?;
-    let (file_writer, guard) = tracing_appender::non_blocking(RedactingWriter { inner: appender });
+    // Off the calling thread (non_blocking, lossy rather than ever blocking a hot path), and
+    // batched: the background worker drains every queued line and then flushes once, so the
+    // buffer turns a burst of lines into a single write() instead of one per line.
+    let (file_writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(true)
+        .buffered_lines_limit(LOG_QUEUE_LINES)
+        .thread_name("bastion-log")
+        .finish(RedactingWriter { inner: std::io::BufWriter::with_capacity(LOG_WRITE_BUFFER, appender) });
+    let (stderr_writer, stderr_guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(true)
+        .thread_name("bastion-stderr")
+        .finish(RedactingWriter { inner: std::io::stderr() });
 
     // Noisy protocol crates are capped at `warn` unless explicitly requested.
     let directive = std::env::var("BASTION_LOG").unwrap_or_else(|_| {
@@ -102,11 +119,11 @@ pub fn init(paths: &AppPaths, level: &str) -> Result<LogGuard> {
     tracing_subscriber::registry()
         .with(filter)
         .with(fmt::layer().with_writer(file_writer).with_ansi(false).with_target(true))
-        .with(fmt::layer().with_writer(|| RedactingWriter { inner: std::io::stderr() }).with_target(false))
+        .with(fmt::layer().with_writer(stderr_writer).with_target(false))
         .try_init()
         .ok();
 
-    Ok(LogGuard { _file: guard })
+    Ok(LogGuard { _file: guard, _stderr: stderr_guard })
 }
 
 #[cfg(test)]

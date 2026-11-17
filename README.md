@@ -14,7 +14,9 @@ connecting to Windows PCs through a **Remote Desktop Gateway**.
   changed screen regions are uploaded to the GPU.
 - **Dynamic resolution:** resize the window and the remote desktop follows, including HiDPI
   scaling.
-- **Multi-monitor:** full screen across every monitor, one borderless window per screen.
+- **Multi-monitor:** full screen across every monitor (or the ones you pick per connection), one
+  borderless window per screen. Unplugging a monitor keeps the session on the others; plugging
+  one in asks whether to extend the session onto it.
 - **Folder sharing** (off by default), optionally read-only.
 - **Auto-reconnect** after network drops, using the server's reconnect cookie.
 - **.rdp import:** open company `.rdp` files directly, or double-click them in Dolphin.
@@ -85,6 +87,12 @@ Configuration lives in `~/.config/bastion/` (mode 0700): `profiles.toml` and
   *H.264* in the connection's Display settings.
 - **More detail**: run with `BASTION_LOG=debug bastion`, or see the log folder (*Settings →
   Diagnostics → Open folder*).
+- **Slowness**: every 10 s while something is happening, the log gets one `bastion::metrics`
+  line with throughput and timing percentiles for each stage (network, PDU processing, H.264
+  decode, screen upload/render, input latency, audio). It is logged as a warning, naming the
+  stage, when a stage exceeded its "slow" threshold. `BASTION_METRICS=30` changes the interval,
+  `BASTION_METRICS=off` disables it. Metrics cost a few atomic operations per event and write
+  nothing while idle.
 
 ## Development
 

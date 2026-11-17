@@ -110,6 +110,8 @@ pub struct SessionHandle {
     events: std::sync::mpsc::Receiver<Event>,
     pub frame: Arc<SharedFrame>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// When the oldest input not yet picked up by the network thread was queued.
+    input_queued: Arc<bastion_metrics::Stamp>,
 }
 
 impl SessionHandle {
@@ -117,7 +119,15 @@ impl SessionHandle {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ev_tx, ev_rx) = std::sync::mpsc::channel();
         let frame = Arc::new(SharedFrame::default());
-        let ctx = EngineCtx { params, cmd_tx: cmd_tx.clone(), events: ev_tx, waker, frame: frame.clone() };
+        let input_queued = Arc::new(bastion_metrics::Stamp::default());
+        let ctx = EngineCtx {
+            params,
+            cmd_tx: cmd_tx.clone(),
+            events: ev_tx,
+            waker,
+            frame: frame.clone(),
+            input_queued: input_queued.clone(),
+        };
         let thread = std::thread::Builder::new()
             .name("bastion-session".into())
             .spawn(move || {
@@ -131,10 +141,13 @@ impl SessionHandle {
                 rt.block_on(run(ctx, cmd_rx));
             })
             .expect("spawn session thread");
-        Self { cmd: cmd_tx, events: ev_rx, frame, thread: Some(thread) }
+        Self { cmd: cmd_tx, events: ev_rx, frame, thread: Some(thread), input_queued }
     }
 
     pub fn send(&self, cmd: Command) {
+        if matches!(cmd, Command::Input(_)) {
+            self.input_queued.mark();
+        }
         let _ = self.cmd.send(cmd);
     }
 
@@ -166,6 +179,7 @@ struct EngineCtx {
     events: std::sync::mpsc::Sender<Event>,
     waker: Waker,
     frame: Arc<SharedFrame>,
+    input_queued: Arc<bastion_metrics::Stamp>,
 }
 
 impl EngineCtx {
@@ -408,6 +422,8 @@ async fn connect_inner(
         None => ConnectFailure::Error { message, retryable: true },
     };
 
+    let started = std::time::Instant::now();
+    let mut phases = Phases::default();
     // 1. Transport: RD Gateway tunnel or direct TCP.
     let (stream, client_addr): (Erased, SocketAddr) = if let Some(gw) = &p.gateway {
         ctx.emit(Event::Status(Status::ConnectingGateway));
@@ -489,6 +505,7 @@ async fn connect_inner(
         (Box::new(tcp), addr)
     };
 
+    phases.transport = started.elapsed();
     // 2. RDP negotiation, TLS (with our verifier), CredSSP/NLA, capability exchange.
     ctx.emit(Event::Status(Status::Connecting));
     let (mic_tx, mic_rx) = mpsc::unbounded_channel();
@@ -502,7 +519,9 @@ async fn connect_inner(
         error!(error = %format!("{e:#}"), "Connection failed");
         ConnectFailure::Error { message, retryable }
     };
+    let t = std::time::Instant::now();
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await.map_err(err)?;
+    phases.negotiate = t.elapsed();
     let (stream, leftover) = framed.into_inner();
     if !leftover.is_empty() {
         return Err(ConnectFailure::Error {
@@ -518,13 +537,16 @@ async fn connect_inner(
         insecure,
         rejected.clone(),
     ));
+    let t = std::time::Instant::now();
     let (tls, server_key) = crate::tls::upgrade(stream, p.host.trim(), verifier)
         .await
         .map_err(|e| cert_failure(&rejected, format!("TLS handshake with the remote computer failed: {e}")))?;
+    phases.tls = t.elapsed();
     let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
     let mut framed: Framed = ironrdp_tokio::TokioFramed::new(Box::new(tls) as Erased);
 
     ctx.emit(Event::Status(Status::Authenticating));
+    let t = std::time::Instant::now();
     let outcome = ironrdp_tokio::connect_finalize(
         upgraded,
         connector,
@@ -547,8 +569,31 @@ async fn connect_inner(
             });
         }
     };
-    info!(width = result.desktop_size.width, height = result.desktop_size.height, "RDP session established");
+    phases.finalize = t.elapsed();
+    info!(
+        width = result.desktop_size.width,
+        height = result.desktop_size.height,
+        transport_ms = phases.transport.as_millis(),
+        negotiate_ms = phases.negotiate.as_millis(),
+        tls_ms = phases.tls.as_millis(),
+        auth_and_setup_ms = phases.finalize.as_millis(),
+        total_ms = started.elapsed().as_millis(),
+        gateway = p.gateway.is_some(),
+        "RDP session established"
+    );
     Ok((result, framed, Some(mic_rx)))
+}
+
+/// How long each connection phase took (logged once per connection).
+#[derive(Debug, Default)]
+struct Phases {
+    /// TCP connect, or the whole RD Gateway tunnel setup.
+    transport: Duration,
+    /// X.224 security negotiation.
+    negotiate: Duration,
+    tls: Duration,
+    /// CredSSP/NLA sign-in, licensing and capability exchange.
+    finalize: Duration,
 }
 
 fn gateway_error_message(e: &ironrdp_error::Error<ironrdp_mstsgu::GwErrorKind>, endpoint: &str) -> (String, bool) {
@@ -780,7 +825,11 @@ fn publish(ctx: &EngineCtx, image: &DecodedImage, r: &ironrdp_pdu::geometry::Inc
         w: u32::from(r.right.saturating_sub(r.left)) + 1,
         h: u32::from(r.bottom.saturating_sub(r.top)) + 1,
     };
+    let started = std::time::Instant::now();
     ctx.frame.update_from(image.data(), u32::from(image.width()), u32::from(image.height()), rect);
+    bastion_metrics::FRAME_PUBLISH.since(started);
+    bastion_metrics::FRAME_UPDATES.incr();
+    bastion_metrics::FRAME_PIXELS.add(u64::from(rect.w) * u64::from(rect.h));
     if !ctx.frame.needs_present.swap(true, Ordering::AcqRel) {
         (ctx.waker)();
     }
@@ -829,9 +878,12 @@ async fn active_session(
         ($bytes:expr) => {{
             let bytes: Vec<u8> = $bytes;
             if !bytes.is_empty() {
+                let started = std::time::Instant::now();
                 if let Err(e) = writer.write_all(&bytes).await {
                     return SessionEnd::NetworkError(format!("write failed: {e}"));
                 }
+                bastion_metrics::NET_WRITE.since(started);
+                bastion_metrics::NET_TX.add(bytes.len() as u64);
             }
         }};
     }
@@ -844,6 +896,8 @@ async fn active_session(
         };
     }
 
+    // Set while handling an input batch: when its oldest event was queued by the UI.
+    let mut input_since: Option<std::time::Instant> = None;
     loop {
         let outputs = tokio::select! {
             frame = reader.read_pdu() => {
@@ -851,7 +905,12 @@ async fn active_session(
                     Ok(f) => f,
                     Err(e) => return SessionEnd::NetworkError(e.to_string()),
                 };
-                session_try!(stage.process(&mut image, action, &payload, reader.last_read_at()))
+                bastion_metrics::NET_PDUS.incr();
+                bastion_metrics::NET_RX.add(payload.len() as u64);
+                let started = std::time::Instant::now();
+                let out = session_try!(stage.process(&mut image, action, &payload, reader.last_read_at()));
+                bastion_metrics::RDP_PROCESS.since(started);
+                out
             }
             Some((_, msgs)) = async { match mic_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {
                 write_frame!(session_try!(stage.encode_dvc_messages(msgs)));
@@ -861,6 +920,11 @@ async fn active_session(
                 let Some(cmd) = cmd else { return SessionEnd::UserClosed };
                 match cmd {
                     Command::Input(events) => {
+                        bastion_metrics::INPUT_BATCHES.incr();
+                        if let Some(waited) = ctx.input_queued.take() {
+                            bastion_metrics::INPUT_QUEUE.record(waited);
+                            input_since = std::time::Instant::now().checked_sub(waited);
+                        }
                         if let Some(k) = keep_active.as_mut() {
                             k.on_input(&events, tokio::time::Instant::now());
                         }
@@ -1012,6 +1076,10 @@ async fn active_session(
                 ActiveStageOutput::MonitorLayout(m) => debug!(monitors = m.len(), "Server monitor layout"),
                 other => debug!(output = ?std::mem::discriminant(&other), "Unhandled session output"),
             }
+        }
+        if let Some(t) = input_since.take() {
+            // Queued by the UI → encoded → written to the socket.
+            bastion_metrics::INPUT_LATENCY.since(t);
         }
     }
 }

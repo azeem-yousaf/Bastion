@@ -194,6 +194,7 @@ impl FfmpegH264Decoder {
 
     fn fall_back_to_software(&mut self) -> DecoderResult<()> {
         warn!(from = self.ctx.accel.name(), "Hardware H.264 decode failed; switching to software");
+        bastion_metrics::VIDEO_HW_FALLBACKS.incr();
         self.ctx = Context::open(Accel::Software)?;
         Ok(())
     }
@@ -210,7 +211,10 @@ impl FfmpegH264Decoder {
         let payload_len = self.input.len();
         self.input.resize(payload_len + ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize, 0);
 
-        let r = self.send_and_receive(payload_len);
+        let r = bastion_metrics::VIDEO_DECODE.time(|| self.send_and_receive(payload_len));
+        if r.is_ok() {
+            bastion_metrics::VIDEO_FRAMES.incr();
+        }
         match r {
             Err(e) if self.ctx.accel != Accel::Software => {
                 self.hw_failures += 1;
@@ -370,12 +374,12 @@ fn to_yuv420(p: &Planes<'_>) -> DecoderResult<Yuv420Frame> {
 impl H264Decoder for FfmpegH264Decoder {
     fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame> {
         let f = self.decode_raw(data)?;
-        to_rgba(&unsafe { planes(f)? })
+        bastion_metrics::VIDEO_CONVERT.time(|| to_rgba(&unsafe { planes(f)? }))
     }
 
     fn decode_yuv420(&mut self, data: &[u8]) -> DecoderResult<Yuv420Frame> {
         let f = self.decode_raw(data)?;
-        to_yuv420(&unsafe { planes(f)? })
+        bastion_metrics::VIDEO_CONVERT.time(|| to_yuv420(&unsafe { planes(f)? }))
     }
 
     fn supports_yuv420(&self) -> bool {

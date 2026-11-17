@@ -763,6 +763,10 @@ impl Session {
             f.dirty = Some(bastion_session::Rect { x: 0, y: 0, w: f.width, h: f.height });
         }
         let Some(d) = f.dirty.take() else { return };
+        if let Some(t) = f.dirty_since.take() {
+            bastion_metrics::FRAME_LATENCY.since(t);
+        }
+        let started = Instant::now();
         let (tex, _, _) = self.texture.as_ref().expect("texture exists");
         let offset = (u64::from(d.y) * u64::from(f.width) + u64::from(d.x)) * 4;
         gpu.queue.write_texture(
@@ -776,6 +780,8 @@ impl Session {
             wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(f.width * 4), rows_per_image: Some(d.h) },
             wgpu::Extent3d { width: d.w, height: d.h, depth_or_array_layers: 1 },
         );
+        bastion_metrics::UI_UPLOAD.since(started);
+        bastion_metrics::UI_UPLOAD_BYTES.add(u64::from(d.w) * u64::from(d.h) * 4);
     }
 
     fn hide_bars(&mut self) {
@@ -838,6 +844,8 @@ impl Session {
         let mut image_rect = None;
         let ppp = view.gfx.window.scale_factor();
 
+        let render = bastion_metrics::UI_RENDER.start();
+        bastion_metrics::UI_FRAMES.incr();
         view.gfx.frame(gpu, |ui| {
             egui::CentralPanel::no_frame().show(ui, |ui| {
                 let avail = ui.max_rect();
@@ -883,6 +891,7 @@ impl Session {
                 }
             });
         });
+        drop(render);
         view.image_rect = image_rect;
         view.bar_rect = bar_rect;
         view.prompt_rect = prompt_rect;

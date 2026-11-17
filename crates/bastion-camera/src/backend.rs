@@ -43,9 +43,15 @@ struct Delivery {
 impl Delivery {
     fn offer(&mut self, frame: Vec<u8>) {
         let Some(sink) = &self.sink else { return };
+        let len = frame.len() as u64;
         self.pending = match sink.send_sample(STREAM, frame.clone()) {
             SampleDelivery::NotRequested | SampleDelivery::Failed => Some(frame),
-            SampleDelivery::Sent | SampleDelivery::Rejected | SampleDelivery::Stopped => None,
+            SampleDelivery::Sent => {
+                bastion_metrics::CAMERA_FRAMES.incr();
+                bastion_metrics::CAMERA_TX.add(len);
+                None
+            }
+            SampleDelivery::Rejected | SampleDelivery::Stopped => None,
         };
     }
 }

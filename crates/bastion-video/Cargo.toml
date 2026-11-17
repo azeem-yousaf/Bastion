@@ -8,4 +8,5 @@ license.workspace = true
 ironrdp-egfx.workspace = true
 ffmpeg-next.workspace = true
 tracing.workspace = true
+bastion-metrics.workspace = true
 yuv = "0.8"

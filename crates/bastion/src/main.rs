@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
             }
             Some("--help" | "-h") => {
                 println!(
-                    "Bastion {} — secure Remote Desktop client\n\nUsage: bastion [FILE.rdp]\n\nEnvironment:\n  BASTION_LOG=debug   more detailed logs\n  BASTION_NO_HWDEC=1  disable hardware video decoding",
+                    "Bastion {} — secure Remote Desktop client\n\nUsage: bastion [FILE.rdp]\n\nEnvironment:\n  BASTION_LOG=debug   more detailed logs\n  BASTION_NO_HWDEC=1  disable hardware video decoding\n  BASTION_METRICS=30  performance summary every 30 s (default 10; off to disable)",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Ok(());
@@ -32,6 +32,9 @@ fn main() -> anyhow::Result<()> {
     let settings = bastion_core::store::AppSettings::load(&paths);
     let _log = bastion_core::logging::init(&paths, &settings.log_level)?;
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "Bastion starting");
+    if let Some(interval) = bastion_metrics::interval_from_env() {
+        bastion_metrics::start_reporter(interval);
+    }
     bastion_session::tls::install_default_crypto_provider();
     harden_process();
 

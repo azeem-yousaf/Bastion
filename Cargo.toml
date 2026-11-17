@@ -56,6 +56,7 @@ libpulse-binding = "2.30"
 libpulse-simple-binding = "2.29"
 
 bastion-core = { path = "crates/bastion-core" }
+bastion-metrics = { path = "crates/bastion-metrics" }
 bastion-session = { path = "crates/bastion-session" }
 bastion-audio = { path = "crates/bastion-audio" }
 bastion-clipboard = { path = "crates/bastion-clipboard" }

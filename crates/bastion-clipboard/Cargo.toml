@@ -12,6 +12,7 @@ ironrdp-core.workspace = true
 ironrdp-cliprdr-native = "0.9"
 anyhow.workspace = true
 tracing.workspace = true
+bastion-metrics.workspace = true
 # X11 / XWayland fallback when no data-control protocol is available.
 x11rb = { version = "0.13", features = ["xfixes"] }
 # openat()/mkdirat() with O_NOFOLLOW for downloads, O_NOFOLLOW opens for uploads.

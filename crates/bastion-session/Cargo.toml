@@ -37,6 +37,7 @@ x509-cert.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+bastion-metrics.workspace = true
 smallvec.workspace = true
 libc = "0.2"
 ironrdp-error = "0.2"

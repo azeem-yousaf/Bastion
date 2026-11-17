@@ -107,6 +107,7 @@ impl Writer {
             Ok(()) => {}
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 self.queued_samples.fetch_sub(n, Ordering::Relaxed);
+                bastion_metrics::AUDIO_DROPPED.add(n as u64);
                 debug!("Playback queue full; dropping audio chunk");
             }
         }
@@ -153,6 +154,7 @@ impl WriterCtx {
             let queued_now = self.queued.fetch_sub(chunk.len(), Ordering::Relaxed).saturating_sub(chunk.len());
             if queued_now > self.high_water {
                 dropped += chunk.len();
+                bastion_metrics::AUDIO_DROPPED.add(chunk.len() as u64);
                 continue; // catch up: keep audio close to real time
             }
             if dropped > 0 {
@@ -267,10 +269,13 @@ impl RdpsndClientHandler for PulsePlayback {
             return;
         }
         let Some((_, dec)) = self.decoder.as_mut() else { return };
+        bastion_metrics::AUDIO_PACKETS.incr();
         self.scratch.clear();
+        let started = std::time::Instant::now();
         if let Err(e) = dec.decode(&data, &mut self.scratch) {
             debug!(error = %e, "Audio decode error (partial chunk kept)");
         }
+        bastion_metrics::AUDIO_DECODE.since(started);
         if self.gain != (1.0, 1.0) {
             let stereo = format.n_channels == 2;
             for (i, s) in self.scratch.iter_mut().enumerate() {
@@ -279,6 +284,7 @@ impl RdpsndClientHandler for PulsePlayback {
             }
         }
         if let Some(w) = &self.writer {
+            bastion_metrics::AUDIO_BUFFER.record(w.latency());
             w.push(std::mem::take(&mut self.scratch));
         }
     }
