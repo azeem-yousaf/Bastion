@@ -1,0 +1,10 @@
+//! Bastion desktop application (library part, so UI and input logic are testable).
+
+pub mod app;
+pub mod gpu;
+pub mod inhibit;
+pub mod input;
+pub mod manager;
+pub mod session;
+pub mod theme;
+pub mod tray;

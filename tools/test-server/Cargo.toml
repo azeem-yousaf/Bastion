@@ -1,0 +1,20 @@
+[package]
+name = "bastion-test-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Loopback RDP server used only by Bastion's integration tests"
+
+# Separate workspace: ironrdp-server is built on an older IronRDP stack than the client.
+[workspace]
+
+[dependencies]
+ironrdp-server = { version = "0.13", features = ["helper"] }
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+rcgen = "0.13"
+anyhow = "1"
+async-trait = "0.1"
+sha2 = "0.10"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ironrdp-rdpsnd = "0.9"

@@ -1,0 +1,124 @@
+# Bastion
+
+A fast, secure Remote Desktop (RDP) client for Linux, written in Rust. It is built for
+connecting to Windows PCs through a **Remote Desktop Gateway**.
+
+- **Full desktop:** keyboard (scancode-exact, any layout), mouse, smooth and horizontal
+  scrolling, and remote cursors.
+- **Audio both ways:** remote sound plays on your speakers or headset, and your microphone
+  is available in the remote session. Devices are chosen by name (PipeWire/PulseAudio).
+- **Clipboard sync:** text, rich text (HTML), images, and files.
+- **RD Gateway** (HTTPS / WebSocket transport, NTLM/Negotiate) or direct connections.
+- **Efficient graphics:** H.264/AVC via the RDP graphics pipeline, with **hardware
+  decoding** (NVDEC on NVIDIA, VAAPI elsewhere) and automatic software fallback. Only
+  changed screen regions are uploaded to the GPU.
+- **Dynamic resolution:** resize the window and the remote desktop follows, including HiDPI
+  scaling.
+- **Multi-monitor:** full screen across every monitor, one borderless window per screen.
+- **Folder sharing** (off by default), optionally read-only.
+- **Auto-reconnect** after network drops, using the server's reconnect cookie.
+- **.rdp import:** open company `.rdp` files directly, or double-click them in Dolphin.
+- **System shortcuts** (Alt+Tab, Super, Alt+F4) go to the remote PC while it has focus.
+
+## Install
+
+Requirements (Arch/CachyOS): `rust`, `ffmpeg`, `libpulse` (provided by PipeWire), plus a
+desktop keyring such as KWallet or GNOME Keyring.
+
+```bash
+./install.sh            # builds a release binary, installs to ~/.local, registers .rdp files
+./install.sh --uninstall
+```
+
+## Using it
+
+1. Open **Bastion** from the app launcher, or run `bastion` or `bastion work.rdp`.
+2. Click **New connection** (or **Import .rdp file…**), enter the computer name, then tick
+   *Connect through a Remote Desktop Gateway* and enter the gateway host.
+3. Click **Connect** and sign in. Tick *Remember password* to store it in the system keyring.
+
+| Action | How |
+| --- | --- |
+| Release the keyboard / show the session bar | **Ctrl+Alt+Home** |
+| Send Ctrl+Alt+Del | Session bar → *Ctrl+Alt+Del* |
+| Toggle full screen | Session bar → *Full screen* |
+| Recapture the keyboard | Click inside the remote desktop |
+
+In full screen, move the mouse to the top edge to reveal the session bar.
+
+## Security model
+
+- **Certificates are verified.** IronRDP accepts any certificate by default; Bastion does not.
+  - Gateway and host certificates are checked against the system CAs and the hostname.
+  - A self-signed certificate (common on RDP hosts) is shown with its SHA-256 fingerprint for
+    you to approve once (trust on first use), after which it is pinned.
+  - If a pinned certificate changes, Bastion shows a prominent warning and requires explicit
+    confirmation.
+  - The per-connection *Skip certificate verification* switch exists for isolated labs only.
+- **Network Level Authentication (CredSSP)** is always used, so your password is never sent
+  to an unauthenticated server.
+- **Passwords** live only in the OS keyring (Secret Service).
+  - They are never written to Bastion's files.
+  - In memory they are wiped on drop.
+  - They are never logged; logs are additionally scrubbed for secret-looking values.
+- **Process hardening:** core dumps are disabled and the process is non-dumpable, so other
+  processes cannot read its memory.
+- **Folder sharing** is off by default.
+  - Shared folders are sandboxed: no `..`, no following symlinks, and no crossing mount points.
+  - *Read-only* mode refuses every modifying request at the protocol level.
+- **Clipboard file transfers** are size-limited and path-sanitised.
+- **No telemetry:** nothing is ever sent anywhere except to your gateway and PC.
+
+Configuration lives in `~/.config/bastion/` (mode 0700): `profiles.toml` and
+`known_hosts.toml`. Logs are in `~/.local/state/bastion/logs/` (kept for 7 days).
+
+## Troubleshooting
+
+- **"Sign-in failed"**: check the username and domain (`CORP` + `alice`, or `alice@corp.com`).
+  Bastion forgets a remembered password after a failed sign-in.
+- **Gateway HTTP 401/403**: your account isn't allowed through the gateway, or the gateway
+  needs separate credentials. Untick *Use the same credentials…* and enter them.
+- **No sound or microphone**: check the device pickers under *Audio & devices*. On the
+  Windows side, the policy *Allow audio and video playback/recording redirection* must be
+  enabled.
+- **Video glitches**: run with `BASTION_NO_HWDEC=1` to force software decoding, or untick
+  *H.264* in the connection's Display settings.
+- **More detail**: run with `BASTION_LOG=debug bastion`, or see the log folder (*Settings →
+  Diagnostics → Open folder*).
+
+## Development
+
+```bash
+./ci.sh                         # fmt + clippy (deny warnings) + full test suite
+UPDATE_SNAPSHOTS=1 ./ci.sh      # accept intentional UI changes
+TEST_SERVER_LOG=debug cargo test -p bastion-session --test loopback   # see server-side logs
+```
+
+The test suite covers:
+
+- **Unit tests** in every crate: profiles, .rdp import, trust store, log redaction, keyboard
+  mapping, layouts, input translation, audio negotiation, buffering and volume, the mic
+  encoder, read-only policy, and H.264 decoding (with checked-in fixtures, comparing hardware
+  and software output pixel by pixel).
+- **Loopback end-to-end tests:** a real RDP server (`tools/test-server`, TLS + NLA) is
+  started, and Bastion's real engine is checked for:
+  - certificate prompts, pinning, MITM detection and insecure mode;
+  - graphics, keyboard (including extended keys), mouse;
+  - bit-exact audio playback;
+  - wrong-password handling, auto-reconnect, and unreachable hosts.
+- **UI tests** (egui_kittest): real clicks and typing in the manager, validation, import, the
+  credential prompt, and certificate dialogs. These include accessibility checks and pixel
+  snapshot comparisons.
+
+### Architecture
+
+| Crate | Responsibility |
+| --- | --- |
+| `bastion-core` | Profiles, storage, keyring secrets, certificate pins, .rdp import, logging |
+| `bastion-session` | Connection engine (gateway, TLS policy, NLA, session loop, reconnect), keyboard mapping, drive policy |
+| `bastion-video` | FFmpeg H.264 decoder (NVDEC/VAAPI/software) for the RDP graphics pipeline |
+| `bastion-audio` | Native PulseAudio/PipeWire playback and microphone capture |
+| `bastion-clipboard` | Clipboard redirection (Wayland data-control with X11 fallback) |
+| `bastion` | The app: winit + wgpu + egui UI, connection manager, session windows |
+
+The protocol stack is [IronRDP](https://github.com/Devolutions/IronRDP) (pure Rust).

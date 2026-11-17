@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Bastion
+GenericName=Remote Desktop Client
+Comment=Connect to Windows computers over RDP, including through RD Gateway
+Exec=bastion %f
+Icon=bastion
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=RDP;remote;desktop;gateway;mstsc;windows;
+MimeType=application/x-rdp;
+StartupWMClass=bastion
+SingleMainWindow=false

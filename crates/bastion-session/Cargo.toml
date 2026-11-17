@@ -1,0 +1,45 @@
+[package]
+name = "bastion-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bastion-core.workspace = true
+bastion-audio.workspace = true
+bastion-video.workspace = true
+bastion-clipboard.workspace = true
+ironrdp-connector.workspace = true
+ironrdp-session.workspace = true
+ironrdp-tokio.workspace = true
+ironrdp-pdu.workspace = true
+ironrdp-core.workspace = true
+ironrdp-svc.workspace = true
+ironrdp-dvc.workspace = true
+ironrdp-graphics.workspace = true
+ironrdp-input.workspace = true
+ironrdp-egfx.workspace = true
+ironrdp-displaycontrol.workspace = true
+ironrdp-rdpsnd.workspace = true
+ironrdp-rdpeai.workspace = true
+ironrdp-cliprdr.workspace = true
+ironrdp-rdpdr.workspace = true
+ironrdp-rdpdr-native.workspace = true
+ironrdp-mstsgu.workspace = true
+ironrdp-tls.workspace = true
+sspi.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+x509-cert.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+smallvec.workspace = true
+libc = "0.2"
+ironrdp-error = "0.2"
+gethostname = "1"
+
+[dev-dependencies]
+ironrdp-input.workspace = true

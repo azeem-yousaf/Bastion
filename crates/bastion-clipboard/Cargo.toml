@@ -1,0 +1,25 @@
+[package]
+name = "bastion-clipboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ironrdp-cliprdr.workspace = true
+ironrdp-cliprdr-format.workspace = true
+ironrdp-core.workspace = true
+# Only the public `data_control` module (Wayland ext/wlr data-control client) is used.
+ironrdp-cliprdr-native = "0.9"
+anyhow.workspace = true
+tracing.workspace = true
+# X11 / XWayland fallback when no data-control protocol is available.
+x11rb = { version = "0.13", features = ["xfixes"] }
+# openat()/mkdirat() with O_NOFOLLOW for downloads, O_NOFOLLOW opens for uploads.
+rustix = { version = "1", features = ["fs", "process"] }
+tempfile = "3"
+percent-encoding = "2"
+# Decoding local image/jpeg and image/bmp so they can be offered as CF_DIB.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+
+[dev-dependencies]
+ironrdp-svc.workspace = true

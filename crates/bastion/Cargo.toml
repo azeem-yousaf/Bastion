@@ -1,0 +1,41 @@
+[package]
+name = "bastion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bastion — secure, fast Remote Desktop client"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bastion"
+path = "src/main.rs"
+
+[dependencies]
+bastion-core.workspace = true
+bastion-session.workspace = true
+bastion-audio.workspace = true
+ironrdp-input.workspace = true
+ironrdp-pdu.workspace = true
+winit.workspace = true
+wgpu.workspace = true
+egui.workspace = true
+egui-winit.workspace = true
+egui-wgpu.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+smallvec.workspace = true
+uuid = { version = "1", features = ["v4"] }
+pollster = "0.4"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+gethostname = "1"
+libc = "0.2"
+ksni = { version = "0.3", features = ["blocking"] }
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot"] }
+tempfile = "3"

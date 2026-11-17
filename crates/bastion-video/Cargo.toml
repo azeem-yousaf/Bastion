@@ -1,0 +1,11 @@
+[package]
+name = "bastion-video"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ironrdp-egfx.workspace = true
+ffmpeg-next.workspace = true
+tracing.workspace = true
+yuv = "0.8"
