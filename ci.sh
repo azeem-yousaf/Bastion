@@ -19,4 +19,7 @@ cargo build --quiet --manifest-path tools/test-server/Cargo.toml
 step "Tests"
 cargo test --workspace
 
+step "Patched IronRDP crates (vendor/)"
+cargo test --quiet --manifest-path vendor/ironrdp-graphics/Cargo.toml --lib progressive
+
 printf '\n\033[1;32mAll checks passed.\033[0m\n'

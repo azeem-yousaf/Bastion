@@ -36,6 +36,7 @@ Logs: `~/.local/state/bastion/logs/` (today plain, earlier days `.log.gz`, delet
 
 ## Non-obvious constraints (learned the hard way)
 
+- `vendor/ironrdp-graphics` is a patched copy (parallel RemoteFX Progressive decode, 252 → 27 ms per 4K frame) wired in with `[patch.crates-io]`; see `vendor/README.md`. It's excluded from the workspace — `ci.sh` runs its progressive tests via `--manifest-path`. Upgrading IronRDP means re-applying `vendor/ironrdp-graphics.patch`.
 - Keep IronRDP crate versions mutually compatible; `sspi` is pinned `=0.23.0` to match `picky =7.0.0-rc.26`.
 - IronRDP's TLS (gateway and host) accepts any certificate by default. Bastion always uses `tls::PinningVerifier` (WebPKI → user pin → prompt). Rejections surface as `ConnectFailure::Certificate` → `Event::CertificatePrompt`, and the engine retries after the user decides.
 - Windows only starts "Remote Audio" playback if an RDPDR (device redirection) channel exists, so `build_connector` always attaches one (no devices) when audio is enabled.

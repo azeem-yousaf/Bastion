@@ -1,4 +1,5 @@
 target/
 tools/test-server/target/
+vendor/*/target/
 *.png.diff.png
 *.new.png
