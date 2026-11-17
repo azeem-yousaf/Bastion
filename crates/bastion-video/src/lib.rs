@@ -11,6 +11,8 @@
 
 use std::ffi::c_int;
 use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ffmpeg_next::ffi;
 use ironrdp_egfx::decode::{DecodedFrame, DecoderError, DecoderResult, H264Decoder, Yuv420Frame};
@@ -159,11 +161,12 @@ impl Drop for Frame {
 
 pub struct FfmpegH264Decoder {
     ctx: Context,
-    opts: DecoderOptions,
     frame: Frame,
     sw_frame: Frame,
     input: Vec<u8>,
     hw_failures: u32,
+    /// What `supports_yuv420` answers; see [`FfmpegH264Decoder::yuv420_switch`].
+    planes: Arc<AtomicBool>,
 }
 
 // SAFETY: all FFmpeg objects are exclusively owned and only used through `&mut self`.
@@ -173,7 +176,25 @@ impl FfmpegH264Decoder {
     pub fn new(opts: DecoderOptions) -> DecoderResult<Self> {
         let ctx = Self::open_best(opts.prefer_hardware)?;
         info!(accel = ctx.accel.name(), "H.264 decoder ready");
-        Ok(Self { ctx, opts, frame: Frame::new(), sw_frame: Frame::new(), input: Vec::new(), hw_failures: 0 })
+        Ok(Self {
+            ctx,
+            frame: Frame::new(),
+            sw_frame: Frame::new(),
+            input: Vec::new(),
+            hw_failures: 0,
+            planes: Arc::new(AtomicBool::new(opts.yuv420_planes)),
+        })
+    }
+
+    /// Switch for returning YUV planes, which can change after creation.
+    ///
+    /// IronRDP asks `supports_yuv420` both when choosing which pipeline versions to advertise
+    /// (all modern ones imply AVC444, which needs planes) and for every AVC420 frame (planes are
+    /// then converted by IronRDP one pixel at a time — 25–80 ms per frame, versus ~2 ms for our
+    /// SIMD conversion). The session turns planes on for advertising and off once it knows the
+    /// server streams AVC420.
+    pub fn yuv420_switch(&self) -> Arc<AtomicBool> {
+        self.planes.clone()
     }
 
     pub fn accel(&self) -> Accel {
@@ -383,7 +404,7 @@ impl H264Decoder for FfmpegH264Decoder {
     }
 
     fn supports_yuv420(&self) -> bool {
-        self.opts.yuv420_planes
+        self.planes.load(Ordering::Relaxed)
     }
 
     fn reset(&mut self) {

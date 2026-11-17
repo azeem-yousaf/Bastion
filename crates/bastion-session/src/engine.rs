@@ -72,6 +72,9 @@ pub enum Command {
     },
     RefreshScreen,
     Disconnect,
+    /// Internal: restart the graphics pipeline stream (sent by the graphics handler).
+    #[doc(hidden)]
+    ResetGraphics,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -639,11 +642,57 @@ fn gateway_error_message(e: &ironrdp_error::Error<ironrdp_mstsgu::GwErrorKind>, 
 }
 
 #[derive(Debug)]
-struct GfxHandler;
+struct GfxHandler {
+    /// The decoder's YUV-planes switch (`None` without H.264).
+    planes: Option<Arc<AtomicBool>>,
+    /// The server has sent AVC444 in this session: planes stay on.
+    avc444: bool,
+    /// For asking the session loop to reset the graphics stream.
+    cmds: Option<mpsc::UnboundedSender<Command>>,
+}
+
 impl GraphicsPipelineHandler for GfxHandler {
     fn on_capabilities_confirmed(&mut self, caps: &ironrdp_egfx::pdu::CapabilitySet) {
+        use ironrdp_egfx::pdu::CapabilitySet as C;
         // Which graphics mode the server chose decides whether H.264 can be used at all.
         info!(?caps, "Graphics pipeline negotiated");
+        if let Some(planes) = &self.planes {
+            // Planes were needed to advertise V10.x. Windows streams AVC420 unless its "AVC444"
+            // policy is on, and AVC420 is far faster through our own conversion, so turn them
+            // off — but only where a later switch to AVC444 can be recovered with a protocol
+            // reset (V10.3+); otherwise keep the slow-but-always-correct path.
+            let resettable = matches!(
+                caps,
+                C::V10_3 { .. }
+                    | C::V10_4 { .. }
+                    | C::V10_5 { .. }
+                    | C::V10_6 { .. }
+                    | C::V10_6Err { .. }
+                    | C::V10_7 { .. }
+            );
+            let fast = resettable && !self.avc444 && self.cmds.is_some();
+            planes.store(!fast, Ordering::Relaxed);
+            debug!(fast_avc420 = fast, "H.264 conversion path chosen");
+        }
+    }
+
+    fn on_unhandled_pdu(&mut self, pdu: &ironrdp_egfx::pdu::GfxPdu) {
+        use ironrdp_egfx::pdu::{Codec1Type, GfxPdu};
+        // With planes off IronRDP can't decode AVC444 and hands the frame to us instead. That
+        // frame is lost, so switch planes on for the rest of the session and restart the stream.
+        if let GfxPdu::WireToSurface1(w) = pdu
+            && matches!(w.codec_id, Codec1Type::Avc444 | Codec1Type::Avc444v2)
+            && !self.avc444
+        {
+            self.avc444 = true;
+            if let Some(planes) = &self.planes {
+                planes.store(true, Ordering::Relaxed);
+            }
+            info!("Server streams AVC444; switching to YUV planes and resetting the graphics stream");
+            if let Some(c) = &self.cmds {
+                let _ = c.send(Command::ResetGraphics);
+            }
+        }
     }
 
     fn on_reset_graphics(&mut self, width: u32, height: u32) {
@@ -665,10 +714,14 @@ fn timezone() -> TimezoneInfo {
     TimezoneInfo { bias: -offset_min, ..TimezoneInfo::default() }
 }
 
-/// The graphics pipeline (MS-RDPEGFX) client with our H.264 decoder.
-fn gfx_client(display: &bastion_core::profile::DisplaySettings) -> GraphicsPipelineClient {
+/// The graphics pipeline (MS-RDPEGFX) client with our H.264 decoder. `cmds` lets it ask the
+/// session loop for a graphics reset (see [`GfxHandler`]).
+fn gfx_client(
+    display: &bastion_core::profile::DisplaySettings,
+    cmds: Option<mpsc::UnboundedSender<Command>>,
+) -> GraphicsPipelineClient {
     let decoder = display.h264.then(|| {
-        bastion_video::create_decoder(bastion_video::DecoderOptions {
+        bastion_video::FfmpegH264Decoder::new(bastion_video::DecoderOptions {
             prefer_hardware: display.hardware_decode,
             // Must be on: every modern pipeline version (V10.x) implies AVC444, which needs the
             // YUV planes, so without them IronRDP advertises only V8/V8.1 — and Windows 10/11
@@ -677,8 +730,16 @@ fn gfx_client(display: &bastion_core::profile::DisplaySettings) -> GraphicsPipel
             // Windows chooses AVC420 or AVC444 itself.
             yuv420_planes: true,
         })
+        .map_err(|e| warn!(error = %e, "H.264 decoding unavailable"))
+        .ok()
     });
-    GraphicsPipelineClient::new(Box::new(GfxHandler), decoder.flatten())
+    let decoder = decoder.flatten();
+    let planes = decoder.as_ref().map(bastion_video::FfmpegH264Decoder::yuv420_switch);
+    let handler = GfxHandler { planes, avc444: false, cmds };
+    GraphicsPipelineClient::new(
+        Box::new(handler),
+        decoder.map(|d| Box::new(d) as Box<dyn ironrdp_egfx::decode::H264Decoder>),
+    )
 }
 
 fn build_connector(
@@ -696,7 +757,10 @@ fn build_connector(
     // ── Dynamic channels ──
     let mut drdynvc = DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
     let display = p.display.clone();
-    drdynvc = drdynvc.with_dynamic_channel_factory(ironrdp_egfx::CHANNEL_NAME, move || gfx_client(&display));
+    drdynvc = drdynvc.with_dynamic_channel_factory(ironrdp_egfx::CHANNEL_NAME, {
+        let cmds = ctx.cmd_tx.clone();
+        move || gfx_client(&display, Some(cmds.clone()))
+    });
 
     let audio_host: Arc<dyn bastion_audio::AudioHost> =
         ctx.params.audio_host.clone().unwrap_or_else(|| Arc::new(bastion_audio::PulseHost));
@@ -1107,6 +1171,22 @@ async fn active_session(
                         Vec::new()
                     }
                     Command::CertificateDecision { .. } => Vec::new(),
+                    Command::ResetGraphics => {
+                        let reset = stage.get_dvc_mut::<GraphicsPipelineClient>().and_then(|mut gfx| {
+                            let id = gfx.channel_id();
+                            gfx.processor_mut().request_protocol_reset().map(|pdu| (id, pdu))
+                        });
+                        match reset {
+                            Some((id, pdu)) => {
+                                let msgs: Vec<ironrdp_dvc::DvcMessage> = vec![Box::new(pdu)];
+                                let svc = session_try!(ironrdp_dvc::encode_dvc_messages(id, msgs, ironrdp_svc::ChannelFlags::empty()));
+                                write_frame!(session_try!(stage.encode_dvc_messages(svc)));
+                                info!("Requested a graphics stream reset");
+                            }
+                            None => warn!("Graphics stream reset not possible"),
+                        }
+                        Vec::new()
+                    }
                 }
             }
             Some(events) = seen_rx.recv() => {
@@ -1215,7 +1295,7 @@ mod tests {
     use super::*;
 
     fn advertised(display: &bastion_core::profile::DisplaySettings) -> Vec<CapabilitySet> {
-        let mut client = gfx_client(display);
+        let mut client = gfx_client(display, None);
         let msgs = client.start(1).expect("start");
         let bytes = ironrdp_core::encode_vec(msgs[0].as_ref()).expect("encode");
         match ironrdp_core::decode::<GfxPdu>(&bytes).expect("decode") {
@@ -1231,6 +1311,55 @@ mod tests {
         let caps = advertised(&display);
         assert!(matches!(caps.first(), Some(CapabilitySet::V10_7 { .. })), "{caps:?}");
         assert!(caps.iter().any(|c| matches!(c, CapabilitySet::V8_1 { .. })), "V8.1 kept as fallback: {caps:?}");
+    }
+
+    fn handler() -> (GfxHandler, Arc<AtomicBool>, mpsc::UnboundedReceiver<Command>) {
+        let planes = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::unbounded_channel();
+        (GfxHandler { planes: Some(planes.clone()), avc444: false, cmds: Some(tx) }, planes, rx)
+    }
+
+    fn avc444_frame() -> GfxPdu {
+        GfxPdu::WireToSurface1(ironrdp_egfx::pdu::WireToSurface1Pdu {
+            surface_id: 0,
+            codec_id: ironrdp_egfx::pdu::Codec1Type::Avc444,
+            pixel_format: ironrdp_egfx::pdu::PixelFormat::XRgb,
+            destination_rectangle: ironrdp_pdu::geometry::ExclusiveRectangle { left: 0, top: 0, right: 16, bottom: 16 },
+            bitmap_data: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn avc420_takes_the_fast_conversion_once_v10_7_is_confirmed() {
+        let (mut h, planes, _rx) = handler();
+        h.on_capabilities_confirmed(&CapabilitySet::V10_7 {
+            flags: ironrdp_egfx::pdu::CapabilitiesV107Flags::SMALL_CACHE,
+        });
+        assert!(!planes.load(Ordering::Relaxed), "AVC420 must use our SIMD RGBA path");
+    }
+
+    #[test]
+    fn versions_that_cannot_be_reset_keep_planes() {
+        let (mut h, planes, _rx) = handler();
+        h.on_capabilities_confirmed(&CapabilitySet::V10 {
+            flags: ironrdp_egfx::pdu::CapabilitiesV10Flags::SMALL_CACHE,
+        });
+        assert!(planes.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn avc444_switches_planes_back_on_and_resets_the_stream_once() {
+        let (mut h, planes, mut rx) = handler();
+        let v107 = CapabilitySet::V10_7 { flags: ironrdp_egfx::pdu::CapabilitiesV107Flags::SMALL_CACHE };
+        h.on_capabilities_confirmed(&v107);
+        h.on_unhandled_pdu(&avc444_frame());
+        assert!(planes.load(Ordering::Relaxed));
+        assert!(matches!(rx.try_recv(), Ok(Command::ResetGraphics)));
+        // The reset's confirmation must not turn planes off again, nor trigger another reset.
+        h.on_capabilities_confirmed(&v107);
+        h.on_unhandled_pdu(&avc444_frame());
+        assert!(planes.load(Ordering::Relaxed));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

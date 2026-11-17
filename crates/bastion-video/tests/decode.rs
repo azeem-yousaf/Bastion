@@ -132,3 +132,33 @@ fn every_frame_matches_between_software_and_hardware() {
         assert!(max_diff <= 8, "hw/sw output differs by {max_diff}");
     }
 }
+
+/// The session switches between our SIMD conversion (`decode`) and IronRDP's spec conversion
+/// (`decode_yuv420().to_rgba()`) depending on the stream, so both must give the same colours.
+#[test]
+fn fast_rgba_conversion_matches_ironrdp_spec_conversion() {
+    let units = access_units(TESTSRC);
+    let mut fast = software();
+    let mut spec = software();
+    let mut worst = 0u8;
+    for unit in &units {
+        let a = fast.decode(unit).unwrap();
+        let b = spec.decode_yuv420(unit).unwrap().to_rgba();
+        assert_eq!((a.width(), a.height()), (b.width(), b.height()));
+        for (pa, pb) in a.data().as_chunks::<4>().0.iter().zip(b.data().as_chunks::<4>().0) {
+            for c in 0..3 {
+                worst = worst.max(pa[c].abs_diff(pb[c]));
+            }
+        }
+    }
+    assert!(worst <= 3, "colour mismatch up to {worst} levels");
+}
+
+#[test]
+fn yuv420_switch_controls_supports_yuv420() {
+    use ironrdp_egfx::decode::H264Decoder as _;
+    let d = software();
+    assert!(d.supports_yuv420());
+    d.yuv420_switch().store(false, std::sync::atomic::Ordering::Relaxed);
+    assert!(!d.supports_yuv420());
+}
