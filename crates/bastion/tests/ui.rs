@@ -284,12 +284,49 @@ fn disconnect_card_offers_reconnect() {
     assert_eq!(h.state(), &vec![Action::Reconnect]);
 }
 
+fn quality(level: bastion::quality::Level, latency: f32) -> bastion::quality::Quality {
+    bastion::quality::Quality {
+        level,
+        latency_ms: Some(latency),
+        latency_source: Some(bastion::quality::LatencySource::Gateway),
+        jitter_ms: Some(1.5),
+        loss_pct: Some(0.2),
+        fps: 30.0,
+        down_mbps: 12.3,
+        up_mbps: 0.25,
+        capacity_mbps: None,
+        via_gateway: true,
+    }
+}
+
+#[test]
+fn session_bar_shows_connection_details_on_hover() {
+    let mut h = Harness::builder().with_size(egui::vec2(900.0, 360.0)).wgpu().build_ui_state(
+        |ui, actions: &mut Vec<Action>| {
+            bastion::theme::apply(ui.ctx());
+            ui.ctx().global_style_mut(|s| s.interaction.tooltip_delay = 0.0);
+            let q = quality(bastion::quality::Level::Poor, 230.0);
+            let _ = bastion::session::session_bar(ui, "Work PC", Some(&q), true, true, actions);
+        },
+        Vec::new(),
+    );
+    h.run();
+    h.get_by_label("230 ms").hover();
+    h.run();
+    h.get_by_label("Connection: Poor");
+    h.get_by_label("Round trip to the RD Gateway");
+    h.get_by_label("12.3 Mbit/s");
+    h.get_by_label("Through RD Gateway");
+    h.snapshot("session_bar_quality");
+}
+
 #[test]
 fn session_bar_offers_minimise() {
     let mut h = Harness::builder().with_size(egui::vec2(900.0, 120.0)).wgpu().build_ui_state(
         |ui, actions: &mut Vec<Action>| {
             bastion::theme::apply(ui.ctx());
-            let _ = bastion::session::session_bar(ui, "Work PC", true, true, actions);
+            let q = quality(bastion::quality::Level::Good, 12.0);
+            let _ = bastion::session::session_bar(ui, "Work PC", Some(&q), true, true, actions);
         },
         Vec::new(),
     );

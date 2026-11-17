@@ -87,6 +87,9 @@ pub struct Session {
     pending_monitors: Option<Vec<String>>,
     /// Layout after a monitor change, re-sent after a reconnect (which uses the old one).
     rebuilt_layout: Option<DesktopLayout>,
+    /// Connection quality indicator (sampled while connected).
+    quality: crate::quality::Meter,
+    next_quality_sample: Option<Instant>,
 }
 
 /// Which windows a session shows.
@@ -327,6 +330,8 @@ impl Session {
             want_extend: false,
             pending_monitors: None,
             rebuilt_layout: None,
+            quality: crate::quality::Meter::default(),
+            next_quality_sample: None,
         })
     }
 
@@ -451,6 +456,8 @@ impl Session {
                         }
                     };
                     if self.connected() {
+                        self.quality.reset();
+                        self.next_quality_sample = Some(Instant::now());
                         let locks = bastion_session::keyboard::read_lock_state();
                         self.send(self.input.sync_locks(locks));
                         // A reconnect starts with the original layout; restore the monitor
@@ -485,6 +492,7 @@ impl Session {
             self.handle.send(Command::Layout(layout.clone()));
             self.pending_layout = None;
         }
+        changed |= self.sample_quality();
         let before = self.notices.len();
         self.notices.retain(|(t, _)| t.elapsed() < Duration::from_secs(8));
         // An expired notice must be painted away (nothing else may trigger a redraw).
@@ -496,8 +504,39 @@ impl Session {
         changed
     }
 
+    /// Samples the connection about once a second. Returns true when the indicator is visible
+    /// and its figures changed, or a warning was raised.
+    fn sample_quality(&mut self) -> bool {
+        if !self.connected() {
+            self.next_quality_sample = None;
+            return false;
+        }
+        let now = Instant::now();
+        if self.next_quality_sample.is_some_and(|t| now < t) {
+            return false;
+        }
+        self.next_quality_sample = Some(now + crate::quality::SAMPLE_INTERVAL);
+        let update = self.quality.update(now, self.handle.link.sample(&self.handle.frame));
+        if let Some(w) = &update.warning {
+            if let Some(q) = &self.quality.current {
+                tracing::warn!(
+                    latency_ms = ?q.latency_ms,
+                    source = ?q.latency_source,
+                    loss_pct = ?q.loss_pct,
+                    "Poor connection"
+                );
+            }
+            self.notices.push((now, w.clone()));
+        }
+        let visible = self.views.values().any(|v| v.bar != BarState::Hidden);
+        (update.changed && visible) || update.warning.is_some()
+    }
+
     pub fn next_deadline(&mut self) -> Option<Instant> {
         let mut d = self.pending_layout.as_ref().map(|(t, _)| *t + RESIZE_DEBOUNCE);
+        if let Some(t) = self.next_quality_sample {
+            d = Some(d.map_or(t, |x| x.min(t)));
+        }
         for v in self.views.values_mut() {
             if let Some(t) = v.gfx.tick() {
                 d = Some(d.map_or(t, |x| x.min(t)));
@@ -846,6 +885,7 @@ impl Session {
             _ => None,
         };
         let name = self.profile.display_name().to_owned();
+        let quality = self.quality.current.clone();
         let host = self.profile.host.clone();
         let notices: Vec<String> = self.notices.iter().map(|(_, n)| n.clone()).collect();
         let mut cert = self.cert.take();
@@ -905,7 +945,7 @@ impl Session {
                 }
 
                 if show_bar && disconnected.is_none() && phase_text.is_none() {
-                    bar_rect = Some(session_bar(ui, &name, grabbed, fullscreen, &mut actions));
+                    bar_rect = Some(session_bar(ui, &name, quality.as_ref(), grabbed, fullscreen, &mut actions));
                 }
                 if !offer.is_empty() {
                     prompt_rect = Some(monitor_prompt(ui, &offer, &mut actions));
@@ -1139,6 +1179,7 @@ pub fn certificate_dialog(ui: &mut egui::Ui, rej: &CertificateRejection, ack: &m
 pub fn session_bar(
     ui: &mut egui::Ui,
     name: &str,
+    quality: Option<&crate::quality::Quality>,
     grabbed: bool,
     fullscreen: bool,
     actions: &mut Vec<Action>,
@@ -1153,6 +1194,7 @@ pub fn session_bar(
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(name).strong());
+                        quality_chip(ui, quality);
                         ui.separator();
                         if !grabbed {
                             ui.label(egui::RichText::new("Keyboard released").color(theme::WARN));
@@ -1185,6 +1227,58 @@ pub fn session_bar(
         })
         .response
         .rect
+}
+
+/// Coloured dot plus latency; hovering shows the details.
+fn quality_chip(ui: &mut egui::Ui, quality: Option<&crate::quality::Quality>) {
+    use crate::quality::{Level, format_ms};
+    let level = quality.map_or(Level::Unknown, |q| q.level);
+    let color = match level {
+        Level::Good => theme::OK,
+        Level::Fair => theme::WARN,
+        Level::Poor => theme::DANGER,
+        Level::Unknown => theme::MUTED,
+    };
+    let text = quality.map_or_else(|| "— ms".to_owned(), |q| q.chip_text());
+    let inner = ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+        ui.painter().circle_filled(dot.center(), 4.5, color);
+        ui.label(egui::RichText::new(text).color(theme::MUTED));
+    });
+    let response = ui.interact(inner.response.rect, ui.scope_id().with("connection-quality"), egui::Sense::hover());
+    response.on_hover_ui(|ui| {
+        ui.label(egui::RichText::new(format!("Connection: {}", level.label())).strong().color(color));
+        let Some(q) = quality else {
+            ui.label("Measuring the connection…");
+            return;
+        };
+        egui::Grid::new("connection-quality-grid").num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
+            let mut row = |k: &str, v: String| {
+                ui.label(egui::RichText::new(k).color(theme::MUTED));
+                ui.label(v);
+                ui.end_row();
+            };
+            match (q.latency_ms, q.latency_source) {
+                (Some(ms), Some(src)) => {
+                    let jitter = q.jitter_ms.map(|j| format!(" (± {} ms)", format_ms(j))).unwrap_or_default();
+                    row("Latency", format!("{} ms{jitter}", format_ms(ms)));
+                    row("", src.describe().to_owned());
+                }
+                _ => row("Latency", "not available".into()),
+            }
+            if let Some(l) = q.loss_pct {
+                row("Packet loss", format!("{l:.1} %"));
+            }
+            row("Frame rate", format!("{:.0} fps", q.fps));
+            row("Download", format!("{:.1} Mbit/s", q.down_mbps));
+            row("Upload", format!("{:.2} Mbit/s", q.up_mbps));
+            if let Some(c) = q.capacity_mbps {
+                row("Available", format!("{c:.0} Mbit/s (remote computer's estimate)"));
+            }
+            row("Route", if q.via_gateway { "Through RD Gateway" } else { "Direct" }.into());
+        });
+    });
 }
 
 /// Asks whether to extend the session onto newly connected monitors; returns where it was drawn

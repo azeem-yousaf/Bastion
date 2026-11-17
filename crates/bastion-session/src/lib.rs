@@ -8,8 +8,10 @@ pub mod gfx;
 mod keep_active;
 pub mod keyboard;
 pub mod layout;
+pub mod link;
 pub mod tls;
 
 pub use engine::{Command, ConnectParams, Event, PointerEvent, SessionHandle, Status, Waker};
 pub use frame::{Rect, SharedFrame};
 pub use layout::{DesktopLayout, LocalMonitor, MonitorSpec, pack_monitors};
+pub use link::{LinkSample, LinkStats, ServerReport, TcpSample};

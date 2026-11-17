@@ -20,6 +20,9 @@ connecting to Windows PCs through a **Remote Desktop Gateway**.
   borderless window per screen. Unplugging a monitor keeps the session on the others; plugging
   one in asks whether to extend the session onto it.
 - **Folder sharing** (off by default), optionally read-only.
+- **Connection quality indicator** in the session bar: a green / amber / red dot with the
+  latency; hover for packet loss, frame rate and bandwidth. A notice appears if the connection
+  stays poor.
 - **Auto-reconnect** after network drops, using the server's reconnect cookie.
 - **.rdp import:** open company `.rdp` files directly, or double-click them in Dolphin.
 - **System shortcuts** (Alt+Tab, Super, Alt+F4) go to the remote PC while it has focus.

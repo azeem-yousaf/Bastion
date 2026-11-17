@@ -120,6 +120,8 @@ pub struct SessionHandle {
     thread: Option<std::thread::JoinHandle<()>>,
     /// When the oldest input not yet picked up by the network thread was queued.
     input_queued: Arc<bastion_metrics::Stamp>,
+    /// Connection quality measurements (for the UI's indicator).
+    pub link: Arc<crate::link::LinkStats>,
 }
 
 impl SessionHandle {
@@ -129,7 +131,9 @@ impl SessionHandle {
         let frame = Arc::new(SharedFrame::default());
         let input_queued = Arc::new(bastion_metrics::Stamp::default());
         let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let link = Arc::new(crate::link::LinkStats::default());
         let ctx = EngineCtx {
+            link: link.clone(),
             params,
             cmd_tx: cmd_tx.clone(),
             events: ev_tx,
@@ -153,7 +157,7 @@ impl SessionHandle {
                 rt.block_on(run(ctx, cmd_rx));
             })
             .expect("spawn session thread");
-        Self { cmd: cmd_tx, input: input_tx, events: ev_rx, frame, thread: Some(thread), input_queued }
+        Self { cmd: cmd_tx, input: input_tx, events: ev_rx, frame, thread: Some(thread), input_queued, link }
     }
 
     pub fn send(&self, cmd: Command) {
@@ -199,6 +203,7 @@ struct EngineCtx {
     input_queued: Arc<bastion_metrics::Stamp>,
     /// Set once the graphics pipeline owns the shared frame (see `gfx::GfxShared::active`).
     gfx_active: Arc<AtomicBool>,
+    link: Arc<crate::link::LinkStats>,
     input_tx: mpsc::UnboundedSender<InputEvents>,
     /// Owned by the running session's input task (locked for its lifetime).
     input_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<InputEvents>>>,
@@ -503,6 +508,11 @@ async fn connect_inner(
             Ok(Ok(v)) => v,
         };
         info!(%endpoint, "RD Gateway tunnel established");
+        let probe = crate::link::TcpProbe::find_by_local_addr(addr);
+        if probe.is_none() {
+            debug!("Gateway socket not found; latency comes from the remote computer's reports only");
+        }
+        ctx.link.set_connection(probe, true);
         (Box::new(client), addr)
     } else {
         ctx.emit(Event::Status(Status::Connecting));
@@ -523,6 +533,7 @@ async fn connect_inner(
             Ok(Ok(s)) => s,
         };
         let _ = tcp.set_nodelay(true);
+        ctx.link.set_connection(crate::link::TcpProbe::new(std::os::fd::AsFd::as_fd(&tcp)), false);
         let addr = tcp.local_addr().map_err(|e| ConnectFailure::Error { message: e.to_string(), retryable: true })?;
         (Box::new(tcp), addr)
     };
@@ -852,6 +863,7 @@ struct InputTask {
     queued: Arc<bastion_metrics::Stamp>,
     writer: Arc<tokio::sync::Mutex<Writer>>,
     paused: Arc<AtomicBool>,
+    link: Arc<crate::link::LinkStats>,
     /// Copies of the written input for keep-active (only when it is enabled).
     seen: Option<mpsc::UnboundedSender<InputEvents>>,
 }
@@ -902,6 +914,7 @@ async fn input_task(t: InputTask) {
         }
         bastion_metrics::NET_WRITE.since(started);
         bastion_metrics::NET_TX.add(bytes.len() as u64);
+        t.link.add_tx(bytes.len());
         if let Some(t) = since {
             // Queued by the UI → encoded → written to the socket.
             bastion_metrics::INPUT_LATENCY.since(t);
@@ -1007,6 +1020,7 @@ async fn active_session(
         queued: ctx.input_queued.clone(),
         writer: writer.clone(),
         paused: input_paused.clone(),
+        link: ctx.link.clone(),
         seen: keep_active.is_some().then_some(seen_tx),
     })));
     // Only polled when keep-active is enabled; the far-future fallback is never reached.
@@ -1024,6 +1038,7 @@ async fn active_session(
                 }
                 bastion_metrics::NET_WRITE.since(started);
                 bastion_metrics::NET_TX.add(bytes.len() as u64);
+                ctx.link.add_tx(bytes.len());
             }
         }};
     }
@@ -1045,6 +1060,7 @@ async fn active_session(
                 };
                 bastion_metrics::NET_PDUS.incr();
                 bastion_metrics::NET_RX.add(payload.len() as u64);
+                ctx.link.add_rx(payload.len());
                 let started = std::time::Instant::now();
                 let out = session_try!(stage.process(&mut image, action, &payload, reader.last_read_at()));
                 bastion_metrics::RDP_PROCESS.since(started);
@@ -1221,6 +1237,22 @@ async fn active_session(
                     }
                 }
                 ActiveStageOutput::MonitorLayout(m) => debug!(monitors = m.len(), "Server monitor layout"),
+                ActiveStageOutput::AutoDetect(
+                    ironrdp_pdu::rdp::autodetect::AutoDetectRequest::NetworkCharacteristicsResult {
+                        base_rtt_ms,
+                        bandwidth_kbps,
+                        average_rtt_ms,
+                        ..
+                    },
+                ) => {
+                    debug!(average_rtt_ms, ?base_rtt_ms, ?bandwidth_kbps, "Network measured by the remote computer");
+                    ctx.link.set_server_report(crate::link::ServerReport {
+                        at: std::time::Instant::now(),
+                        average_rtt_ms,
+                        base_rtt_ms,
+                        bandwidth_kbps,
+                    });
+                }
                 other => debug!(output = ?std::mem::discriminant(&other), "Unhandled session output"),
             }
         }

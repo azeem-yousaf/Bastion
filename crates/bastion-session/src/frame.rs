@@ -53,6 +53,8 @@ pub struct SharedFrame {
     /// Set by the session when new pixels arrived; cleared by the renderer when it presents.
     /// Used to coalesce wake-ups (at most one pending redraw request at a time).
     pub needs_present: std::sync::atomic::AtomicBool,
+    /// Screen updates written so far (for the frame rate shown by the quality indicator).
+    pub updates: std::sync::atomic::AtomicU64,
 }
 
 /// Adds `r` to the dirty list, merging it with rectangles it overlaps or abuts when the merge
@@ -112,6 +114,7 @@ impl SharedFrame {
         }
         if copied > 0 {
             st.dirty_since.get_or_insert_with(std::time::Instant::now);
+            self.updates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         copied
     }
@@ -131,6 +134,7 @@ impl SharedFrame {
             st.generation += 1;
             st.dirty = vec![Rect { x: 0, y: 0, w: src_width, h: src_height }];
             st.dirty_since.get_or_insert_with(std::time::Instant::now);
+            self.updates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return u64::from(src_width) * u64::from(src_height);
         }
         let stride = src_width as usize * 4;
@@ -150,6 +154,7 @@ impl SharedFrame {
         }
         if copied > 0 {
             st.dirty_since.get_or_insert_with(std::time::Instant::now);
+            self.updates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         copied
     }
@@ -196,6 +201,20 @@ mod tests {
         f.reset(8, 4);
         assert_eq!(f.lock().generation, 1);
         assert_eq!(f.lock().data[(3 * 8 + 6) * 4], 0);
+    }
+
+    #[test]
+    fn updates_are_counted_only_when_pixels_change() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let f = SharedFrame::default();
+        let src = vec![1u8; 4 * 4 * 4];
+        f.update_from(&src, 4, 4, Rect { x: 0, y: 0, w: 1, h: 1 }); // first frame (resize)
+        f.update_from(&src, 4, 4, Rect { x: 1, y: 1, w: 1, h: 1 });
+        f.update_from(&src, 4, 4, Rect { x: 9, y: 9, w: 1, h: 1 }); // entirely outside
+        assert_eq!(f.updates.load(Relaxed), 2);
+        f.apply_regions([(Rect { x: 0, y: 0, w: 1, h: 1 }, &src[..4])]);
+        f.apply_regions(std::iter::empty());
+        assert_eq!(f.updates.load(Relaxed), 3);
     }
 
     #[test]

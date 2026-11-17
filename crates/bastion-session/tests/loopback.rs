@@ -264,6 +264,14 @@ fn full_session_graphics_keyboard_and_mouse() {
         assert!(report.line.contains(part), "missing {part} in {}", report.line);
     }
 
+    // The connection quality indicator has traffic, frames and a kernel round-trip time.
+    let link = h.link.sample(&h.frame);
+    assert!(link.rx_bytes > 10_000 && link.tx_bytes > 0, "{link:?}");
+    assert!(link.frames >= 2, "{link:?}");
+    assert!(!link.via_gateway);
+    let tcp = link.tcp.expect("direct connection has a TCP probe");
+    assert!(tcp.segs_out > 0 && tcp.rtt < Duration::from_millis(100), "{tcp:?}");
+
     // User disconnect is a clean, non-error end.
     h.send(Command::Disconnect);
     let (_, error) = wait_disconnect(&h);
@@ -765,6 +773,11 @@ fn connects_through_rd_gateway_with_cert_pinning_and_auth() {
     h.send(Command::Input(db.apply([Operation::KeyPressed(a), Operation::KeyReleased(a)])));
     wait_until("key through gateway", || server.saw("KEY DOWN 30 false"));
     assert_eq!(trust.lock().unwrap().entries().count(), 2, "gateway and host pinned separately");
+
+    // Latency through a gateway is measured on the socket to the gateway.
+    let link = h.link.sample(&h.frame);
+    assert!(link.via_gateway && link.rx_bytes > 0, "{link:?}");
+    assert!(link.tcp.is_some(), "gateway socket found by its local address: {link:?}");
 }
 
 #[test]
