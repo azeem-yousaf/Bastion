@@ -482,6 +482,7 @@ impl Session {
         // An expired notice must be painted away (nothing else may trigger a redraw).
         changed |= self.notices.len() != before;
         if changed {
+            bastion_metrics::UI_REDRAW_ENGINE.incr();
             self.request_redraw();
         }
         changed
@@ -579,6 +580,7 @@ impl Session {
             || !self.notices.is_empty()
             || !self.grabbed;
         if egui_resp.repaint && (overlay || !matches!(event, WindowEvent::CursorMoved { .. })) {
+            bastion_metrics::UI_REDRAW_INPUT.incr();
             view.gfx.window.request_redraw();
         }
 

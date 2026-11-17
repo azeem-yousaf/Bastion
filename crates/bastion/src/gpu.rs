@@ -149,11 +149,14 @@ impl WindowGfx {
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&gpu.device, &self.config);
+                bastion_metrics::UI_FRAMES_SKIPPED.incr();
+                bastion_metrics::UI_REDRAW_SURFACE.incr();
                 self.window.request_redraw();
                 self.free_textures(&frees);
                 return platform_output;
             }
             other => {
+                bastion_metrics::UI_FRAMES_SKIPPED.incr();
                 tracing::debug!(state = ?std::mem::discriminant(&other), "Skipped frame");
                 self.free_textures(&frees);
                 return platform_output;
@@ -188,6 +191,7 @@ impl WindowGfx {
         self.next_repaint = None;
         if let Some(v) = full.viewport_output.get(&egui::ViewportId::ROOT).filter(|_| self.follow_repaints) {
             if v.repaint_delay.is_zero() {
+                bastion_metrics::UI_REDRAW_EGUI.incr();
                 self.window.request_redraw();
             } else if v.repaint_delay < std::time::Duration::from_secs(60) {
                 self.next_repaint = Some(std::time::Instant::now() + v.repaint_delay);
@@ -209,6 +213,7 @@ impl WindowGfx {
         match self.next_repaint {
             Some(t) if t <= std::time::Instant::now() => {
                 self.next_repaint = None;
+                bastion_metrics::UI_REDRAW_EGUI.incr();
                 self.window.request_redraw();
                 None
             }

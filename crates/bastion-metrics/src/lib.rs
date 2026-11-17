@@ -215,6 +215,14 @@ pub static UI_EVENT: Histogram = Histogram::new("ui.event", 30);
 pub static UI_FRAMES: Counter = Counter::count("ui.frames");
 /// Bytes uploaded to GPU textures.
 pub static UI_UPLOAD_BYTES: Counter = Counter::bytes("ui.upload");
+/// Redraw requests by cause (to find what drives `ui.frames`).
+pub static UI_REDRAW_PIXELS: Counter = Counter::count("ui.redraw.pixels");
+pub static UI_REDRAW_ENGINE: Counter = Counter::count("ui.redraw.engine_event");
+pub static UI_REDRAW_INPUT: Counter = Counter::count("ui.redraw.window_event");
+pub static UI_REDRAW_EGUI: Counter = Counter::count("ui.redraw.egui");
+pub static UI_REDRAW_SURFACE: Counter = Counter::count("ui.redraw.surface_retry");
+/// Frames not presented (surface lost/outdated/timeout).
+pub static UI_FRAMES_SKIPPED: Counter = Counter::count("ui.frames_skipped");
 /// Uploading dirty pixels to the GPU.
 pub static UI_UPLOAD: Histogram = Histogram::new("ui.upload", 10);
 /// Building and presenting one window frame (egui + wgpu + present).
@@ -249,6 +257,12 @@ static COUNTERS: &[&Counter] = &[
     &VIDEO_HW_FALLBACKS,
     &INPUT_BATCHES,
     &UI_FRAMES,
+    &UI_FRAMES_SKIPPED,
+    &UI_REDRAW_PIXELS,
+    &UI_REDRAW_ENGINE,
+    &UI_REDRAW_INPUT,
+    &UI_REDRAW_EGUI,
+    &UI_REDRAW_SURFACE,
     &UI_UPLOAD_BYTES,
     &AUDIO_PACKETS,
     &AUDIO_DROPPED,

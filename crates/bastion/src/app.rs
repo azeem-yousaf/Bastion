@@ -252,6 +252,7 @@ impl ApplicationHandler<UserEvent> for App {
         for live in &mut self.sessions {
             live.session.poll(event_loop);
             if live.session.handle.frame.needs_present.load(std::sync::atomic::Ordering::Acquire) {
+                bastion_metrics::UI_REDRAW_PIXELS.incr();
                 live.session.request_redraw();
             }
         }
