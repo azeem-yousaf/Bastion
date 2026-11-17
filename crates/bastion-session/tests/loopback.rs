@@ -565,7 +565,7 @@ mod gateway {
                     0x08 => {
                         // Channel create: resources are UTF-16 names; record the target host and port.
                         let utf16: Vec<u16> =
-                            payload.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                            payload.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
                         let text = String::from_utf16_lossy(&utf16);
                         log.lock()
                             .unwrap()
@@ -591,10 +591,10 @@ mod gateway {
                     }
                     0x0A => {
                         let n = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-                        if let Some(w) = rdp_write.as_mut() {
-                            if w.write_all(&payload[2..2 + n]).await.is_err() {
-                                return;
-                            }
+                        if let Some(w) = rdp_write.as_mut()
+                            && w.write_all(&payload[2..2 + n]).await.is_err()
+                        {
+                            return;
                         }
                     }
                     other => log.lock().unwrap().push(format!("PACKET {other:#x}")),
