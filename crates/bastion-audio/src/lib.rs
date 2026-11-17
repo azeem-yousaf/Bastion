@@ -7,7 +7,7 @@ pub mod host;
 pub mod playback;
 mod ratelimit;
 
-pub use capture::{CaptureOptions, PulseCapture};
+pub use capture::{CaptureOptions, MicThreads, PulseCapture};
 pub use devices::{AudioDevice, DeviceList, list_devices};
 pub use host::{AudioHost, CaptureDevice, PcmSpec, PlaybackDevice, PulseHost};
 pub use playback::{PlaybackOptions, PulsePlayback};

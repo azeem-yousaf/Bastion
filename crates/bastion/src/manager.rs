@@ -62,8 +62,14 @@ pub fn read_rdp_file(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    // Non-blocking so that opening a FIFO returns at once instead of waiting for a writer; it
-    // has no effect on regular files.
+    // Checked before opening too: opening a device has side effects of its own (a serial port
+    // resets the board on it), and opening a FIFO releases a writer waiting on it.
+    if !std::fs::metadata(path).map_err(|e| anyhow::anyhow!("{}", friendly_io_error(&e)))?.is_file() {
+        anyhow::bail!("it is not a regular file");
+    }
+    // Non-blocking so that opening a FIFO (swapped in after the check) returns at once instead
+    // of waiting for a writer; it has no effect on regular files. The opened file is checked
+    // again below.
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
@@ -152,6 +158,8 @@ pub struct Manager {
     detect_mac: Option<Receiver<Result<bastion_core::wol::MacAddr, String>>>,
     /// egui ids of the credential prompt's password fields as last drawn.
     secret_fields: Vec<egui::Id>,
+    /// A `.rdp` file from a later launch, waiting for the connection being edited to be closed.
+    pending_import: Option<PathBuf>,
 }
 
 impl Manager {
@@ -186,6 +194,7 @@ impl Manager {
             monitors: Vec::new(),
             detect_mac: None,
             secret_fields: Vec::new(),
+            pending_import: None,
         })
     }
 
@@ -223,8 +232,44 @@ impl Manager {
         }
     }
 
+    /// Imports a .rdp file opened while Bastion was already running. Unlike the user's own
+    /// "Import" or "New connection" click, this arrives unasked, so a connection being edited
+    /// with unsaved changes is kept: the file waits until that edit is saved or cancelled.
+    pub fn import_launched(&mut self, path: &std::path::Path) {
+        if !self.draft_has_changes() {
+            self.import_file(path);
+            return;
+        }
+        let file = path.file_name().map_or_else(|| path.display().to_string(), |f| f.to_string_lossy().into_owned());
+        self.banner =
+            Some((format!("{file} will open for import when you save or cancel the connection being edited."), false));
+        self.pending_import = Some(path.to_path_buf());
+    }
+
+    /// Opens a waiting [`Self::import_launched`] file once nothing is being edited.
+    fn apply_pending_import(&mut self) {
+        if self.draft.is_none()
+            && let Some(path) = self.pending_import.take()
+        {
+            self.import_file(&path);
+        }
+    }
+
+    /// A connection is being edited and differs from what is saved (any new one counts).
+    fn draft_has_changes(&self) -> bool {
+        self.draft.as_ref().is_some_and(|d| self.draft_is_new || self.profile(d.id) != Some(d))
+    }
+
+    /// Cancels the credential prompt, if open (e.g. its window was closed). Call
+    /// [`Self::forget_secret_fields`] first, while egui's state of it still exists.
+    pub fn cancel_prompt(&mut self) {
+        self.prompt = None;
+    }
+
     /// Opens the credential prompt (or connects straight away with a stored password).
     pub fn begin_connect(&mut self, id: Uuid) -> Option<ConnectRequest> {
+        // Another Bastion process may have changed this profile (e.g. its security settings).
+        self.reload_profiles();
         let p = self.profile(id)?.clone();
         let needs_gw = p.gateway.as_ref().is_some_and(|g| !g.same_credentials);
         if p.security.remember_password && self.keyring_ok {
@@ -247,6 +292,13 @@ impl Manager {
             _wipe: crate::wipe::WipeScope::begin(),
         });
         None
+    }
+
+    /// Picks up profiles saved by another Bastion process (one `stat` when nothing changed).
+    fn reload_profiles(&mut self) {
+        if let Err(e) = self.store.reload() {
+            tracing::warn!(error = %e, "Could not re-read the saved connections");
+        }
     }
 
     /// egui ids of the credential prompt's password fields, as last drawn (used by tests to
@@ -361,6 +413,8 @@ impl Manager {
     /// Draws the manager. Returns a connection request when the user starts one.
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<ConnectRequest> {
         self.poll_background();
+        self.reload_profiles();
+        self.apply_pending_import();
         let mut request = None;
 
         egui::Panel::left("connections").resizable(true).default_size(270.0).show(ui, |ui| {
@@ -867,7 +921,11 @@ impl Manager {
         let entries: Vec<(String, String, String)> = self
             .trust
             .lock()
-            .map(|t| t.entries().map(|(k, p)| (k.to_owned(), p.sha256.clone(), p.pinned_at.clone())).collect())
+            .map(|mut t| {
+                // Shows pins another Bastion process added or forgot (one `stat` if unchanged).
+                let _ = t.reload();
+                t.entries().map(|(k, p)| (k.to_owned(), p.sha256.clone(), p.pinned_at.clone())).collect()
+            })
             .unwrap_or_default();
         let mut forget = None;
         egui::Grid::new("pins").striped(true).num_columns(3).spacing([16.0, 6.0]).show(ui, |ui| {
@@ -994,9 +1052,24 @@ impl Manager {
         {
             gw.username = prompt.gateway_user.clone();
         }
-        // Persist username/remember choice (never the password itself) on the profile.
+        // Persist username/remember choice (never the password itself) on the profile. Only
+        // these fields: the rest of this copy may be older than what another process saved.
         prompt.profile.security.remember_password = prompt.remember;
-        let _ = self.store.upsert(prompt.profile.clone());
+        let (username, domain, remember) =
+            (prompt.profile.username.clone(), prompt.profile.domain.clone(), prompt.remember);
+        let gateway_user = needs_gw.then(|| prompt.gateway_user.clone());
+        let updated = self.store.update(prompt.profile.id, |p| {
+            p.username.clone_from(&username);
+            p.domain.clone_from(&domain);
+            p.security.remember_password = remember;
+            if let (Some(gw), Some(user)) = (p.gateway.as_mut(), &gateway_user) {
+                gw.username.clone_from(user);
+            }
+        });
+        if let Ok(Some(current)) = updated {
+            // Connect with the settings as saved now.
+            prompt.profile = current;
+        }
         if prompt.remember {
             if let Err(e) = secrets::store(prompt.profile.id, SecretKind::Host, &prompt.password) {
                 self.banner = Some((format!("Password not saved: {e}"), true));
@@ -1016,7 +1089,7 @@ impl Manager {
     /// Clears what egui still holds of the prompt's passwords: per-widget state (cursor, undo
     /// history) and this frame's input events, which carry the typed or pasted text and would
     /// otherwise live until the next frame — after the prompt's wipe scope has ended.
-    fn forget_secret_fields(&self, ctx: &egui::Context) {
+    pub fn forget_secret_fields(&self, ctx: &egui::Context) {
         for id in &self.secret_fields {
             forget_secret_field(ctx, *id);
         }
@@ -1249,6 +1322,76 @@ mod tests {
         assert_eq!(read_rdp_file(dir.path()).unwrap_err().to_string(), "it is not a regular file");
         let missing = read_rdp_file(&dir.path().join("missing.rdp")).unwrap_err().to_string();
         assert_eq!(missing, "the file does not exist");
+    }
+
+    #[test]
+    fn opening_a_non_regular_file_is_avoided_not_just_refused() {
+        // Opening a FIFO for reading releases a writer blocked in open(): an observable side
+        // effect standing in for a device's (a serial port resets the board on it).
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe.rdp");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (fifo, opened) = (fifo.clone(), opened.clone());
+            std::thread::spawn(move || {
+                let f = std::fs::OpenOptions::new().write(true).open(&fifo);
+                opened.store(true, std::sync::atomic::Ordering::SeqCst);
+                f
+            })
+        };
+        let link = dir.path().join("link.rdp");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        // Let the writer reach open() and block there.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(read_rdp_file(&link).unwrap_err().to_string(), "it is not a regular file");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!opened.load(std::sync::atomic::Ordering::SeqCst), "the FIFO was opened");
+        // Release the writer.
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let _reader = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&fifo).unwrap();
+        writer.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_launched_import_does_not_discard_unsaved_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted(dir.path());
+        let mut m = Manager::new(paths, Arc::new(Mutex::new(TrustStore::in_memory())), Arc::new(|| {})).unwrap();
+        let file = dir.path().join("Work PC.rdp");
+        std::fs::write(&file, "full address:s:work-pc\r\n").unwrap();
+
+        // A new connection being typed in: kept, and the file waits.
+        let typed = Profile { host: "half-typed".into(), ..Default::default() };
+        m.draft = Some(typed.clone());
+        m.draft_is_new = true;
+        m.import_launched(&file);
+        assert_eq!(m.draft.as_ref(), Some(&typed));
+        assert!(m.banner.as_ref().unwrap().0.contains("Work PC.rdp"));
+        m.apply_pending_import();
+        assert_eq!(m.draft.as_ref(), Some(&typed));
+        // Cancelled: the waiting file opens.
+        m.draft = None;
+        m.apply_pending_import();
+        assert_eq!(m.draft.as_ref().map(|d| d.host.as_str()), Some("work-pc"));
+        assert!(m.pending_import.is_none());
+
+        // A saved connection opened for editing but unchanged is simply replaced.
+        let saved = Profile { host: "saved".into(), ..Default::default() };
+        m.store.upsert(saved.clone()).unwrap();
+        m.draft = Some(saved.clone());
+        m.draft_is_new = false;
+        m.import_launched(&file);
+        assert_eq!(m.draft.as_ref().map(|d| d.host.as_str()), Some("work-pc"));
+        // ...but kept once changed.
+        let mut changed = saved;
+        changed.host = "edited".into();
+        m.draft = Some(changed.clone());
+        m.draft_is_new = false;
+        m.import_launched(&file);
+        assert_eq!(m.draft.as_ref(), Some(&changed));
     }
 
     #[test]

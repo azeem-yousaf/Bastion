@@ -5,13 +5,15 @@
 use bastion::app;
 
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Context as _;
 use bastion_core::AppPaths;
+use winit::event_loop::EventLoopProxy;
 
 /// Zeroes freed memory while a password prompt is open (see `bastion::wipe`).
 #[global_allocator]
-static ALLOC: bastion::wipe::WipingAllocator = bastion::wipe::WipingAllocator;
+static ALLOC: bastion::wipe::WipingAllocator = bastion::wipe::WipingAllocator::new();
 
 fn main() -> anyhow::Result<()> {
     let mut import = None;
@@ -45,6 +47,22 @@ fn main() -> anyhow::Result<()> {
         },
         None => None,
     };
+    // Serve later launches right away, before the rest of startup: requests queue here and are
+    // handled once the main window is up. A launch that has to wait for a slow start would
+    // otherwise give up and start a second instance.
+    let wake: Arc<OnceLock<EventLoopProxy<app::UserEvent>>> = Arc::default();
+    let launches = primary.map(|primary| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = wake.clone();
+        primary.serve(move |request| {
+            if tx.send(request).is_ok()
+                && let Some(proxy) = wake.get()
+            {
+                let _ = proxy.send_event(app::UserEvent::Launched);
+            }
+        });
+        rx
+    });
 
     let paths = AppPaths::discover()?;
     let settings = bastion_core::store::AppSettings::load(&paths);
@@ -58,16 +76,8 @@ fn main() -> anyhow::Result<()> {
 
     let event_loop =
         winit::event_loop::EventLoop::<app::UserEvent>::with_user_event().build().context("create event loop")?;
-    let launches = primary.map(|primary| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let proxy = event_loop.create_proxy();
-        primary.serve(move |request| {
-            if tx.send(request).is_ok() {
-                let _ = proxy.send_event(app::UserEvent::Launched);
-            }
-        });
-        rx
-    });
+    // Requests that arrived before this are picked up when the main window opens.
+    let _ = wake.set(event_loop.create_proxy());
     let mut app = app::App::new(paths, event_loop.create_proxy(), import, launches)?;
     event_loop.run_app(&mut app).context("event loop")?;
     tracing::info!("Bastion exiting");

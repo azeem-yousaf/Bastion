@@ -17,7 +17,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::time::Duration;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use ironrdp_cliprdr::backend::ClipboardMessage;
@@ -44,8 +44,17 @@ pub(crate) enum Admission {
 #[derive(Debug, Default)]
 pub(crate) struct Shared {
     queued_requests: AtomicUsize,
-    outstanding_bytes: AtomicUsize,
+    account: Mutex<Account>,
     tracked: AtomicBool,
+}
+
+/// Response bytes charged on the current connection and not yet written.
+#[derive(Debug, Default)]
+struct Account {
+    /// Incremented by every reset (new connection). Releases from guards taken on an earlier
+    /// connection are ignored: their bytes were written off by the reset.
+    epoch: u64,
+    outstanding_bytes: usize,
 }
 
 fn saturating_sub(value: &AtomicUsize, n: usize) {
@@ -81,22 +90,35 @@ impl Shared {
         self.queued_requests.load(Ordering::Acquire)
     }
 
-    fn release(&self, bytes: usize) {
+    fn account(&self) -> MutexGuard<'_, Account> {
+        self.account.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn epoch(&self) -> u64 {
+        self.account().epoch
+    }
+
+    fn release(&self, bytes: usize, epoch: u64) {
         self.tracked.store(true, Ordering::Release);
-        saturating_sub(&self.outstanding_bytes, bytes);
+        let mut account = self.account();
+        if account.epoch == epoch {
+            account.outstanding_bytes = account.outstanding_bytes.saturating_sub(bytes);
+        }
     }
 }
 
 /// Handle through which the session reports clipboard responses it has written, so the worker
 /// knows how much response data is still queued.
 ///
-/// Take a guard for every [`ClipboardMessage`] as soon as it is dequeued and keep it until the
-/// resulting frame was written (or the message was discarded):
+/// Take a guard for every [`ClipboardMessage`] when the proxy receives it (on the worker
+/// thread, so the guard belongs to the connection the message was charged against), pass it
+/// along with the message, and drop it once the resulting frame was written (or the message
+/// was discarded):
 ///
 /// ```ignore
-/// Command::Clipboard(msg) => {
-///     let _sent = flow.track(&msg);
-///     // ... encode, write to the socket ...
+/// fn send_clipboard_message(&self, msg: ClipboardMessage) {
+///     let sent = flow.track(&msg);
+///     queue.send(Command::Clipboard(msg, sent));
 /// }
 /// ```
 #[derive(Debug, Clone, Default)]
@@ -112,17 +134,19 @@ impl FlowControl {
         }
     }
 
-    /// Returns a guard that releases `message`'s share of the budget when dropped.
+    /// Returns a guard that releases `message`'s share of the budget when dropped, unless the
+    /// clipboard was reset for a new connection in between.
     #[must_use = "the budget is released when the guard is dropped; hold it until the write finished"]
     pub fn track(&self, message: &ClipboardMessage) -> SentGuard {
         // Mark the budget as tracked even for messages that cost nothing.
         self.0.tracked.store(true, Ordering::Release);
-        SentGuard { shared: Arc::clone(&self.0), bytes: Self::cost(message) }
+        SentGuard { shared: Arc::clone(&self.0), bytes: Self::cost(message), epoch: self.0.epoch() }
     }
 
-    /// Releases `bytes` of the budget directly (for callers that cannot hold a guard).
+    /// Releases `bytes` of the current connection's budget directly (for callers that cannot
+    /// hold a guard).
     pub fn written(&self, bytes: usize) {
-        self.0.release(bytes);
+        self.0.release(bytes, self.0.epoch());
     }
 
     pub(crate) fn shared(&self) -> Arc<Shared> {
@@ -135,11 +159,12 @@ impl FlowControl {
 pub struct SentGuard {
     shared: Arc<Shared>,
     bytes: usize,
+    epoch: u64,
 }
 
 impl Drop for SentGuard {
     fn drop(&mut self) {
-        self.shared.release(self.bytes);
+        self.shared.release(self.bytes, self.epoch);
     }
 }
 
@@ -162,19 +187,24 @@ impl Budget {
     /// Accounts for a response handed to the session.
     pub(crate) fn charge(&self, bytes: usize) {
         if bytes > 0 {
-            self.shared.outstanding_bytes.fetch_add(bytes, Ordering::AcqRel);
+            let mut account = self.shared.account();
+            account.outstanding_bytes = account.outstanding_bytes.saturating_add(bytes);
         }
     }
 
     /// Whether another data response may be produced now.
     pub(crate) fn has_room(&mut self, now: Instant) -> bool {
         self.assume_drain(now);
-        self.shared.outstanding_bytes.load(Ordering::Acquire) < RESPONSE_BUDGET_BYTES
+        self.shared.account().outstanding_bytes < RESPONSE_BUDGET_BYTES
     }
 
-    /// A new connection answers nothing queued on the old one.
+    /// A new connection answers nothing queued on the old one; guards taken for the old
+    /// connection's messages no longer release anything.
     pub(crate) fn reset(&mut self, now: Instant) {
-        self.shared.outstanding_bytes.store(0, Ordering::Release);
+        let mut account = self.shared.account();
+        account.epoch = account.epoch.wrapping_add(1);
+        account.outstanding_bytes = 0;
+        drop(account);
         self.drained_until = now;
     }
 
@@ -187,7 +217,9 @@ impl Budget {
         let millis = usize::try_from(elapsed.as_millis()).unwrap_or(usize::MAX);
         let drained = millis.saturating_mul(UNTRACKED_DRAIN_BYTES_PER_SEC / 1000);
         if drained > 0 {
-            saturating_sub(&self.shared.outstanding_bytes, drained);
+            let mut account = self.shared.account();
+            account.outstanding_bytes = account.outstanding_bytes.saturating_sub(drained);
+            drop(account);
             self.drained_until = now;
         }
     }
@@ -247,6 +279,27 @@ mod tests {
         assert!(budget.has_room(start), "the guard released its message");
         flow.written(usize::MAX);
         assert!(budget.has_room(start), "over-release saturates");
+    }
+
+    #[test]
+    fn guards_from_before_a_reset_do_not_release_the_new_connections_budget() {
+        let flow = FlowControl::default();
+        let start = Instant::now();
+        let mut budget = Budget::new(flow.shared());
+        // The old connection's response is charged and handed over, but still queued.
+        let old = ClipboardMessage::SendFormatData(FormatDataResponse::new_data(vec![0u8; 1024 * 1024]));
+        budget.charge(FlowControl::cost(&old));
+        let old_guard = flow.track(&old);
+        budget.reset(start);
+        // The new connection fills the budget; then the old message finally leaves the queue.
+        budget.charge(RESPONSE_BUDGET_BYTES);
+        assert!(!budget.has_room(start));
+        drop(old_guard);
+        assert!(!budget.has_room(start), "the old connection's guard must not release new charges");
+        // The new connection's own guards still do.
+        let new = ClipboardMessage::SendFormatData(FormatDataResponse::new_data(vec![0u8; 1]));
+        drop(flow.track(&new));
+        assert!(budget.has_room(start));
     }
 
     #[test]

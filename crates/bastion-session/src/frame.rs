@@ -19,20 +19,22 @@ pub struct Rect {
 /// overhead would outweigh the saved bytes).
 pub const MAX_DIRTY_RECTS: usize = 32;
 
-/// Largest frame edge accepted, in pixels. It is the most Bastion ever asks a server for (and
-/// what RDP display control allows); a server announcing more is refused rather than given a
-/// multi-gigabyte buffer or a texture no GPU can create.
-pub const MAX_FRAME_DIM: u32 = 8192;
+/// Limits on the frame size the remote computer chooses (shared with the video decoder): up
+/// to RDP's virtual-desktop side per side, so wide multi-monitor layouts fit, and at most
+/// 8192 × 8192 pixels in area. A server announcing more is refused rather than given a
+/// multi-gigabyte buffer.
+pub use bastion_video::{MAX_DESKTOP_PIXELS, MAX_DESKTOP_SIDE, desktop_size_ok};
 
 /// Regions written per lock in [`SharedFrame::apply_regions`]. The renderer (the one UI thread
 /// for every window) takes the same lock, so a server that produces millions of tiny regions
 /// must not be able to hold it for all of them. Far above what a real frame produces (a full
-/// 8192×8192 RemoteFX Progressive update is 16,384 tiles), so real frames still land atomically.
+/// RemoteFX Progressive update of the largest desktop area, 8192×8192 pixels, is 16,384 tiles),
+/// so real frames still land atomically.
 const REGIONS_PER_LOCK: usize = 32_768;
 
 /// Bytes of a `width`×`height` RGBA frame; `None` if it is larger than Bastion accepts.
 fn frame_len(width: u32, height: u32) -> Option<usize> {
-    if width > MAX_FRAME_DIM || height > MAX_FRAME_DIM {
+    if width != 0 && height != 0 && !desktop_size_ok(width, height) {
         return None;
     }
     (width as usize).checked_mul(height as usize)?.checked_mul(4)
@@ -77,6 +79,10 @@ pub struct SharedFrame {
     /// The session's graphics pipeline threads (see `gfx::Pipelines`): kept here because this
     /// is the one object every graphics channel of a session shares.
     pub(crate) gfx: Mutex<crate::gfx::Pipelines>,
+    /// Tests: refuse every size, as for one beyond the limits. The graphics pipeline allows no
+    /// more than [`desktop_size_ok`] does, so its refusal path cannot be reached otherwise.
+    #[cfg(test)]
+    pub(crate) refuse_resets: std::sync::atomic::AtomicBool,
 }
 
 /// Adds `r` to the dirty list, merging it with rectangles it overlaps or abuts when the merge
@@ -101,9 +107,13 @@ impl SharedFrame {
     /// Sets the frame size announced by the graphics pipeline. A new size clears the frame (the
     /// server repaints after a reset); the same size keeps the pixels.
     ///
-    /// Returns `false`, leaving the frame untouched, for a size beyond [`MAX_FRAME_DIM`]: the
+    /// Returns `false`, leaving the frame untouched, for a size beyond [`desktop_size_ok`]: the
     /// size comes from the server, and nothing is allocated for one no display could have.
     pub fn reset(&self, width: u32, height: u32) -> bool {
+        #[cfg(test)]
+        if self.refuse_resets.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
         let Some(len) = frame_len(width, height) else {
             return false;
         };
@@ -171,7 +181,7 @@ impl SharedFrame {
 
     /// Copies each of `rects` from `src` under one lock. Returns the number of pixels copied.
     ///
-    /// A source larger than [`MAX_FRAME_DIM`], or shorter than its stated size, is ignored
+    /// A source larger than [`desktop_size_ok`] allows, or shorter than its stated size, is ignored
     /// (nothing is copied or allocated).
     pub fn update_rects(&self, src: &[u8], src_width: u32, src_height: u32, rects: &[Rect]) -> u64 {
         let Some(len) = frame_len(src_width, src_height).filter(|&len| src.len() >= len) else {
@@ -255,24 +265,40 @@ mod tests {
     }
 
     #[test]
+    fn wide_multi_monitor_desktops_are_accepted() {
+        // ResetGraphics for three 4K monitors side by side, 4K + 4K + 2560, and three stacked.
+        for (w, h) in [(11_520, 2160), (10_240, 2160), (3840, 6480)] {
+            let f = SharedFrame::default();
+            assert!(f.reset(w, h), "{w}x{h}");
+            assert_eq!(f.lock().data.len(), w as usize * h as usize * 4);
+            let src = vec![0u8; w as usize * h as usize * 4];
+            let f = SharedFrame::default();
+            assert_eq!(f.update_from(&src, w, h, Rect { x: 0, y: 0, w: 1, h: 1 }), u64::from(w) * u64::from(h));
+        }
+    }
+
+    #[test]
     fn sizes_no_display_could_have_are_refused_without_allocating() {
         let f = SharedFrame::default();
         assert!(f.reset(64, 48));
         f.lock().dirty.clear();
-        // What a hostile ResetGraphics can ask for: one edge over the limit, or both (17 GB).
-        for (w, h) in [(MAX_FRAME_DIM + 1, 8), (8, MAX_FRAME_DIM + 1), (32_766, 32_766), (u32::MAX, u32::MAX)] {
+        // What a hostile ResetGraphics can ask for: one edge over the limit, an area over it, or
+        // both (17 GB).
+        for (w, h) in
+            [(MAX_DESKTOP_SIDE + 1, 8), (8, MAX_DESKTOP_SIDE + 1), (8192, 8193), (32_766, 32_766), (u32::MAX, u32::MAX)]
+        {
             assert!(!f.reset(w, h), "{w}x{h}");
         }
         let st = f.lock();
         assert_eq!((st.width, st.height, st.data.len(), st.generation), (64, 48, 64 * 48 * 4, 1));
         assert!(st.dirty.is_empty(), "a refused reset leaves the frame alone");
         drop(st);
-        assert!(f.reset(MAX_FRAME_DIM, 2), "the largest size Bastion requests still works");
+        assert!(f.reset(8192, 8192), "the largest area still works");
 
         // The legacy path sizes the frame from the source image.
         let f = SharedFrame::default();
-        let wide = vec![0u8; (MAX_FRAME_DIM as usize + 1) * 4];
-        assert_eq!(f.update_from(&wide, MAX_FRAME_DIM + 1, 1, Rect { x: 0, y: 0, w: 1, h: 1 }), 0);
+        let wide = vec![0u8; (MAX_DESKTOP_SIDE as usize + 1) * 4];
+        assert_eq!(f.update_from(&wide, MAX_DESKTOP_SIDE + 1, 1, Rect { x: 0, y: 0, w: 1, h: 1 }), 0);
         assert_eq!(f.update_from(&wide, 65_535, 65_535, Rect { x: 0, y: 0, w: 1, h: 1 }), 0);
         // A source shorter than it claims must not be read past its end.
         assert_eq!(f.update_from(&wide[..16], 4, 4, Rect { x: 0, y: 0, w: 4, h: 4 }), 0);

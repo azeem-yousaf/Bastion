@@ -5,7 +5,7 @@
 //! O_EXCL | O_NOFOLLOW)` relative to directory descriptors below a fresh private (0700)
 //! directory, so a hostile file list cannot write outside it or through symlinks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, FileTimes};
 use std::io::Write as _;
 use std::os::fd::OwnedFd;
@@ -16,7 +16,10 @@ use ironrdp_cliprdr::pdu::{ClipboardFileAttributes, FileContentsFlags, FileConte
 use rustix::fs::{Mode, OFlags};
 use tempfile::TempDir;
 
-use super::{DOWNLOAD_PREFIX, Limits, PathRejection, lock_download_dir, sanitize_remote_path};
+use super::{
+    DOWNLOAD_PREFIX, Limits, PathRejection, lock_download_dir, numbered_name, raw_remote_components,
+    sanitize_remote_path,
+};
 
 /// Bytes requested per `FileContentsRequest`.
 pub(crate) const CHUNK_BYTES: u32 = 1024 * 1024;
@@ -157,6 +160,79 @@ impl InodeCount {
     }
 }
 
+/// Gives distinct remote paths distinct local paths. Defusing maps `.x` and `_x` (or names
+/// that differ only in a bidi control) to one name; the later one of such a pair would be
+/// skipped as a duplicate, or (directory vs file) abort the download. Names defusing left
+/// alone are reserved first and keep their names; a renamed entry that collides gets ` (n)`.
+#[derive(Default)]
+struct UniqueNames {
+    /// Per directory (index 0 = download root): remote name -> child node.
+    children: Vec<HashMap<String, usize>>,
+    /// Per directory: local names in use.
+    taken: Vec<HashSet<String>>,
+    /// Per node: its local name.
+    names: Vec<String>,
+    /// Last ` (n)` used per (directory, name), so many clashes on one name stay linear.
+    last_suffix: HashMap<(usize, String), usize>,
+}
+
+impl UniqueNames {
+    fn node(&mut self, parent: usize, raw: &str, local: String) -> usize {
+        let child = self.children.len();
+        self.children.push(HashMap::new());
+        self.taken.push(HashSet::new());
+        self.taken[parent].insert(local.clone());
+        self.children[parent].insert(raw.to_owned(), child);
+        self.names.push(local);
+        child
+    }
+
+    fn root(&mut self) {
+        if self.children.is_empty() {
+            self.children.push(HashMap::new());
+            self.taken.push(HashSet::new());
+            self.names.push(String::new());
+        }
+    }
+
+    /// Reserves the leading components that defusing did not change.
+    fn reserve(&mut self, raw: &[String], local: &[String]) {
+        self.root();
+        let mut node = 0;
+        for (r, l) in raw.iter().zip(local).take_while(|(r, l)| r == l) {
+            node = match self.children[node].get(r) {
+                Some(&child) => child,
+                None => self.node(node, r, l.clone()),
+            };
+        }
+    }
+
+    /// The unique local path for a remote path; `None` if no unique name fits.
+    fn assign(&mut self, raw: &[String], local: &[String]) -> Option<Vec<String>> {
+        self.root();
+        let mut node = 0;
+        let mut out = Vec::with_capacity(local.len());
+        for (r, l) in raw.iter().zip(local) {
+            node = match self.children[node].get(r) {
+                Some(&child) => child,
+                None => {
+                    let mut name = l.clone();
+                    if self.taken[node].contains(&name) {
+                        let n = self.last_suffix.entry((node, l.clone())).or_default();
+                        while self.taken[node].contains(&name) {
+                            *n += 1;
+                            name = numbered_name(l, *n)?;
+                        }
+                    }
+                    self.node(node, r, name)
+                }
+            };
+            out.push(self.names[node].clone());
+        }
+        Some(out)
+    }
+}
+
 fn filetime_to_system(ft: u64) -> Option<std::time::SystemTime> {
     let secs = (ft / 10_000_000).checked_sub(FILETIME_UNIX_OFFSET_SECS)?;
     let nanos = u32::try_from((ft % 10_000_000) * 100).ok()?;
@@ -178,13 +254,22 @@ impl Download {
         let mut declared: u64 = 0;
         let mut inodes = InodeCount::default();
         let mut renamed = 0usize;
+        let mut accepted = Vec::new();
+        let mut names = UniqueNames::default();
         for (index, f) in files.iter().enumerate() {
-            let components = match sanitize_remote_path(f.relative_path.as_deref(), &f.name) {
-                Ok(c) => c,
-                Err(why) => {
-                    log_rejection(why);
-                    continue;
+            match sanitize_remote_path(f.relative_path.as_deref(), &f.name) {
+                Ok(local) => {
+                    let raw = raw_remote_components(f.relative_path.as_deref(), &f.name);
+                    names.reserve(&raw, &local);
+                    accepted.push((index, f, raw, local));
                 }
+                Err(why) => log_rejection(why),
+            }
+        }
+        for (index, f, raw, local) in accepted {
+            let Some(components) = names.assign(&raw, &local) else {
+                tracing::warn!("Skipping a remote file whose name cannot be made unique");
+                continue;
             };
             let is_dir = f.attributes.is_some_and(|a| a.contains(ClipboardFileAttributes::DIRECTORY));
             // Parent directories are created implicitly, so they count too: 10,000 entries with
@@ -609,6 +694,31 @@ mod tests {
             .filter(|n| n.starts_with('.'))
             .collect();
         assert!(hidden.is_empty(), "no hidden entry may be created: {hidden:?}");
+    }
+
+    #[test]
+    fn defused_names_never_collide_with_real_ones() {
+        let base = tempfile::tempdir().expect("tmp");
+        let files = vec![
+            file(".env", None, Some(1)),
+            file("_env", None, Some(1)),
+            file("\u{200E}env", None, Some(1)),
+            // A file `_config`, then a directory `.config` with a file in it.
+            file("_config", None, Some(1)),
+            dir(".config", None),
+            file("x", Some(".config"), Some(1)),
+        ];
+        let contents = vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec(), b"4".to_vec(), vec![], b"5".to_vec()];
+        let mut dl = Download::start(&files, None, base.path(), limits(100)).expect("start");
+        let paths = run(&mut dl, &contents).expect("download");
+        let root = dl.path().to_owned();
+        let names = ["_env (1)", "_env", "_env (2)", "_config", "_config (1)"];
+        assert_eq!(paths, names.iter().map(|n| root.join(n)).collect::<Vec<_>>());
+        assert_eq!(std::fs::read(root.join("_env")).expect("read"), b"2", "the real `_env` keeps its name");
+        assert_eq!(std::fs::read(root.join("_env (1)")).expect("read"), b"1");
+        assert_eq!(std::fs::read(root.join("_env (2)")).expect("read"), b"3");
+        assert_eq!(std::fs::read(root.join("_config")).expect("read"), b"4");
+        assert_eq!(std::fs::read(root.join("_config (1)/x")).expect("read"), b"5");
     }
 
     #[test]

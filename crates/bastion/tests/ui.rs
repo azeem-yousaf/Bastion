@@ -223,6 +223,39 @@ fn prompt_harness(f: &Fixture) -> Harness<'static, Manager> {
     harness(m)
 }
 
+#[test]
+fn credential_prompt_does_not_revert_settings_changed_by_another_process() {
+    let f = fixture();
+    let mut store = ProfileStore::load(&f.paths).unwrap();
+    let mut p = bastion_core::Profile { name: "Lab".into(), host: "lab01".into(), ..Default::default() };
+    p.security.allow_insecure_tls = true;
+    store.upsert(p.clone()).unwrap();
+    let mut m = manager(&f);
+    assert!(m.begin_connect(p.id).is_none());
+    let mut h = harness(m);
+    h.run();
+
+    // While the prompt is open, another Bastion process turns verification back on.
+    p.security.allow_insecure_tls = false;
+    store.upsert(p.clone()).unwrap();
+
+    let user = h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Username");
+    user.focus();
+    user.type_text("bob");
+    h.run();
+    let pw = h.get_by_role_and_label(egui::accesskit::Role::PasswordInput, "Password");
+    pw.focus();
+    pw.type_text("hunter2");
+    h.run();
+    h.get_all_by_label("Connect").last().unwrap().click();
+    h.run();
+    assert!(h.query_by_label("Sign in to Lab").is_none(), "the prompt was submitted");
+    let disk = ProfileStore::load(&f.paths).unwrap();
+    let saved = disk.get(p.id).unwrap();
+    assert_eq!(saved.username, "bob", "the prompt still remembers the username");
+    assert!(!saved.security.allow_insecure_tls, "a stale copy must not switch verification off again");
+}
+
 /// A state no real edit can equal: `has_undo` is then true exactly when any undo point exists.
 fn never_typed() -> (egui::text::CCursorRange, String) {
     (egui::text::CCursorRange::default(), "\u{0}never typed".to_owned())

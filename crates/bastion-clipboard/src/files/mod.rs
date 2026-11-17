@@ -71,10 +71,7 @@ fn defuse_component(component: &str) -> String {
 /// is rejected outright instead of being repaired. Names that are merely deceptive (hidden
 /// files, bidi controls) are kept but renamed, see [`defuse_component`].
 pub(crate) fn sanitize_remote_path(relative: Option<&str>, name: &str) -> Result<Vec<String>, PathRejection> {
-    let joined = match relative {
-        Some(r) if !r.is_empty() => format!("{r}\\{name}"),
-        _ => name.to_owned(),
-    };
+    let joined = remote_joined(relative, name);
     if joined.is_empty() {
         return Err(PathRejection::Empty);
     }
@@ -115,6 +112,29 @@ pub(crate) fn sanitize_remote_path(relative: Option<&str>, name: &str) -> Result
         }
     }
     Ok(out)
+}
+
+fn remote_joined(relative: Option<&str>, name: &str) -> String {
+    match relative {
+        Some(r) if !r.is_empty() => format!("{r}\\{name}"),
+        _ => name.to_owned(),
+    }
+}
+
+/// The remote path's components as sent (before [`defuse_component`]); for a path that
+/// [`sanitize_remote_path`] accepted they correspond one to one with its result.
+pub(crate) fn raw_remote_components(relative: Option<&str>, name: &str) -> Vec<String> {
+    remote_joined(relative, name).split(['\\', '/']).map(str::to_owned).collect()
+}
+
+/// `name` with ` (n)` before its extension: `_x (1)`, `report (2).pdf`. `None` if too long.
+pub(crate) fn numbered_name(name: &str, n: usize) -> Option<String> {
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot) if dot > 0 => name.split_at(dot),
+        _ => (name, ""),
+    };
+    let out = format!("{stem} ({n}){ext}");
+    (out.len() <= MAX_COMPONENT_BYTES).then_some(out)
 }
 
 pub(crate) const DOWNLOAD_PREFIX: &str = "paste-";

@@ -70,6 +70,10 @@ pub struct TrustStore {
     /// Contents re-read by [`TrustStore::check`] (which only has `&self`) after another
     /// process changed the file, with the stamp they belong to.
     fresh: Mutex<Option<(Option<FileStamp>, TrustFile)>>,
+    /// Decisions the user made in this process that could not be written (`None` = forgotten).
+    /// They are honoured here regardless of the file, so the user is not asked again and again;
+    /// pins merely remembered from an earlier read still fail closed.
+    unsaved: BTreeMap<String, Option<Pin>>,
 }
 
 /// A missing file is an empty store; an unreadable or malformed one is an error.
@@ -86,6 +90,17 @@ fn status(hosts: &BTreeMap<String, Pin>, key: &str, cert_der: &[u8]) -> TrustSta
         None => TrustStatus::Unknown,
         Some(pin) if pin.sha256 == fingerprint_sha256(cert_der) => TrustStatus::Pinned,
         Some(pin) => TrustStatus::Mismatch { pinned: pin.sha256.clone() },
+    }
+}
+
+fn apply(hosts: &mut BTreeMap<String, Pin>, key: &str, decision: Option<Pin>) {
+    match decision {
+        Some(pin) => {
+            hosts.insert(key.to_owned(), pin);
+        }
+        None => {
+            hosts.remove(key);
+        }
     }
 }
 
@@ -112,11 +127,11 @@ impl TrustStore {
         // next check simply re-reads.
         let stamp = file_stamp(&path);
         let file = read_trust_file(&path)?;
-        Ok(Self { path: Some(path), file, stamp, fresh: Mutex::new(None) })
+        Ok(Self { path: Some(path), file, stamp, fresh: Mutex::new(None), unsaved: BTreeMap::new() })
     }
 
     pub fn in_memory() -> Self {
-        Self { path: None, file: TrustFile::default(), stamp: None, fresh: Mutex::new(None) }
+        Self { path: None, file: TrustFile::default(), stamp: None, fresh: Mutex::new(None), unsaved: BTreeMap::new() }
     }
 
     /// Compares a certificate with the pin for an endpoint, as currently stored on disk: a pin
@@ -124,6 +139,13 @@ impl TrustStore {
     /// honoured.
     pub fn check(&self, kind: EndpointKind, endpoint: &str, cert_der: &[u8]) -> TrustStatus {
         let key = key(kind, endpoint);
+        if let Some(decision) = self.unsaved.get(&key) {
+            return match decision {
+                None => TrustStatus::Unknown,
+                Some(pin) if pin.sha256 == fingerprint_sha256(cert_der) => TrustStatus::Pinned,
+                Some(pin) => TrustStatus::Mismatch { pinned: pin.sha256.clone() },
+            };
+        }
         let Some(path) = &self.path else { return status(&self.file.hosts, &key, cert_der) };
         let now = file_stamp(path);
         if now == self.stamp {
@@ -150,16 +172,11 @@ impl TrustStore {
             time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default();
         let key = key(kind, endpoint);
         let pin = Pin { sha256: fingerprint_sha256(cert_der), pinned_at: now };
-        self.mutate(|hosts| {
-            hosts.insert(key.clone(), pin.clone());
-        })
+        self.mutate(key, Some(pin))
     }
 
     pub fn forget(&mut self, kind: EndpointKind, endpoint: &str) -> Result<()> {
-        let key = key(kind, endpoint);
-        self.mutate(|hosts| {
-            hosts.remove(&key);
-        })
+        self.mutate(key(kind, endpoint), None)
     }
 
     /// Pins as of the last load, change or [`TrustStore::reload`] in this process.
@@ -174,6 +191,9 @@ impl TrustStore {
         if stamp != self.stamp {
             self.file = read_trust_file(path)?;
             self.stamp = stamp;
+            for (key, decision) in &self.unsaved {
+                apply(&mut self.file.hosts, key, decision.clone());
+            }
             *self.fresh.get_mut().unwrap_or_else(PoisonError::into_inner) = None;
         }
         Ok(())
@@ -181,15 +201,15 @@ impl TrustStore {
 
     /// Applies one change on top of what is on disk *now* (not this process's possibly stale
     /// copy) and writes it back, all under the lock shared with other Bastion processes.
-    fn mutate(&mut self, change: impl Fn(&mut BTreeMap<String, Pin>)) -> Result<()> {
+    fn mutate(&mut self, key: String, decision: Option<Pin>) -> Result<()> {
         let Some(path) = self.path.clone() else {
-            change(&mut self.file.hosts);
+            apply(&mut self.file.hosts, &key, decision);
             return Ok(());
         };
         let written = (|| {
             let _lock = lock_exclusive(&path)?;
             let mut file = read_trust_file(&path)?;
-            change(&mut file.hosts);
+            apply(&mut file.hosts, &key, decision.clone());
             write_private_atomic(&path, toml::to_string_pretty(&file)?.as_bytes())?;
             Ok::<_, anyhow::Error>((file, file_stamp(&path)))
         })();
@@ -198,12 +218,15 @@ impl TrustStore {
                 self.file = file;
                 self.stamp = stamp;
                 *self.fresh.get_mut().unwrap_or_else(PoisonError::into_inner) = None;
+                // Now on disk, so later changes made elsewhere apply to it again.
+                self.unsaved.remove(&key);
                 Ok(())
             }
             Err(e) => {
-                // Nothing was written. The decision still holds for this process (as before),
-                // so a read-only config directory does not turn into an endless prompt.
-                change(&mut self.file.hosts);
+                // Nothing was written. The decision still holds for this process, even while
+                // `check` fails closed on an unreadable file, so the user is not asked again.
+                apply(&mut self.file.hosts, &key, decision.clone());
+                self.unsaved.insert(key, decision);
                 Err(e)
             }
         }
@@ -300,5 +323,28 @@ mod tests {
         assert_eq!(stale.check(EndpointKind::Rdp, "pc01:3389", b"pc01"), TrustStatus::Unknown);
         assert!(stale.pin(EndpointKind::Rdp, "pc03:3389", b"pc03").is_err());
         assert_eq!(std::fs::read_to_string(paths.trust_file()).unwrap(), "hosts = not toml");
+    }
+
+    #[test]
+    fn decision_that_cannot_be_saved_is_still_honoured() {
+        let (_dir, paths, mut stale, _other) = two_processes();
+        std::fs::write(paths.trust_file(), "hosts = not toml").unwrap();
+        // The user approves a certificate while the file is broken: no endless prompt.
+        assert_eq!(stale.check(EndpointKind::Rdp, "pc03:3389", b"pc03"), TrustStatus::Unknown);
+        assert!(stale.pin(EndpointKind::Rdp, "pc03:3389", b"pc03").is_err());
+        assert_eq!(stale.check(EndpointKind::Rdp, "pc03:3389", b"pc03"), TrustStatus::Pinned);
+        assert!(matches!(stale.check(EndpointKind::Rdp, "pc03:3389", b"other"), TrustStatus::Mismatch { .. }));
+        // A forget made now holds too, while pins only remembered from before still fail closed.
+        assert!(stale.forget(EndpointKind::Gateway, "rdg.corp.com:443").is_err());
+        assert_eq!(stale.check(EndpointKind::Gateway, "rdg.corp.com:443", b"compromised"), TrustStatus::Unknown);
+        assert_eq!(stale.check(EndpointKind::Rdp, "pc01:3389", b"pc01"), TrustStatus::Unknown);
+
+        // Once the file is fixed, the next change writes it and disk is the source of truth again.
+        std::fs::remove_file(paths.trust_file()).unwrap();
+        stale.pin(EndpointKind::Rdp, "pc03:3389", b"pc03").unwrap();
+        assert_eq!(stale.check(EndpointKind::Rdp, "pc03:3389", b"pc03"), TrustStatus::Pinned);
+        let mut other = TrustStore::load(&paths).unwrap();
+        other.forget(EndpointKind::Rdp, "pc03:3389").unwrap();
+        assert_eq!(stale.check(EndpointKind::Rdp, "pc03:3389", b"pc03"), TrustStatus::Unknown);
     }
 }

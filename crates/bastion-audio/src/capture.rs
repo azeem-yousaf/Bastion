@@ -42,8 +42,8 @@ const READ_SLICE: Duration = Duration::from_millis(20);
 /// finished by then (a sound server that stopped delivering audio) is detached: it exits on its
 /// own as soon as its read returns, and never delivers another packet.
 const JOIN_TIMEOUT: Duration = Duration::from_millis(400);
-/// Capture threads of one microphone channel that may be alive at once, counting detached ones
-/// still stuck in a read. Further Opens are refused until they exit.
+/// Capture threads that may be alive at once per [`MicThreads`] (one per session), counting
+/// detached ones still stuck in a read. Further Opens are refused until they exit.
 const MAX_LIVE_THREADS: usize = 3;
 /// Server format lists are logged (at debug) only up to this many entries.
 const MAX_LOGGED_FORMATS: usize = 16;
@@ -92,9 +92,16 @@ pub struct PulseCapture {
     running: Option<Running>,
     /// Kept so capture can be restarted when the server changes format mid-stream.
     sink: Option<SharedSink>,
-    /// Capture threads of this channel still alive (including detached ones).
-    live_threads: Arc<AtomicUsize>,
+    /// Capture threads still alive (including detached ones), shared by every channel instance
+    /// of a session.
+    live_threads: MicThreads,
 }
+
+/// Counts a session's live microphone capture threads. The server can close and reopen the
+/// microphone channel at will, and each reopen builds a new [`PulseCapture`]; sharing one
+/// counter between them keeps the [`MAX_LIVE_THREADS`] limit from being reset that way.
+#[derive(Clone, Default, Debug)]
+pub struct MicThreads(Arc<AtomicUsize>);
 
 /// Converts a packet size between PCM shapes, preserving its duration. `None` when either shape
 /// is degenerate (zero rate or channels) or the result would exceed [`MAX_PACKET_BYTES`].
@@ -173,7 +180,13 @@ impl PulseCapture {
             pcm_format(1, 16_000, 16),
             pcm_format(1, 8_000, 16),
         ];
-        Self { host, opts, formats, running: None, sink: None, live_threads: Arc::default() }
+        Self { host, opts, formats, running: None, sink: None, live_threads: MicThreads::default() }
+    }
+
+    /// Like [`Self::with_host`], counting capture threads in `threads` (shared across channel
+    /// instances of one session).
+    pub fn with_host_and_threads(host: Arc<dyn AudioHost>, opts: CaptureOptions, threads: MicThreads) -> Self {
+        Self { live_threads: threads, ..Self::with_host(host, opts) }
     }
 
     fn encoder_for(encode: &AudioFormat) -> Result<Option<AudioEncoder>, String> {
@@ -189,7 +202,7 @@ impl PulseCapture {
             bastion_metrics::AUDIO_REJECTED.incr();
             return OpenReplyPdu::E_FAIL;
         }
-        if self.live_threads.load(Ordering::Relaxed) >= MAX_LIVE_THREADS {
+        if self.live_threads.0.load(Ordering::Relaxed) >= MAX_LIVE_THREADS {
             bastion_metrics::AUDIO_REJECTED.incr();
             gated!(warn, "Microphone is still busy stopping; refusing to open it again");
             return OpenReplyPdu::E_FAIL;
@@ -202,8 +215,8 @@ impl PulseCapture {
         let device = self.opts.device.clone();
         let (stop2, enc2) = (stop.clone(), encoder.clone());
         let slice = read_slice_bytes(spec, packet_size);
-        self.live_threads.fetch_add(1, Ordering::Relaxed);
-        let live = LiveGuard(self.live_threads.clone());
+        self.live_threads.0.fetch_add(1, Ordering::Relaxed);
+        let live = LiveGuard(self.live_threads.0.clone());
 
         let thread = std::thread::Builder::new().name("bastion-mic".into()).spawn(move || {
             // Both are dropped when the thread ends, however it ends.

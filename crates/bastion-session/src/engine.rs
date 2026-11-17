@@ -8,7 +8,7 @@
 //! auto-reconnect cookie) → … → disconnected.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -66,7 +66,9 @@ pub struct ConnectParams {
 pub enum Command {
     Input(SmallVec<[FastPathInputEvent; 2]>),
     Layout(DesktopLayout),
-    Clipboard(ClipboardMessage),
+    /// A CLIPRDR message from the clipboard worker, with the guard that releases its share of
+    /// the clipboard's response budget once it was written (or dropped).
+    Clipboard(ClipboardMessage, Option<bastion_clipboard::SentGuard>),
     /// Answer to [`Event::CertificatePrompt`].
     CertificateDecision {
         accept: bool,
@@ -76,6 +78,9 @@ pub enum Command {
     /// Internal: replies from the graphics thread, to send on its channel.
     #[doc(hidden)]
     GfxReply(crate::gfx::GfxReply),
+    /// Internal: the graphics pipeline cannot go on; ends the session with this message.
+    #[doc(hidden)]
+    GfxFailed(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -248,11 +253,19 @@ impl EngineCtx {
 }
 
 #[derive(Debug)]
-struct ClipboardProxy(mpsc::UnboundedSender<Command>);
+struct ClipboardProxy {
+    tx: mpsc::UnboundedSender<Command>,
+    /// Set once the clipboard exists (it is created with this proxy).
+    flow: Arc<std::sync::OnceLock<bastion_clipboard::FlowControl>>,
+}
 
 impl ClipboardMessageProxy for ClipboardProxy {
     fn send_clipboard_message(&self, message: ClipboardMessage) {
-        let _ = self.0.send(Command::Clipboard(message));
+        // Taken here, on the worker thread right after it charged the message, so the guard
+        // belongs to the connection the message was produced for: after a reconnect, queued
+        // messages from the old connection release nothing of the new one's budget.
+        let sent = self.flow.get().map(|f| f.track(&message));
+        let _ = self.tx.send(Command::Clipboard(message, sent));
     }
 }
 
@@ -283,14 +296,12 @@ fn attempt_after_drop(previous: u32, lasted: Duration) -> u32 {
     if lasted >= STABLE_SESSION { 1 } else { previous.saturating_add(1) }
 }
 
-/// The largest desktop side Bastion ever asks for (see `build_connector`), and so the largest it
-/// accepts from the remote computer.
-const MAX_DESKTOP_SIDE: u16 = 8192;
-
 /// The remote computer chooses the final desktop size; it is checked before anything is
-/// allocated for it (a 65535 x 65535 desktop would need 17 GB).
+/// allocated for it (a 65535 x 65535 desktop would need 17 GB). Multi-monitor desktops are the
+/// bounding box of all monitors, so the limit is RDP's virtual-desktop side plus an area cap
+/// (see [`crate::frame::desktop_size_ok`]), not one monitor's 8192.
 fn check_desktop_size(width: u16, height: u16) -> Result<(), String> {
-    if width == 0 || height == 0 || width > MAX_DESKTOP_SIDE || height > MAX_DESKTOP_SIDE {
+    if !crate::frame::desktop_size_ok(u32::from(width), u32::from(height)) {
         warn!(width, height, "Remote computer reported an unsupported desktop size");
         return Err("The remote computer reported an unsupported desktop size.".to_owned());
     }
@@ -317,9 +328,62 @@ fn nla_selected(state: &ClientConnectorState) -> bool {
     )
 }
 
-/// How long one socket write may take before the connection is considered dead (the remote
-/// computer stopped reading).
+/// How long a socket write may go without progress before the connection is considered dead
+/// (the remote computer stopped reading). A large write (a clipboard response can be hundreds
+/// of megabytes) may take longer in total, as long as every [`WRITE_PIECE`] gets through.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Writes are made in pieces of this size, each with its own [`WRITE_TIMEOUT`].
+const WRITE_PIECE: usize = 64 * 1024;
+
+/// The session's socket writer, shared by the session loop and the input task (each write
+/// holds the lock for the whole frame, so frames never interleave).
+struct SocketWriter<W> {
+    framed: W,
+    /// A write started and did not finish (it failed, stalled or was cancelled): the stream
+    /// ends part-way through a frame and nothing more may be written to it.
+    torn: bool,
+}
+
+impl<W> SocketWriter<W> {
+    fn new(framed: W) -> Self {
+        Self { framed, torn: false }
+    }
+}
+
+#[derive(Debug)]
+enum WriteFailure {
+    Io(std::io::Error),
+    /// No progress for [`WRITE_TIMEOUT`].
+    Stalled,
+    /// An earlier write was left unfinished.
+    Torn,
+}
+
+/// Writes one whole frame, giving up only when a piece makes no progress for `stall`.
+///
+/// Dropping the future part-way (on disconnect) marks the writer torn, so the stream is never
+/// written to again after a half-written frame.
+async fn write_frame_to(
+    writer: &tokio::sync::Mutex<SocketWriter<Writer>>,
+    bytes: &[u8],
+    stall: Duration,
+) -> Result<(), WriteFailure> {
+    let mut w = writer.lock().await;
+    if w.torn {
+        return Err(WriteFailure::Torn);
+    }
+    // Cleared only once the whole frame is out.
+    w.torn = true;
+    for piece in bytes.chunks(WRITE_PIECE) {
+        match tokio::time::timeout(stall, w.framed.write_all(piece)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(WriteFailure::Io(e)),
+            Err(_) => return Err(WriteFailure::Stalled),
+        }
+    }
+    w.torn = false;
+    Ok(())
+}
 /// The goodbye sent on disconnect is best effort; it must not delay closing.
 const SHUTDOWN_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -403,8 +467,15 @@ async fn run(ctx: EngineCtx, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
             files: p.clipboard.files,
             max_transfer_bytes: p.clipboard.max_transfer_mb as usize * 1024 * 1024,
         };
-        match bastion_clipboard::Clipboard::new(ClipboardProxy(ctx.cmd_tx.clone()), opts) {
-            Ok(c) => Some(c),
+        let flow = Arc::default();
+        match bastion_clipboard::Clipboard::new(
+            ClipboardProxy { tx: ctx.cmd_tx.clone(), flow: Arc::clone(&flow) },
+            opts,
+        ) {
+            Ok(c) => {
+                let _ = flow.set(c.flow_control());
+                Some(c)
+            }
             Err(e) => {
                 warn!(error = %e, "Clipboard redirection disabled");
                 ctx.emit(Event::Notice(format!("Clipboard sync unavailable: {e}")));
@@ -415,7 +486,6 @@ async fn run(ctx: EngineCtx, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
         None
     };
     let cliprdr_factory = clipboard.as_ref().map(|c| c.backend_factory());
-    let clip_flow = clipboard.as_ref().map(|c| c.flow_control());
 
     let mut layout = ctx.params.layout.normalized();
     let mut cookie: Option<ServerAutoReconnect> = None;
@@ -468,8 +538,7 @@ async fn run(ctx: EngineCtx, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 
         ever_connected = true;
         let session_started = std::time::Instant::now();
-        let end =
-            active_session(&ctx, conn, framed, &mut cmd_rx, mic_rx, &mut cookie, &layout, clip_flow.as_ref()).await;
+        let end = active_session(&ctx, conn, framed, &mut cmd_rx, mic_rx, &mut cookie, &layout).await;
         // The latency probe holds a duplicate of the socket; drop it so the connection really
         // closes now, not when the UI lets go of the session.
         ctx.link.clear_connection();
@@ -546,50 +615,99 @@ const MIC_UPLINK_CAPACITY: usize = 64;
 
 type UplinkItem = (u32, Vec<SvcMessage>);
 
+/// One microphone uplink message, marked when it is audio data (which may be dropped) rather
+/// than a control PDU such as the FormatChange confirmation (which never is).
+struct MicItem {
+    item: UplinkItem,
+    audio: bool,
+}
+
 /// Data produced on other threads for the session loop to send: microphone packets (bounded
 /// here) and camera samples (bounded by the server's sample requests).
 struct MicRx {
-    mic: mpsc::Receiver<UplinkItem>,
+    mic: mpsc::UnboundedReceiver<MicItem>,
+    /// Audio items currently in `mic`.
+    queued_audio: Arc<AtomicUsize>,
     camera: mpsc::UnboundedReceiver<UplinkItem>,
 }
 
 impl MicRx {
     async fn recv(&mut self) -> Option<UplinkItem> {
         tokio::select! {
-            Some(m) = self.mic.recv() => Some(m),
+            Some(m) = self.mic.recv() => {
+                if m.audio {
+                    self.queued_audio.fetch_sub(1, Ordering::AcqRel);
+                }
+                Some(m.item)
+            }
             Some(m) = self.camera.recv() => Some(m),
             else => None,
         }
     }
 }
 
+/// The microphone side of the uplink. One queue keeps control PDUs in order behind the audio
+/// sent before them; only audio counts against [`MIC_UPLINK_CAPACITY`].
+#[derive(Clone)]
+struct MicTx {
+    tx: mpsc::UnboundedSender<MicItem>,
+    queued_audio: Arc<AtomicUsize>,
+}
+
 struct UplinkTx {
-    mic: mpsc::Sender<UplinkItem>,
+    mic: MicTx,
     camera: mpsc::UnboundedSender<UplinkItem>,
 }
 
 fn uplink() -> (UplinkTx, MicRx) {
-    let (mic_tx, mic_rx) = mpsc::channel(MIC_UPLINK_CAPACITY);
+    let (mic_tx, mic_rx) = mpsc::unbounded_channel();
+    let queued_audio = Arc::new(AtomicUsize::new(0));
     let (cam_tx, cam_rx) = mpsc::unbounded_channel();
-    (UplinkTx { mic: mic_tx, camera: cam_tx }, MicRx { mic: mic_rx, camera: cam_rx })
+    (
+        UplinkTx { mic: MicTx { tx: mic_tx, queued_audio: queued_audio.clone() }, camera: cam_tx },
+        MicRx { mic: mic_rx, queued_audio, camera: cam_rx },
+    )
+}
+
+/// Whether an AUDIO_INPUT uplink message is captured audio (Data Incoming followed by Data),
+/// as opposed to a control PDU.
+fn is_mic_audio(msgs: &[SvcMessage]) -> bool {
+    use ironrdp_dvc::pdu::{DrdynvcDataPdu, DrdynvcServerPdu};
+    let Some(Ok(first)) = msgs.first().map(SvcMessage::encode_unframed_pdu) else { return false };
+    matches!(
+        ironrdp_core::decode::<DrdynvcServerPdu>(&first),
+        Ok(DrdynvcServerPdu::Data(DrdynvcDataPdu::Data(d)))
+            if d.data().first() == Some(&ironrdp_rdpeai::pdu::MSG_SNDIN_DATA_INCOMING)
+    )
 }
 
 static MIC_DROP_LOG: LogGate = LogGate::new();
 static MIC_BUSY_LOG: LogGate = LogGate::new();
 
 /// The microphone's way into the session loop: never blocks the capture thread and never
-/// queues more than [`MIC_UPLINK_CAPACITY`] packets — the newest is dropped instead.
-fn mic_uplink(tx: mpsc::Sender<UplinkItem>) -> ironrdp_rdpeai::client::DvcUplink {
-    use mpsc::error::TrySendError;
-    Box::new(move |id, msgs| match tx.try_send((id, msgs)) {
-        Ok(()) => Ok(()),
-        Err(TrySendError::Full(_)) => {
-            if let Some(dropped) = MIC_DROP_LOG.pass() {
-                warn!(dropped, "Microphone audio dropped: the connection is not keeping up");
+/// queues more than [`MIC_UPLINK_CAPACITY`] audio packets — the newest is dropped instead.
+/// Control PDUs (the FormatChange confirmation) are always queued.
+fn mic_uplink(tx: MicTx) -> ironrdp_rdpeai::client::DvcUplink {
+    Box::new(move |id, msgs| {
+        let audio = is_mic_audio(&msgs);
+        if audio {
+            let reserved = tx
+                .queued_audio
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MIC_UPLINK_CAPACITY).then_some(n + 1));
+            if reserved.is_err() {
+                if tx.tx.is_closed() {
+                    return Err(ironrdp_pdu::pdu_other_err!("microphone uplink closed"));
+                }
+                if let Some(dropped) = MIC_DROP_LOG.pass() {
+                    warn!(dropped, "Microphone audio dropped: the connection is not keeping up");
+                }
+                return Ok(());
             }
-            Ok(())
         }
-        Err(TrySendError::Closed(_)) => Err(ironrdp_pdu::pdu_other_err!("microphone uplink closed")),
+        if tx.tx.send(MicItem { item: (id, msgs), audio }).is_err() {
+            return Err(ironrdp_pdu::pdu_other_err!("microphone uplink closed"));
+        }
+        Ok(())
     })
 }
 
@@ -1085,10 +1203,16 @@ fn build_connector(
         let mic_host = audio_host.clone();
         let mic_tx = uplink.mic;
         let recording = Arc::new(AtomicBool::new(false));
+        // One thread limit for every reopen of the channel (the server decides how often).
+        let mic_threads = bastion_audio::MicThreads::default();
         drdynvc = drdynvc.with_dynamic_channel_factory(ironrdp_rdpeai::CHANNEL_NAME, move || {
             ironrdp_rdpeai::client::RdpeaiClient::new(
                 Box::new(SingleCapture::new(
-                    bastion_audio::PulseCapture::with_host(mic_host.clone(), opts.clone()),
+                    bastion_audio::PulseCapture::with_host_and_threads(
+                        mic_host.clone(),
+                        opts.clone(),
+                        mic_threads.clone(),
+                    ),
                     recording.clone(),
                 )),
                 mic_uplink(mic_tx.clone()),
@@ -1097,7 +1221,10 @@ fn build_connector(
     }
 
     let config = ironrdp_connector::Config {
-        desktop_size: DesktopSize { width: bw.min(8192) as u16, height: bh.min(8192) as u16 },
+        desktop_size: DesktopSize {
+            width: bw.min(crate::frame::MAX_DESKTOP_SIDE) as u16,
+            height: bh.min(crate::frame::MAX_DESKTOP_SIDE) as u16,
+        },
         monitor_layout: gcc.as_ref().map(|g| g.0.clone()),
         desktop_scale_factor: primary.scale,
         desktop_physical_size: primary.physical_mm,
@@ -1206,7 +1333,7 @@ fn drive_channel(p: &Profile, client_name: &str) -> anyhow::Result<ironrdp_rdpdr
         .with_drives(Some(drives.into_iter().map(|d| d.into_parts()).collect())))
 }
 
-/// Shown (after "Connection lost:") when a write could not complete in [`WRITE_TIMEOUT`].
+/// Shown (after "Connection lost:") when a write made no progress for [`WRITE_TIMEOUT`].
 const WRITE_STALLED: &str = "the remote computer stopped accepting data";
 
 /// The user-facing text for a session-level protocol error. IronRDP's detailed form contains
@@ -1230,7 +1357,7 @@ impl Drop for AbortOnDrop {
 struct InputTask {
     rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<InputEvents>>>,
     queued: Arc<bastion_metrics::Stamp>,
-    writer: Arc<tokio::sync::Mutex<Writer>>,
+    writer: Arc<tokio::sync::Mutex<SocketWriter<Writer>>>,
     paused: Arc<AtomicBool>,
     link: Arc<crate::link::LinkStats>,
     /// Copies of the written input for keep-active (only when it is enabled).
@@ -1278,15 +1405,16 @@ async fn input_task(t: InputTask) {
             continue;
         }
         let started = std::time::Instant::now();
-        let write = async { t.writer.lock().await.write_all(&bytes).await };
-        match tokio::time::timeout(WRITE_TIMEOUT, write).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
+        // The stall timeout starts once the lock is held, so input queued behind a long (but
+        // progressing) clipboard write is not mistaken for a dead connection.
+        match write_frame_to(&t.writer, &bytes, WRITE_TIMEOUT).await {
+            Ok(()) => {}
+            Err(WriteFailure::Io(e)) => {
                 // The session loop notices the broken connection on its next read.
                 debug!(error = %e, "Input write failed");
                 return;
             }
-            Err(_) => {
+            Err(WriteFailure::Stalled | WriteFailure::Torn) => {
                 // The remote computer stopped reading; a half-written frame cannot be recovered.
                 t.stalled.notify_one();
                 return;
@@ -1357,7 +1485,6 @@ fn publish(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // per-connection state the loop owns or borrows
 async fn active_session(
     ctx: &EngineCtx,
     conn: ConnectionResult,
@@ -1366,11 +1493,10 @@ async fn active_session(
     mic_rx: Option<MicRx>,
     cookie: &mut Option<ServerAutoReconnect>,
     layout: &DesktopLayout,
-    clip_flow: Option<&bastion_clipboard::FlowControl>,
 ) -> SessionEnd {
     let (mut reader, writer) = split_tokio_framed(framed);
     // Shared with the input task; each write holds the lock only for that write.
-    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    let writer = Arc::new(tokio::sync::Mutex::new(SocketWriter::new(writer)));
     let input_paused = Arc::new(AtomicBool::new(false));
     let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<InputEvents>();
     let size = conn.desktop_size;
@@ -1421,10 +1547,14 @@ async fn active_session(
             let bytes: Vec<u8> = $bytes;
             if !bytes.is_empty() {
                 let started = std::time::Instant::now();
-                let write = async { writer.lock().await.write_all(&bytes).await };
-                match bounded(&mut cancel, WRITE_TIMEOUT, write).await {
+                let write = write_frame_to(&writer, &bytes, WRITE_TIMEOUT);
+                // The stall limit is inside the write; this only adds Disconnect.
+                match bounded(&mut cancel, Duration::MAX, write).await {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => return SessionEnd::NetworkError(format!("write failed: {e}")),
+                    Ok(Err(WriteFailure::Io(e))) => return SessionEnd::NetworkError(format!("write failed: {e}")),
+                    Ok(Err(WriteFailure::Stalled | WriteFailure::Torn)) => {
+                        return SessionEnd::NetworkError(WRITE_STALLED.into());
+                    }
                     // Disconnect wins over a write the remote computer is not accepting.
                     Err(Interrupted::Cancelled) => return SessionEnd::UserClosed,
                     Err(Interrupted::TimedOut) => return SessionEnd::NetworkError(WRITE_STALLED.into()),
@@ -1476,7 +1606,7 @@ async fn active_session(
                         let out = stage.graceful_shutdown().unwrap_or_default();
                         for o in out {
                             if let ActiveStageOutput::ResponseFrame(f) = o {
-                                let goodbye = async { writer.lock().await.write_all(&f).await };
+                                let goodbye = write_frame_to(&writer, &f, SHUTDOWN_WRITE_TIMEOUT);
                                 let _ = tokio::time::timeout(SHUTDOWN_WRITE_TIMEOUT, goodbye).await;
                             }
                         }
@@ -1506,10 +1636,10 @@ async fn active_session(
                             }
                         }
                     }
-                    Command::Clipboard(msg) => {
-                        // Tells the clipboard worker when this response has really left for the
-                        // socket (or was dropped), so it bounds what it queues behind a slow link.
-                        let _sent = clip_flow.map(|f| f.track(&msg));
+                    Command::Clipboard(msg, _sent) => {
+                        // `_sent` tells the clipboard worker when this response has really left
+                        // for the socket (or was dropped), so it bounds what it queues behind a
+                        // slow link.
                         let Some(c) = stage.get_svc_processor_mut::<CliprdrClient>() else { continue };
                         let msgs = match msg {
                             ClipboardMessage::SendInitiateCopy(f) => c.initiate_copy(&f),
@@ -1519,6 +1649,10 @@ async fn active_session(
                             ClipboardMessage::SendFileContentsRequest(r) => c.request_file_contents(r),
                             ClipboardMessage::SendFileContentsResponse(r) => c.submit_file_contents(r),
                             ClipboardMessage::Error(e) => {
+                                if let Some(notice) = bastion_clipboard::ClipboardNotice::of(&*e) {
+                                    ctx.emit(Event::Notice(notice.to_string()));
+                                    continue;
+                                }
                                 warn!(error = %e, "Clipboard backend error");
                                 continue;
                             }
@@ -1541,6 +1675,7 @@ async fn active_session(
                         write_frame!(session_try!(stage.encode_dvc_messages(reply.0)));
                         Vec::new()
                     }
+                    Command::GfxFailed(message) => return SessionEnd::Fatal(message.to_owned()),
                 }
             }
             Some(events) = seen_rx.recv() => {
@@ -1683,8 +1818,22 @@ mod tests {
     fn server_chosen_desktop_sizes_are_bounded() {
         assert!(check_desktop_size(1920, 1080).is_ok());
         assert!(check_desktop_size(1, 1).is_ok());
-        assert!(check_desktop_size(MAX_DESKTOP_SIDE, MAX_DESKTOP_SIDE).is_ok());
-        for (w, h) in [(0, 0), (0, 600), (800, 0), (65535, 1), (1, 65535), (65535, 65535), (8193, 1080), (1920, 8193)] {
+        assert!(check_desktop_size(8192, 8192).is_ok());
+        // Multi-monitor desktops wider than one monitor: three 4K side by side, 4K + 4K + 2560.
+        assert!(check_desktop_size(11_520, 2160).is_ok());
+        assert!(check_desktop_size(10_240, 2160).is_ok());
+        assert!(check_desktop_size(32_766, 1080).is_ok());
+        for (w, h) in [
+            (0, 0),
+            (0, 600),
+            (800, 0),
+            (65535, 1),
+            (1, 65535),
+            (65535, 65535),
+            (32_767, 1080),
+            (8192, 8193),
+            (16_384, 16_384),
+        ] {
             let message = check_desktop_size(w, h).expect_err("must be refused");
             assert!(message.contains("unsupported desktop size"), "{message}");
         }
@@ -1725,11 +1874,15 @@ mod tests {
     }
 
     /// A session writer whose peer never reads (and has a 16-byte receive buffer).
-    fn stuck_writer() -> (tokio::sync::Mutex<Writer>, tokio::io::DuplexStream) {
-        let (ours, theirs) = tokio::io::duplex(16);
+    fn stuck_writer() -> (tokio::sync::Mutex<SocketWriter<Writer>>, tokio::io::DuplexStream) {
+        writer_with_buffer(16)
+    }
+
+    fn writer_with_buffer(peer_buffer: usize) -> (tokio::sync::Mutex<SocketWriter<Writer>>, tokio::io::DuplexStream) {
+        let (ours, theirs) = tokio::io::duplex(peer_buffer);
         let framed: Framed = ironrdp_tokio::TokioFramed::new(Box::new(ours) as Erased);
         let (_reader, writer) = split_tokio_framed(framed);
-        (tokio::sync::Mutex::new(writer), theirs)
+        (tokio::sync::Mutex::new(SocketWriter::new(writer)), theirs)
     }
 
     #[tokio::test]
@@ -1742,10 +1895,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let _ = cancel_tx.send(true);
         });
-        let write = async { writer.lock().await.write_all(&bytes).await };
-        let result = bounded(&mut cancel, Duration::from_secs(60), write).await;
+        let write = write_frame_to(&writer, &bytes, Duration::from_secs(60));
+        let result = bounded(&mut cancel, Duration::MAX, write).await;
         assert_eq!(result.map(|r| r.is_ok()), Err(Interrupted::Cancelled));
         assert!(started.elapsed() < Duration::from_secs(10));
+        // The frame was cut short: nothing may follow it on the stream.
+        assert!(matches!(write_frame_to(&writer, b"x", Duration::from_secs(60)).await, Err(WriteFailure::Torn)));
     }
 
     #[tokio::test]
@@ -1754,35 +1909,80 @@ mod tests {
         let (cancel_tx, mut cancel) = watch::channel(false);
         drop(cancel_tx);
         let bytes = vec![0u8; 4096];
-        let write = async { writer.lock().await.write_all(&bytes).await };
-        let result = bounded(&mut cancel, Duration::from_secs(60), write).await;
+        let write = write_frame_to(&writer, &bytes, Duration::from_secs(60));
+        let result = bounded(&mut cancel, Duration::MAX, write).await;
         assert_eq!(result.map(|r| r.is_ok()), Err(Interrupted::Cancelled));
     }
 
     #[tokio::test]
     async fn a_stuck_write_times_out() {
         let (writer, _peer) = stuck_writer();
-        let (_cancel_tx, mut cancel) = watch::channel(false);
         let bytes = vec![0u8; 4096];
-        let write = async { writer.lock().await.write_all(&bytes).await };
-        let result = bounded(&mut cancel, Duration::from_millis(50), write).await;
-        assert_eq!(result.map(|r| r.is_ok()), Err(Interrupted::TimedOut));
+        let result = write_frame_to(&writer, &bytes, Duration::from_millis(50)).await;
+        assert!(matches!(result, Err(WriteFailure::Stalled)), "{result:?}");
+        // A stalled stream is never written to again (the input task and session loop share it).
+        let again = write_frame_to(&writer, b"x", Duration::from_secs(60)).await;
+        assert!(matches!(again, Err(WriteFailure::Torn)), "{again:?}");
+    }
+
+    #[tokio::test]
+    async fn a_slow_but_progressing_write_is_not_a_stall() {
+        // A large clipboard response on a slow link: 1 MiB read 4 KiB per 2 ms takes over half
+        // a second, longer than the 200 ms stall limit, but data keeps moving the whole time.
+        let (writer, mut peer) = writer_with_buffer(4096);
+        let reader = tokio::spawn(async move {
+            let mut got = 0usize;
+            let mut buf = vec![0u8; 4096];
+            while let Ok(n @ 1..) = tokio::io::AsyncReadExt::read(&mut peer, &mut buf).await {
+                got += n;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            got
+        });
+        let bytes = vec![7u8; 1024 * 1024];
+        let limit = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let result = write_frame_to(&writer, &bytes, limit).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(started.elapsed() > limit, "test premise: the whole write outlasts the limit");
+        drop(writer);
+        assert_eq!(reader.await.unwrap(), bytes.len());
     }
 
     #[tokio::test]
     async fn a_write_that_can_complete_still_goes_out_after_disconnect() {
         // The goodbye and anything already queued must not be lost just because the flag is set.
-        let (ours, mut theirs) = tokio::io::duplex(1024);
-        let framed: Framed = ironrdp_tokio::TokioFramed::new(Box::new(ours) as Erased);
-        let (_reader, writer) = split_tokio_framed(framed);
-        let writer = tokio::sync::Mutex::new(writer);
+        let (writer, mut theirs) = writer_with_buffer(1024);
         let (cancel_tx, mut cancel) = watch::channel(false);
         cancel_tx.send(true).unwrap();
-        let write = async { writer.lock().await.write_all(b"hello").await };
-        assert!(matches!(bounded(&mut cancel, Duration::from_secs(60), write).await, Ok(Ok(()))));
+        let write = write_frame_to(&writer, b"hello", Duration::from_secs(60));
+        assert!(matches!(bounded(&mut cancel, Duration::MAX, write).await, Ok(Ok(()))));
         let mut got = [0u8; 5];
         tokio::io::AsyncReadExt::read_exact(&mut theirs, &mut got).await.unwrap();
         assert_eq!(&got, b"hello");
+    }
+
+    fn mic_messages(pdu: Vec<ironrdp_rdpeai::pdu::RdpeaiPdu>) -> Vec<SvcMessage> {
+        let msgs = pdu.into_iter().map(|p| Box::new(p) as ironrdp_dvc::DvcMessage).collect();
+        ironrdp_dvc::encode_dvc_messages(7, msgs, ironrdp_svc::ChannelFlags::empty()).unwrap()
+    }
+
+    /// What the capture thread sends for one packet (the size makes the Data PDU span chunks).
+    fn mic_audio() -> Vec<SvcMessage> {
+        use ironrdp_rdpeai::pdu::{DataPdu, RdpeaiPdu};
+        mic_messages(vec![RdpeaiPdu::DataIncoming, RdpeaiPdu::Data(DataPdu::new(vec![1; 4000]))])
+    }
+
+    fn mic_format_change() -> Vec<SvcMessage> {
+        use ironrdp_rdpeai::pdu::{FormatChangePdu, RdpeaiPdu};
+        mic_messages(vec![RdpeaiPdu::FormatChange(FormatChangePdu::new(1))])
+    }
+
+    #[test]
+    fn microphone_audio_is_told_apart_from_control_pdus() {
+        assert!(is_mic_audio(&mic_audio()));
+        assert!(!is_mic_audio(&mic_format_change()));
+        assert!(!is_mic_audio(&[]));
     }
 
     #[test]
@@ -1791,25 +1991,48 @@ mod tests {
         let mut send = mic_uplink(tx.mic.clone());
         // Nothing drains the queue (the session loop is stuck): ten times its capacity arrives.
         for _ in 0..MIC_UPLINK_CAPACITY * 10 {
-            send(7, Vec::new()).expect("a full queue is not an error for the capture thread");
+            send(7, mic_audio()).expect("a full queue is not an error for the capture thread");
         }
         let mut queued = 0;
         while rx.mic.try_recv().is_ok() {
             queued += 1;
         }
         assert_eq!(queued, MIC_UPLINK_CAPACITY);
+        // (try_recv bypasses the counter MicRx::recv keeps; reset it as recv would have.)
+        rx.queued_audio.store(0, Ordering::Release);
         // Drained again: packets flow again.
-        send(7, Vec::new()).unwrap();
+        send(7, mic_audio()).unwrap();
         assert!(rx.mic.try_recv().is_ok());
         // Once the session is gone the capture side is told to stop.
         drop(rx);
-        assert!(send(7, Vec::new()).is_err());
+        assert!(send(7, mic_audio()).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_full_microphone_queue_still_carries_the_format_change_confirmation() {
+        let (tx, mut rx) = uplink();
+        let mut send = mic_uplink(tx.mic.clone());
+        for _ in 0..MIC_UPLINK_CAPACITY {
+            send(7, mic_audio()).unwrap();
+        }
+        // The queue is full of audio when the server changes the format.
+        send(7, mic_format_change()).unwrap();
+        send(7, mic_audio()).unwrap(); // dropped
+        let mut got = Vec::new();
+        while let Ok(Some((_, msgs))) = tokio::time::timeout(Duration::from_millis(10), rx.recv()).await {
+            got.push(is_mic_audio(&msgs));
+        }
+        assert_eq!(got.len(), MIC_UPLINK_CAPACITY + 1);
+        assert_eq!(got.last(), Some(&false), "the confirmation goes out, behind the old-format audio");
+        // Draining through `recv` frees the audio budget again.
+        send(7, mic_audio()).unwrap();
+        assert!(is_mic_audio(&rx.recv().await.unwrap().1));
     }
 
     #[tokio::test]
     async fn uplink_delivers_microphone_and_camera_data() {
         let (tx, mut rx) = uplink();
-        mic_uplink(tx.mic.clone())(1, Vec::new()).unwrap();
+        mic_uplink(tx.mic.clone())(1, mic_audio()).unwrap();
         tx.camera.send((2, Vec::new())).unwrap();
         let mut ids = vec![rx.recv().await.unwrap().0, rx.recv().await.unwrap().0];
         ids.sort_unstable();
@@ -1909,12 +2132,73 @@ mod tests {
         assert!(!WRITE_STALLED.contains('/'));
     }
 
+    /// Passes everything to the system allocator, and records whether one watched block was
+    /// all zeroes when it was freed (so a test can tell wiping from merely dropping).
+    mod watch_alloc {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+        pub struct WatchingAlloc;
+        static WATCHED: AtomicUsize = AtomicUsize::new(0);
+        /// 0: not freed yet, 1: freed zeroed, 2: freed with data left in it.
+        pub static FREED: AtomicU8 = AtomicU8::new(0);
+
+        /// Held by a test for as long as it watches a block (the tests run in parallel).
+        pub static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        pub fn watch(ptr: *const u8) {
+            FREED.store(0, Ordering::SeqCst);
+            WATCHED.store(ptr as usize, Ordering::SeqCst);
+        }
+
+        // SAFETY: every call is forwarded unchanged to `System`; the watched block is only read
+        // (within its layout) before it is freed.
+        unsafe impl GlobalAlloc for WatchingAlloc {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                unsafe { System.alloc(layout) }
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                if ptr as usize == WATCHED.load(Ordering::SeqCst)
+                    && WATCHED.compare_exchange(ptr as usize, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+                {
+                    let bytes = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
+                    FREED.store(if bytes.iter().all(|&b| b == 0) { 1 } else { 2 }, Ordering::SeqCst);
+                }
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        #[global_allocator]
+        static ALLOC: WatchingAlloc = WatchingAlloc;
+    }
+
     #[test]
-    fn the_gateway_password_copy_is_emptied_when_wiped() {
-        let mut copy = String::from("hunter2");
-        wipe(&mut copy);
-        assert!(copy.is_empty());
-        assert_eq!(copy.capacity(), 0, "the buffer must have been handed to the zeroizing container");
+    fn the_gateway_password_copy_is_zeroed_before_it_is_freed() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _serial = watch_alloc::SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let gw_pass = String::from("hunter2-gateway-password");
+        watch_alloc::watch(gw_pass.as_ptr());
+        let target = GwTarget(ironrdp_mstsgu::GwConnectTarget {
+            gw_endpoint: "gw.example:443".to_owned(),
+            gw_user: "user".to_owned(),
+            gw_pass,
+            smart_card: None,
+            server: "pc01".to_owned(),
+        });
+        assert_eq!(watch_alloc::FREED.load(SeqCst), 0, "still in use");
+        drop(target);
+        assert_eq!(watch_alloc::FREED.load(SeqCst), 1, "the password's memory must be zeroed before it is freed");
+    }
+
+    #[test]
+    fn the_password_watch_tells_a_plain_drop_apart() {
+        // The check above would catch a `wipe` that only frees the buffer.
+        use std::sync::atomic::Ordering::SeqCst;
+        let _serial = watch_alloc::SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let pass = String::from("hunter2-gateway-password");
+        watch_alloc::watch(pass.as_ptr());
+        drop(pass);
+        assert_eq!(watch_alloc::FREED.load(SeqCst), 2);
     }
 
     #[test]

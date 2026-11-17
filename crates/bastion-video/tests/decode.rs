@@ -219,7 +219,7 @@ fn streams_larger_than_the_limit_are_refused_before_decoding() {
         assert_eq!((frame.width(), frame.height()), (64, 48));
     }
     // The default limit is the largest RDP desktop; ordinary streams are unaffected.
-    assert_eq!(bastion_video::MAX_FRAME_DIM, 8192);
+    assert_eq!(bastion_video::MAX_PICTURE_SIDE, 32_768);
     let mut d = software();
     assert!(d.decode(&access_units(TESTSRC)[0]).is_ok());
 }

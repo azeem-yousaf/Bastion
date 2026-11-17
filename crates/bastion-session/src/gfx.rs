@@ -21,7 +21,8 @@
 //!   thread makes no room for [`QUEUE_STALL`];
 //! - a session has one live pipeline: a further channel retires the previous one, and at most
 //!   [`MAX_PIPELINE_THREADS`] threads may still be winding down ([`Pipelines`]);
-//! - a retired or closed pipeline drops what is still queued and ends after its current message;
+//! - a retired or closed pipeline drops what is still queued and ends after its current message,
+//!   whose output (pixels and replies) it discards;
 //! - log lines a server can trigger per message go through a [`LogGate`].
 
 use std::collections::VecDeque;
@@ -161,8 +162,8 @@ struct Queue {
     /// Signalled when a job is taken or the queue closes (the session loop waits on it).
     room: Condvar,
     budget: usize,
-    /// Set by the thread when the server announced a desktop size we refuse: the next message
-    /// on the channel ends the session with [`FRAME_SIZE_MESSAGE`].
+    /// Set by the thread when the server announced a desktop size we refuse (it also asks the
+    /// session loop to end the session); later messages on the channel are refused too.
     frame_refused: AtomicBool,
 }
 
@@ -385,6 +386,14 @@ impl DvcProcessor for GfxForwarder {
 
 impl DvcClientProcessor for GfxForwarder {}
 
+/// The pipeline's right to touch session state: held while it replies and composites. `None`
+/// once the pipeline is retired or closed. A newer pipeline is admitted under the same lock
+/// (and retires this one there), so a retired pipeline's output never lands after it.
+fn live<'a>(queue: &Queue, shared: &'a GfxShared) -> Option<MutexGuard<'a, Pipelines>> {
+    let guard = lock(&shared.frame.gfx);
+    (!queue.is_closed()).then_some(guard)
+}
+
 fn run(queue: &Queue, mut client: GraphicsPipelineClient, shared: &GfxShared, codecs: &AtomicU32, reset: &AtomicBool) {
     let mut capture = Capture::from_env();
     let mut started_on = None;
@@ -392,6 +401,7 @@ fn run(queue: &Queue, mut client: GraphicsPipelineClient, shared: &GfxShared, co
         match job {
             Job::Start(id) => match client.start(id) {
                 Ok(msgs) => {
+                    let Some(_live) = live(queue, shared) else { break };
                     started_on = Some(id);
                     reply(shared, id, msgs);
                 }
@@ -407,6 +417,8 @@ fn run(queue: &Queue, mut client: GraphicsPipelineClient, shared: &GfxShared, co
                 let took = started.elapsed();
                 bastion_metrics::GFX_PROCESS.record(took);
                 record_codec_time(codecs.swap(0, Ordering::Relaxed), took);
+                // Retired while decoding: what this message produced belongs to no one.
+                let Some(_live) = live(queue, shared) else { break };
                 match result {
                     Ok(msgs) => reply(shared, id, msgs),
                     Err(e) => {
@@ -424,10 +436,12 @@ fn run(queue: &Queue, mut client: GraphicsPipelineClient, shared: &GfxShared, co
                     }
                 }
                 if !composite(&mut client, shared) {
-                    // Nothing sensible can be shown from here on; the session loop ends the
-                    // session when the server's next graphics message arrives.
+                    // Nothing sensible can be shown from here on. The server may send nothing
+                    // more (it waits for the acknowledgement of this frame), so end the session
+                    // now rather than on its next graphics message.
                     gated!(warn, "The server announced a desktop size beyond what Bastion supports");
                     queue.frame_refused.store(true, Ordering::Relaxed);
+                    let _ = shared.replies.send(Command::GfxFailed(FRAME_SIZE_MESSAGE));
                     break;
                 }
             }
@@ -1066,8 +1080,10 @@ mod tests {
         let mut fwd = GfxForwarder::spawn(&display, shared.clone());
         fwd.start(7).unwrap();
         assert!(rx.blocking_recv().is_some());
-        // Within the pipeline's own limits (32766 per side, 256 MiB), beyond any GPU texture.
-        let reset = || wire(GfxPdu::ResetGraphics(ResetGraphicsPdu { width: 32_766, height: 8, monitors: Vec::new() }));
+        // The pipeline's own limits (32766 per side, 256 MiB) are the shared frame's, so the
+        // frame is told to refuse the size the way it refuses one beyond them.
+        shared.frame.refuse_resets.store(true, Ordering::Relaxed);
+        let reset = || wire(GfxPdu::ResetGraphics(ResetGraphicsPdu { width: 64, height: 48, monitors: Vec::new() }));
         fwd.process(
             7,
             &wire(GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V8 {
@@ -1076,7 +1092,19 @@ mod tests {
         )
         .unwrap();
         fwd.process(7, &reset()).unwrap();
-        // The graphics thread refuses the size; the next message on the channel reports it.
+        // The graphics thread refuses the size and ends the session itself: the server may send
+        // nothing more (it waits for a frame acknowledgement that never comes).
+        let mut failed = None;
+        wait_for("the graphics thread to end the session", || {
+            while let Ok(cmd) = rx.try_recv() {
+                if let Command::GfxFailed(message) = cmd {
+                    failed = Some(message);
+                }
+            }
+            failed.is_some()
+        });
+        assert_eq!(failed, Some(FRAME_SIZE_MESSAGE));
+        // Should the server send more before the session ends, the channel refuses it.
         let mut error = None;
         wait_for("the refused size to be reported", || {
             error = fwd.process(7, &reset()).err();
@@ -1088,6 +1116,99 @@ mod tests {
         drop(f);
         assert!(!shared.active.load(Ordering::Relaxed), "the pipeline never took over the frame");
         wait_for("the graphics thread to end", || lock(&shared.frame.gfx).threads == 0);
+    }
+
+    #[test]
+    fn a_reset_to_a_wide_multi_monitor_desktop_is_accepted() {
+        use ironrdp_egfx::pdu::*;
+        let (shared, mut rx) = test_shared();
+        let display = bastion_core::profile::DisplaySettings { h264: false, ..Default::default() };
+        let mut fwd = GfxForwarder::spawn(&display, shared.clone());
+        fwd.start(7).unwrap();
+        assert!(rx.blocking_recv().is_some());
+        fwd.process(
+            7,
+            &wire(GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::SMALL_CACHE,
+            }))),
+        )
+        .unwrap();
+        // Three 4K monitors side by side: wider than one monitor's 8192.
+        fwd.process(
+            7,
+            &wire(GfxPdu::ResetGraphics(ResetGraphicsPdu { width: 11_520, height: 2160, monitors: Vec::new() })),
+        )
+        .unwrap();
+        wait_for("the pipeline to take over the frame", || shared.active.load(Ordering::Relaxed));
+        let f = shared.frame.lock();
+        assert_eq!((f.width, f.height, f.data.len()), (11_520, 2160, 11_520 * 2160 * 4));
+        drop(f);
+        while let Ok(cmd) = rx.try_recv() {
+            assert!(!matches!(cmd, Command::GfxFailed(_)), "the session must go on");
+        }
+    }
+
+    /// One server message that sets up a 64×48 output and paints a frame (acknowledged).
+    fn painted_frame() -> Vec<u8> {
+        use ironrdp_egfx::pdu::*;
+        use ironrdp_pdu::geometry::ExclusiveRectangle;
+        let ts = Timestamp { milliseconds: 0, seconds: 0, minutes: 0, hours: 0 };
+        let monitor = ironrdp_pdu::gcc::Monitor {
+            left: 0,
+            top: 0,
+            right: 63,
+            bottom: 47,
+            flags: ironrdp_pdu::gcc::MonitorFlags::PRIMARY,
+        };
+        let mut raw = Vec::new();
+        for pdu in [
+            GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::SMALL_CACHE,
+            })),
+            GfxPdu::ResetGraphics(ResetGraphicsPdu { width: 64, height: 48, monitors: vec![monitor] }),
+            GfxPdu::CreateSurface(CreateSurfacePdu {
+                surface_id: 1,
+                width: 64,
+                height: 48,
+                pixel_format: PixelFormat::XRgb,
+            }),
+            GfxPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu { surface_id: 1, output_origin_x: 0, output_origin_y: 0 }),
+            GfxPdu::StartFrame(StartFramePdu { timestamp: ts, frame_id: 1 }),
+            GfxPdu::SolidFill(SolidFillPdu {
+                surface_id: 1,
+                fill_pixel: Color { b: 0, g: 0, r: 255, xa: 255 },
+                rectangles: vec![ExclusiveRectangle { left: 0, top: 0, right: 16, bottom: 8 }],
+            }),
+            GfxPdu::EndFrame(EndFramePdu { frame_id: 1 }),
+        ] {
+            raw.extend_from_slice(&ironrdp_core::encode_vec(&pdu).unwrap());
+        }
+        ironrdp_graphics::zgfx::wrap_uncompressed(&raw)
+    }
+
+    #[test]
+    fn a_pipeline_closed_mid_message_discards_that_message() {
+        let (shared, mut rx) = test_shared();
+        let display = bastion_core::profile::DisplaySettings { h264: false, ..Default::default() };
+        let mut fwd = GfxForwarder::spawn(&display, shared.clone());
+        fwd.start(7).unwrap();
+        assert!(matches!(rx.blocking_recv(), Some(Command::GfxReply(_))), "capabilities advertised");
+        let queue = fwd.queue.clone().unwrap();
+        {
+            // Keeps the thread from publishing until the channel has closed under it (as when
+            // Windows reopens the channel at logon while a message is being decoded).
+            let _pipelines = lock(&shared.frame.gfx);
+            fwd.process(7, &painted_frame()).unwrap();
+            wait_for("the graphics thread to take the message", || lock(&queue.state).jobs.is_empty());
+            fwd.close(7);
+        }
+        wait_for("the graphics thread to end", || lock(&shared.frame.gfx).threads == 0);
+        let f = shared.frame.lock();
+        assert_eq!((f.width, f.height, f.data.len()), (0, 0, 0), "a closed pipeline must not resize the frame");
+        assert!(f.dirty.is_empty());
+        drop(f);
+        assert!(!shared.active.load(Ordering::Relaxed));
+        assert!(rx.try_recv().is_err(), "a closed pipeline must not acknowledge or reply");
     }
 
     #[test]

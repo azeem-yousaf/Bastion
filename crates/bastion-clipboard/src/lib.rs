@@ -43,6 +43,7 @@ use anyhow::{Result, anyhow};
 use ironrdp_cliprdr::backend::{ClipboardMessageProxy, CliprdrBackendFactory};
 
 pub use crate::flow::{FlowControl, SentGuard};
+pub use crate::worker::ClipboardNotice;
 use crate::worker::{Command, Config, Worker};
 
 /// How long [`Clipboard::new`] waits for the OS clipboard to open.

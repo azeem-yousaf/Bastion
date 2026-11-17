@@ -14,8 +14,9 @@
 //! (no reordering), which AVC444 relies on.
 //!
 //! The picture size is whatever the stream's SPS says, i.e. chosen by the server, so it is
-//! capped at [`MAX_FRAME_DIM`] per side: FFmpeg refuses larger streams before allocating
-//! pictures for them (`max_pixels`), and nothing larger is ever converted.
+//! capped like a desktop ([`MAX_DESKTOP_SIDE`] per side, [`MAX_DESKTOP_PIXELS`] in area, both
+//! rounded up to whole macroblocks): FFmpeg refuses larger streams before allocating pictures
+//! for them (`max_pixels`), and nothing larger is ever converted.
 
 #![allow(unsafe_code)]
 
@@ -63,17 +64,43 @@ impl Default for DecoderOptions {
     }
 }
 
-/// Largest H.264 picture edge decoded, in pixels: the largest desktop RDP (and Bastion) allows.
-/// A legitimate stream is the size of the surface it paints, rounded up to whole macroblocks;
-/// 8192 is itself a multiple of 16, so the largest desktop still fits.
-pub const MAX_FRAME_DIM: u32 = 8192;
+/// Largest remote desktop (and graphics surface) side, in pixels: the limit of RDP's virtual
+/// desktop (monitor layouts span at most 32766 pixels, MS-RDPEDISP 2.2.2.2.1). A multi-monitor
+/// desktop is the bounding box of all monitors, so it can be much wider than one monitor's 8192.
+pub const MAX_DESKTOP_SIDE: u32 = 32_766;
 
-/// Refuses decoded pictures larger than `max_dim` per side, before anything is allocated or
-/// converted for them.
-fn check_picture_size(width: u32, height: u32, max_dim: u32) -> DecoderResult<()> {
-    if width > max_dim || height > max_dim {
+/// Largest remote desktop area, in pixels: that of 8192 × 8192, i.e. 256 MiB as RGBA whatever
+/// its shape. Three 4K monitors side by side (11520 × 2160) are 25 million.
+pub const MAX_DESKTOP_PIXELS: u64 = 8192 * 8192;
+
+/// Whether a desktop (or frame) of `width` × `height` chosen by the remote computer is within
+/// [`MAX_DESKTOP_SIDE`] and [`MAX_DESKTOP_PIXELS`]. This is the one limit every part of Bastion
+/// applies to server-chosen sizes.
+pub fn desktop_size_ok(width: u32, height: u32) -> bool {
+    width > 0
+        && height > 0
+        && width <= MAX_DESKTOP_SIDE
+        && height <= MAX_DESKTOP_SIDE
+        && u64::from(width) * u64::from(height) <= MAX_DESKTOP_PIXELS
+}
+
+/// Largest H.264 picture side decoded: a desktop side rounded up to whole macroblocks (a
+/// legitimate stream is the size of the surface it paints, rounded up to multiples of 16).
+pub const MAX_PICTURE_SIDE: u32 = MAX_DESKTOP_SIDE.next_multiple_of(16);
+
+/// The largest area a picture of `width` × `height` may have: the desktop limit plus what
+/// rounding a surface up to whole macroblocks adds (less than 16 pixels per row and column).
+fn max_picture_pixels(width: u32, height: u32) -> u64 {
+    MAX_DESKTOP_PIXELS + 16 * (u64::from(width) + u64::from(height))
+}
+
+/// Refuses decoded pictures larger than `max_side` per side or larger in area than any
+/// desktop, before anything is allocated or converted for them.
+fn check_picture_size(width: u32, height: u32, max_side: u32) -> DecoderResult<()> {
+    if width > max_side || height > max_side || u64::from(width) * u64::from(height) > max_picture_pixels(width, height)
+    {
         return Err(DecoderError::msg(format!(
-            "H.264 picture of {width}x{height} exceeds the {max_dim}x{max_dim} limit"
+            "H.264 picture of {width}x{height} exceeds the size limit ({max_side} per side)"
         )));
     }
     Ok(())
@@ -171,10 +198,13 @@ fn err(ctx: &str, code: c_int) -> DecoderError {
 }
 
 impl Context {
-    /// Limits the coded picture size FFmpeg accepts (checked when a stream's SPS is activated,
-    /// before it allocates pictures) to `max_dim` × `max_dim`.
+    /// Limits the coded picture area FFmpeg accepts (checked when a stream's SPS is activated,
+    /// before it allocates pictures): `max_dim` × `max_dim`, and never more than the largest
+    /// desktop allows. Each side is checked again before conversion ([`check_picture_size`]).
     fn limit_picture_size(&mut self, max_dim: u32) {
-        unsafe { (*self.ctx).max_pixels = i64::from(max_dim) * i64::from(max_dim) };
+        let square = u64::from(max_dim) * u64::from(max_dim);
+        let area = square.min(max_picture_pixels(MAX_PICTURE_SIDE, MAX_PICTURE_SIDE));
+        unsafe { (*self.ctx).max_pixels = i64::try_from(area).unwrap_or(i64::MAX) };
     }
 
     fn open(accel: Accel, max_dim: u32) -> DecoderResult<Self> {
@@ -248,7 +278,7 @@ pub struct FfmpegH264Decoder {
     adaptive: Option<Adaptive>,
     /// What `supports_yuv420` answers; see [`FfmpegH264Decoder::yuv420_switch`].
     planes: Arc<AtomicBool>,
-    /// Largest picture edge accepted (see [`MAX_FRAME_DIM`]).
+    /// Largest picture edge accepted (see [`MAX_PICTURE_SIDE`]).
     max_dim: u32,
 }
 
@@ -259,7 +289,7 @@ impl FfmpegH264Decoder {
     pub fn new(opts: DecoderOptions) -> DecoderResult<Self> {
         let hw_allowed = opts.prefer_hardware && std::env::var_os("BASTION_NO_HWDEC").is_none();
         let adaptive = (opts.adaptive && hw_allowed).then(Adaptive::default);
-        let ctx = Self::open_best(opts.prefer_hardware && adaptive.is_none(), MAX_FRAME_DIM)?;
+        let ctx = Self::open_best(opts.prefer_hardware && adaptive.is_none(), MAX_PICTURE_SIDE)?;
         // A server can make the session open a decoder per graphics channel it creates, so
         // only the first few and then every 64th are logged.
         static OPENED: AtomicU64 = AtomicU64::new(0);
@@ -275,14 +305,14 @@ impl FfmpegH264Decoder {
             hw_failures: 0,
             adaptive,
             planes: Arc::new(AtomicBool::new(opts.yuv420_planes)),
-            max_dim: MAX_FRAME_DIM,
+            max_dim: MAX_PICTURE_SIDE,
         })
     }
 
-    /// Lowers the largest picture edge accepted (never above [`MAX_FRAME_DIM`]), e.g. to the
+    /// Lowers the largest picture edge accepted (never above [`MAX_PICTURE_SIDE`]), e.g. to the
     /// size of the desktop being shown. Streams announcing a larger picture then fail to decode.
     pub fn set_max_dimension(&mut self, max_dim: u32) {
-        self.max_dim = max_dim.clamp(16, MAX_FRAME_DIM);
+        self.max_dim = max_dim.clamp(16, MAX_PICTURE_SIDE);
         self.ctx.limit_picture_size(self.max_dim);
     }
 
@@ -460,7 +490,7 @@ unsafe fn planes<'a>(f: *const ffi::AVFrame, max_dim: u32) -> DecoderResult<Plan
     unsafe {
         let w = u32::try_from((*f).width).map_err(|_| DecoderError::msg("bad frame width"))?;
         let h = u32::try_from((*f).height).map_err(|_| DecoderError::msg("bad frame height"))?;
-        // `max_pixels` bounds the area FFmpeg decodes; this bounds each side (a 16384×4096
+        // `max_pixels` bounds the area FFmpeg decodes; this bounds each side (a 65536×16
         // picture has an acceptable area) before any plane is copied or converted.
         check_picture_size(w, h, max_dim)?;
         let ch = h.div_ceil(2) as usize;
@@ -592,12 +622,35 @@ mod adaptive_tests {
 
     #[test]
     fn pictures_larger_than_any_remote_desktop_are_refused() {
-        assert!(check_picture_size(MAX_FRAME_DIM, MAX_FRAME_DIM, MAX_FRAME_DIM).is_ok());
-        assert!(check_picture_size(3840, 2160, MAX_FRAME_DIM).is_ok());
-        // Acceptable area, absurd shape; and the 1 GB RGBA case from a few bytes of SPS.
-        assert!(check_picture_size(16_384, 4096, MAX_FRAME_DIM).is_err());
-        assert!(check_picture_size(64, MAX_FRAME_DIM + 16, MAX_FRAME_DIM).is_err());
-        assert!(check_picture_size(16_384, 16_000, MAX_FRAME_DIM).is_err());
+        let max = MAX_PICTURE_SIDE;
+        assert!(check_picture_size(8192, 8192, max).is_ok());
+        assert!(check_picture_size(3840, 2160, max).is_ok());
+        // Wide multi-monitor desktops: three 4K monitors side by side, 4K + 4K + 2560, and the
+        // widest surface RDP allows, rounded up to whole macroblocks.
+        assert!(check_picture_size(11_520, 2160, max).is_ok());
+        assert!(check_picture_size(10_240, 2160, max).is_ok());
+        assert!(check_picture_size(32_768, 1088, max).is_ok());
+        // A surface just within the area limit, rounded up to macroblocks.
+        assert!(check_picture_size(11_520, 5840, max).is_ok(), "11520x5825 surface");
+        // Too wide, too tall, or too large in area (the 1 GB RGBA case from a few bytes of SPS).
+        assert!(check_picture_size(32_784, 16, max).is_err());
+        assert!(check_picture_size(64, 32_784, max).is_err());
+        assert!(check_picture_size(16_384, 16_000, max).is_err());
+        assert!(check_picture_size(8192, 8192 + 64, max).is_err());
+    }
+
+    #[test]
+    fn desktop_limits_allow_wide_layouts_but_bound_memory() {
+        assert!(desktop_size_ok(1920, 1080));
+        assert!(desktop_size_ok(8192, 8192));
+        assert!(desktop_size_ok(11_520, 2160), "three 4K monitors side by side");
+        assert!(desktop_size_ok(MAX_DESKTOP_SIDE, 2048));
+        assert!(desktop_size_ok(2048, MAX_DESKTOP_SIDE));
+        for (w, h) in [(0, 1080), (1920, 0), (MAX_DESKTOP_SIDE + 1, 8), (8, MAX_DESKTOP_SIDE + 1), (8192, 8193)] {
+            assert!(!desktop_size_ok(w, h), "{w}x{h}");
+        }
+        assert!(!desktop_size_ok(MAX_DESKTOP_SIDE, MAX_DESKTOP_SIDE));
+        assert!(!desktop_size_ok(u32::MAX, u32::MAX));
     }
 
     #[test]

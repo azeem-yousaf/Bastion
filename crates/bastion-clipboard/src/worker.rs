@@ -155,6 +155,62 @@ impl core::fmt::Display for ClipError {
 
 impl core::error::Error for ClipError {}
 
+/// Something the user should be told about (once), sent through [`ClipboardMessage::Error`].
+/// The session shows it as a notice instead of only logging it.
+#[derive(Debug)]
+pub struct ClipboardNotice(pub(crate) String);
+
+impl core::fmt::Display for ClipboardNotice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl core::error::Error for ClipboardNotice {}
+
+impl ClipboardNotice {
+    /// The notice carried by a clipboard [`ClipboardMessage::Error`], if it is one.
+    pub fn of(error: &dyn ironrdp_cliprdr::backend::ClipboardError) -> Option<&Self> {
+        let error: &(dyn core::error::Error + 'static) = error;
+        error.downcast_ref()
+    }
+}
+
+/// Why the local selection is not announced to the remote (see [`Worker::withheld`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Withheld {
+    /// Our own remote offer, re-published by a clipboard manager: the remote already has it.
+    OwnRemote,
+    /// The remote clipboard of another Bastion session.
+    OtherSession,
+    /// A password manager marked it as secret.
+    Secret,
+}
+
+impl Withheld {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::OwnRemote => "it is this session's own remote clipboard",
+            Self::OtherSession => "it is another session's remote clipboard",
+            Self::Secret => "a password manager marked it as secret",
+        }
+    }
+}
+
+/// The value of [`MIME_BASTION_REMOTE`] in this session's offers. It only has to differ between
+/// sessions (it is readable by any local client, so it is not a secret): forging it makes us
+/// withhold a selection, never announce one.
+fn session_marker() -> Vec<u8> {
+    use core::hash::{BuildHasher as _, Hasher as _};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher
+        .write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+    let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{seq}-{:016x}", std::process::id(), hasher.finish()).into_bytes()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Channel {
     /// No channel, or waiting for the server's Monitor Ready.
@@ -221,7 +277,7 @@ impl RemoteFormats {
 
     /// What to put on the local clipboard for this remote offer. A non-empty offer always
     /// carries [`MIME_BASTION_REMOTE`], which tells other sessions not to forward it.
-    fn local_offer(&self) -> Vec<OfferItem> {
+    fn local_offer(&self, marker: &[u8]) -> Vec<OfferItem> {
         let mut items = Vec::new();
         if self.file_list.is_some() {
             items.push(OfferItem::delayed(MIME_URI_LIST));
@@ -239,7 +295,7 @@ impl RemoteFormats {
             items.push(OfferItem::delayed(MIME_PNG));
         }
         if !items.is_empty() {
-            items.push(OfferItem { mime: MIME_BASTION_REMOTE.to_owned(), data: Some(b"1".to_vec()) });
+            items.push(OfferItem { mime: MIME_BASTION_REMOTE.to_owned(), data: Some(marker.to_vec()) });
         }
         items
     }
@@ -307,6 +363,12 @@ pub(crate) struct Worker<O, P> {
     budget: Budget,
     /// Data requests waiting for room in `budget`, oldest first.
     deferred: VecDeque<DataRequest>,
+    /// This session's [`MIME_BASTION_REMOTE`] value.
+    marker: Vec<u8>,
+    /// Our last format list on this channel announced something.
+    local_announced: bool,
+    /// The user was told that another session's clipboard is not shared (once per session).
+    cross_session_noticed: bool,
 }
 
 impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
@@ -341,6 +403,9 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
             loops,
             last_remote_delivery: None,
             epoch: Instant::now(),
+            marker: session_marker(),
+            local_announced: false,
+            cross_session_noticed: false,
         }
     }
 
@@ -459,6 +524,7 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
         self.locked.clear();
         self.loops.clear();
         self.local_dirty = false;
+        self.local_announced = false;
     }
 
     /// Drops everything tied to the current remote offer.
@@ -520,6 +586,7 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
         self.local_files = None;
         self.local_dirty = self.config.files && !withheld && self.local_file_paths(&mimes).is_some();
         self.channel = Channel::Initializing;
+        self.local_announced = !formats.is_empty();
         self.send(ClipboardMessage::SendInitiateCopy(formats));
     }
 
@@ -540,24 +607,28 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
 
     /// Why the current local selection must not reach the remote, if it must not:
     ///
-    /// * it is the remote clipboard of another Bastion session. Announcing it would hand one
-    ///   server's data to another without the user pasting anything (and reading its file list
-    ///   would make that session download the files);
+    /// * it is this session's own remote offer, re-published by a clipboard manager that keeps
+    ///   every type (marker with our value). The remote already has it;
+    /// * it is the remote clipboard of another Bastion session (marker with another value, or
+    ///   one we cannot read). Announcing it would hand one server's data to another without
+    ///   the user pasting anything (and reading its file list would make that session download
+    ///   the files);
     /// * a password manager marked it as a secret.
     ///
-    /// Nothing but the (tiny) hint is read from the selection to decide this.
-    fn withheld(&mut self, mimes: &[String]) -> Option<&'static str> {
+    /// Nothing but the (tiny) marker and hint is read from the selection to decide this.
+    fn withheld(&mut self, mimes: &[String]) -> Option<Withheld> {
         if self.os.is_owner() {
             return None;
         }
         if mimes.iter().any(|m| m == MIME_BASTION_REMOTE) {
-            return Some("it is another session's remote clipboard");
+            let own = matches!(self.os.read(MIME_BASTION_REMOTE), Ok(Some(m)) if m == self.marker);
+            return Some(if own { Withheld::OwnRemote } else { Withheld::OtherSession });
         }
         if mimes.iter().any(|m| m == MIME_PASSWORD_HINT) {
             // Fail closed: a hint that cannot be read counts as "secret".
             let public = matches!(self.os.read(MIME_PASSWORD_HINT), Ok(Some(hint)) if hint.trim_ascii() != b"secret");
             if !public {
-                return Some("a password manager marked it as secret");
+                return Some(Withheld::Secret);
             }
         }
         None
@@ -607,12 +678,21 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
 
     fn advertise_local(&mut self) {
         let mimes = self.os.mime_types();
-        if let Some(reason) = self.withheld(&mimes) {
-            // An empty list also retracts whatever we announced before, so the remote cannot
-            // go on requesting formats that would now be rendered from this selection.
-            debug!(reason, "Not announcing the local clipboard to the remote");
+        if let Some(why) = self.withheld(&mimes) {
+            debug!(reason = why.reason(), "Not announcing the local clipboard to the remote");
             self.local_files = None;
-            self.send(ClipboardMessage::SendInitiateCopy(Vec::new()));
+            if why == Withheld::OtherSession && !self.cross_session_noticed {
+                self.cross_session_noticed = true;
+                let notice = "Clipboard from another session isn't shared with this one.".to_owned();
+                self.send(ClipboardMessage::Error(Box::new(ClipboardNotice(notice))));
+            }
+            // An empty list retracts what we announced before (requests would be refused
+            // anyway: `render_local` checks again). If the remote owns its clipboard there is
+            // nothing to retract, and an empty list would wipe it.
+            if why == Withheld::Secret || self.local_announced {
+                self.local_announced = false;
+                self.send(ClipboardMessage::SendInitiateCopy(Vec::new()));
+            }
             return;
         }
         if self.is_echo(&mimes) {
@@ -631,6 +711,7 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
                     info!(entries = list.len(), "Offering local files to the remote clipboard");
                     let descriptors = list.descriptors().to_vec();
                     self.local_files = Some(Arc::new(list));
+                    self.local_announced = true;
                     self.send(ClipboardMessage::SendInitiateFileCopy(descriptors));
                     return;
                 }
@@ -640,6 +721,7 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
         self.local_files = None;
         let formats = self.local_formats(&mimes);
         debug!(count = formats.len(), "Announcing local clipboard formats");
+        self.local_announced = !formats.is_empty();
         self.send(ClipboardMessage::SendInitiateCopy(formats));
     }
 
@@ -727,8 +809,8 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
             }
             // Checked again here: the selection may have changed since it was announced.
             let mimes = self.os.mime_types();
-            if let Some(reason) = self.withheld(&mimes) {
-                return Err(format!("local clipboard is withheld: {reason}"));
+            if let Some(why) = self.withheld(&mimes) {
+                return Err(format!("local clipboard is withheld: {}", why.reason()));
             }
             let out = match format {
                 ClipboardFormatId::CF_UNICODETEXT => {
@@ -801,8 +883,10 @@ impl<O: OsClipboard, P: ClipboardMessageProxy> Worker<O, P> {
 
     fn remote_copy(&mut self, formats: &[ClipboardFormat]) {
         let parsed = RemoteFormats::parse(formats, self.files_negotiated());
-        let items = parsed.local_offer();
+        let items = parsed.local_offer(&self.marker);
         self.invalidate();
+        // The remote owns its clipboard now: our earlier list is gone.
+        self.local_announced = false;
         if items.is_empty() && self.remote.is_none() {
             // Nothing we can render: keep the user's local clipboard.
             debug!("No supported format in the remote clipboard");

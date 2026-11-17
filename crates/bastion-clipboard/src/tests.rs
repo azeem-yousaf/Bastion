@@ -1115,14 +1115,14 @@ fn another_sessions_remote_clipboard_is_not_re_exported() {
     b.os.state().reads.clear();
     share_selection(&a, &mut b);
     let msgs = b.take();
-    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs.len(), 2, "a notice and the retraction: {msgs:?}");
     assert!(initiate_copy(&msgs).is_empty(), "session B announces nothing (and retracts its earlier list)");
     for format in [ClipboardFormatId::CF_UNICODETEXT, HTML_FORMAT_ID, ClipboardFormatId::CF_DIB] {
         b.backend.on_format_data_request(FormatDataRequest { format });
         b.pump();
         assert_eq!(format_data(b.take()), None, "server B cannot pull server A's data");
     }
-    assert!(b.os.state().reads.is_empty(), "session B never reads session A's offer");
+    assert!(b.os.state().reads.iter().all(|m| m == MIME_BASTION_REMOTE), "session B reads nothing but the marker");
     assert!(a.take().is_empty(), "so session A fetches nothing from its server");
 
     // The same when session B connects while session A's offer is on the clipboard.
@@ -1152,8 +1152,9 @@ fn another_sessions_remote_files_are_neither_downloaded_nor_re_exported() {
     // Session B sees session A's file offer: it must not read the list (which would make A
     // download the files with no paste anywhere).
     share_selection(&a, &mut b);
-    assert!(initiate_copy(&b.take()).is_empty());
-    assert!(b.os.state().reads.is_empty());
+    let msgs = b.take();
+    assert!(msgs.iter().all(|m| !matches!(m, ClipboardMessage::SendInitiateFileCopy(_))));
+    assert!(b.os.state().reads.iter().all(|m| m == MIME_BASTION_REMOTE));
     assert!(a.take().is_empty(), "no file list was requested from server A");
 
     // The user pastes A's files somewhere; later a clipboard manager re-publishes their paths
@@ -1173,6 +1174,66 @@ fn another_sessions_remote_files_are_neither_downloaded_nor_re_exported() {
         "another session's downloads are not uploaded: {msgs:?}"
     );
     assert!(file_contents(&mut b, range(1, 0, 0, 16, None)).is_error());
+}
+
+#[test]
+fn own_remote_offer_re_published_by_a_clipboard_manager_is_left_alone() {
+    let mut h = Harness::new(true, 1 << 20);
+    h.connect();
+    h.local_copy(&[("text/plain;charset=utf-8", b"local")]);
+    h.take();
+    h.remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+    h.take();
+    // A clipboard manager that keeps every type (wl-clip-persist, CopyQ) takes the selection
+    // over with all of our types, marker included.
+    let offered = h.os.state().offered.clone();
+    let items: Vec<(String, Vec<u8>)> =
+        offered.iter().map(|o| (o.mime.clone(), o.data.clone().unwrap_or_else(|| b"remote text".to_vec()))).collect();
+    let items: Vec<(&str, &[u8])> = items.iter().map(|(m, d)| (m.as_str(), d.as_slice())).collect();
+    h.local_copy(&items);
+    assert!(h.take().is_empty(), "the server's own clipboard is neither re-announced nor wiped");
+    // The same marker on other contents (a local client copying it) only withholds.
+    h.local_copy(&[("text/plain;charset=utf-8", b"forged"), (MIME_BASTION_REMOTE, &offered_marker(&offered))]);
+    assert!(h.take().is_empty());
+    h.backend.on_format_data_request(FormatDataRequest { format: ClipboardFormatId::CF_UNICODETEXT });
+    h.pump();
+    assert_eq!(format_data(h.take()), None, "nothing is served from it either");
+}
+
+fn offered_marker(offered: &[OfferItem]) -> Vec<u8> {
+    offered.iter().find(|o| o.mime == MIME_BASTION_REMOTE).and_then(|o| o.data.clone()).expect("marker")
+}
+
+#[test]
+fn sessions_use_distinct_markers() {
+    let mut a = Harness::new(true, 1 << 20);
+    a.connect();
+    let mut b = Harness::new(true, 1 << 20);
+    b.connect();
+    let text = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+    a.remote_copy(&text);
+    b.remote_copy(&text);
+    assert_ne!(offered_marker(&a.os.state().offered), offered_marker(&b.os.state().offered));
+}
+
+#[test]
+fn another_sessions_clipboard_keeps_the_remote_clipboard_and_notifies_once() {
+    let mut a = Harness::new(true, 1 << 20);
+    a.connect();
+    let mut b = Harness::new(true, 1 << 20);
+    b.connect();
+    // Server B owns its clipboard.
+    b.remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+    b.take();
+    a.remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+    share_selection(&a, &mut b);
+    let msgs = b.take();
+    let [ClipboardMessage::Error(e)] = msgs.as_slice() else { panic!("only a notice expected: {msgs:?}") };
+    assert!(crate::ClipboardNotice::of(&**e).is_some(), "a user notice: {e}");
+    // Copied again: still withheld, but the user is not told twice.
+    a.remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+    share_selection(&a, &mut b);
+    assert!(b.take().is_empty());
 }
 
 // ---------------------------------------------------------------------------------------------

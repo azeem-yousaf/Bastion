@@ -58,6 +58,38 @@ pub struct App {
 }
 
 const MONITOR_SETTLE: Duration = Duration::from_millis(1500);
+const MANAGER_TITLE: &str = "Bastion";
+
+/// How a later launch brings up the main window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchAction {
+    /// There is none (closed to the tray): open one, with the launcher's activation token.
+    Open,
+    /// X11: un-minimise and focus the existing window.
+    Raise,
+    /// KWin on Wayland: ask the compositor to un-minimise and raise the existing window (Wayland
+    /// apps cannot do it themselves), keeping its size, position and contents.
+    RaiseWithKwin,
+    /// Other Wayland compositors: the window may be minimised and nothing else can restore it,
+    /// so it is replaced by one carrying the launcher's activation token.
+    Replace,
+}
+
+fn launch_action(has_window: bool, wayland: bool, kwin: bool, has_token: bool) -> LaunchAction {
+    match (has_window, wayland, kwin, has_token) {
+        (false, ..) => LaunchAction::Open,
+        (true, false, ..) => LaunchAction::Raise,
+        (true, true, true, _) => LaunchAction::RaiseWithKwin,
+        (true, true, false, true) => LaunchAction::Replace,
+        // Without a token a new window would not get focus either.
+        (true, true, false, false) => LaunchAction::Raise,
+    }
+}
+
+/// Running under KDE Plasma (KWin), whose scripting API can restore our windows.
+fn is_kwin() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.split(':').any(|part| part.eq_ignore_ascii_case("KDE")))
+}
 
 impl App {
     pub fn new(
@@ -103,9 +135,18 @@ impl App {
     }
 
     fn open_manager(&mut self, event_loop: &ActiveEventLoop, token: Option<ActivationToken>) -> anyhow::Result<()> {
+        self.open_manager_sized(event_loop, token, winit::dpi::LogicalSize::new(980.0, 640.0).into())
+    }
+
+    fn open_manager_sized(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        token: Option<ActivationToken>,
+        size: winit::dpi::Size,
+    ) -> anyhow::Result<()> {
         let mut attrs = Window::default_attributes()
-            .with_title("Bastion")
-            .with_inner_size(winit::dpi::LogicalSize::new(980, 640))
+            .with_title(MANAGER_TITLE)
+            .with_inner_size(size)
             .with_min_inner_size(winit::dpi::LogicalSize::new(720, 480))
             .with_name("bastion", "bastion");
         if let Some(token) = token {
@@ -128,23 +169,37 @@ impl App {
     /// Bastion was launched again (application icon, or a `.rdp` file opened) while this
     /// instance was running: bring the main window up and import the file, if any.
     fn handle_launches(&mut self, event_loop: &ActiveEventLoop) {
+        // Not started yet: `resumed` picks the requests up once the main window exists.
+        if self.gpu.is_none() {
+            return;
+        }
         let requests: Vec<_> = self.launches.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        let wayland = winit::platform::wayland::ActiveEventLoopExtWayland::is_wayland(event_loop);
         for request in requests {
             tracing::info!(import = request.import.is_some(), "Launched again; showing the main window");
-            // Wayland does not let an application raise a window it already has, so a visible
-            // (or minimised) window is replaced by a new one carrying the launcher's activation
-            // token. The manager's state lives outside the window and is kept.
-            if request.token.is_some() || self.manager_win.is_none() {
-                self.manager_win = None;
-                if let Err(e) = self.open_manager(event_loop, request.token.map(ActivationToken::from_raw)) {
-                    tracing::error!(error = %e, "Cannot reopen main window");
+            let action = launch_action(self.manager_win.is_some(), wayland, is_kwin(), request.token.is_some());
+            match action {
+                LaunchAction::Open | LaunchAction::Replace => {
+                    // Replacing keeps the window's size; the manager's state lives outside it.
+                    let size = self.manager_win.take().map_or_else(
+                        || winit::dpi::LogicalSize::new(980.0, 640.0).into(),
+                        |w| w.window.inner_size().into(),
+                    );
+                    let token = request.token.map(ActivationToken::from_raw);
+                    if let Err(e) = self.open_manager_sized(event_loop, token, size) {
+                        tracing::error!(error = %e, "Cannot reopen main window");
+                    }
                 }
-            } else if let Some(w) = &self.manager_win {
-                w.window.set_minimized(false);
-                w.window.focus_window();
+                LaunchAction::Raise => {
+                    if let Some(w) = &self.manager_win {
+                        w.window.set_minimized(false);
+                        w.window.focus_window();
+                    }
+                }
+                LaunchAction::RaiseWithKwin => crate::kwin::restore_windows(MANAGER_TITLE.to_owned()),
             }
             if let Some(path) = request.import {
-                self.manager.import_file(&path);
+                self.manager.import_launched(&path);
             }
             if let Some(w) = &self.manager_win {
                 w.window.request_redraw();
@@ -272,6 +327,8 @@ impl ApplicationHandler<UserEvent> for App {
             if let Some(path) = self.startup_import.take() {
                 self.manager.import_file(&path);
             }
+            // Launches that arrived while starting up.
+            self.handle_launches(event_loop);
         }
     }
 
@@ -325,7 +382,13 @@ impl ApplicationHandler<UserEvent> for App {
             match event {
                 WindowEvent::CloseRequested => {
                     // With a tray icon, closing only hides the window; Bastion keeps running.
+                    // A credential prompt is cancelled with it rather than left open (and
+                    // wiping freed memory) in a window nobody can see: egui's copies of the
+                    // password go first, then the window (freed while still wiping), then the
+                    // prompt and its wipe scope.
+                    self.manager.forget_secret_fields(&win.ctx);
                     self.manager_win = None;
+                    self.manager.cancel_prompt();
                     if self.sessions.is_empty() && self.tray.is_none() {
                         event_loop.exit();
                     }
@@ -378,5 +441,25 @@ impl ApplicationHandler<UserEvent> for App {
             Some(d) => ControlFlow::WaitUntil(d),
             None => ControlFlow::Wait,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_relaunch_keeps_an_existing_main_window_where_it_can() {
+        use LaunchAction::*;
+        // No window (closed to the tray): open one.
+        assert_eq!(launch_action(false, true, true, true), Open);
+        assert_eq!(launch_action(false, false, false, false), Open);
+        // An existing window is never destroyed where it can be raised.
+        assert_eq!(launch_action(true, false, false, true), Raise);
+        assert_eq!(launch_action(true, true, true, true), RaiseWithKwin);
+        assert_eq!(launch_action(true, true, true, false), RaiseWithKwin);
+        assert_eq!(launch_action(true, true, false, false), Raise);
+        // Only elsewhere on Wayland, with a token to activate the new one.
+        assert_eq!(launch_action(true, true, false, true), Replace);
     }
 }

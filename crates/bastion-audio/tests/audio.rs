@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use bastion_audio::playback::{client_formats, is_playable};
 use bastion_audio::{
-    AudioHost, CaptureDevice, CaptureOptions, PcmSpec, PlaybackDevice, PlaybackOptions, PulseCapture, PulsePlayback,
+    AudioHost, CaptureDevice, CaptureOptions, MicThreads, PcmSpec, PlaybackDevice, PlaybackOptions, PulseCapture,
+    PulsePlayback,
 };
 use ironrdp_rdpeai::client::RdpeaiCaptureHandler as _;
 use ironrdp_rdpeai::pdu::{OpenReplyPdu, pcm_format};
@@ -547,6 +548,35 @@ fn stuck_microphone_never_blocks_close_and_cannot_pile_up_threads() {
         rc == OpenReplyPdu::S_OK
     });
     assert_eq!(delivered.load(Ordering::Relaxed), 0, "a closed capture must not deliver packets");
+}
+
+/// The server can also close and reopen the whole microphone channel, which builds a new
+/// capture each time: the session's thread limit must survive that.
+#[test]
+fn reopening_the_microphone_channel_cannot_reset_the_thread_limit() {
+    let host = RealTimeHost::default();
+    host.stuck.store(true, Ordering::Relaxed);
+    let threads = MicThreads::default();
+    let mut results = Vec::new();
+    for _ in 0..8 {
+        // One channel instance: Create, Open, Close.
+        let mut c =
+            PulseCapture::with_host_and_threads(Arc::new(host.clone()), CaptureOptions::default(), threads.clone());
+        results.push(c.open(&pcm(1, 16_000), &pcm(1, 16_000), 640, Box::new(|_| {})));
+        let started = Instant::now();
+        drop(c);
+        assert!(started.elapsed() < Duration::from_secs(2), "closing blocked for {:?}", started.elapsed());
+    }
+    let opened = host.opened.lock().unwrap().len();
+    assert!((1..=3).contains(&opened), "{opened} capture streams opened while the microphone was stuck");
+    assert_eq!(*results.last().unwrap(), OpenReplyPdu::E_FAIL);
+
+    host.stuck.store(false, Ordering::Relaxed);
+    wait_until(|| {
+        let mut c =
+            PulseCapture::with_host_and_threads(Arc::new(host.clone()), CaptureOptions::default(), threads.clone());
+        c.open(&pcm(1, 16_000), &pcm(1, 16_000), 640, Box::new(|_| {})) == OpenReplyPdu::S_OK
+    });
 }
 
 /// Counts info-and-above log events on the current thread.

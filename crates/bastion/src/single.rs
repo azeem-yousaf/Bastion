@@ -148,12 +148,20 @@ fn forward(socket: &Path, request: &Request) -> io::Result<()> {
     stream.write_all(&request.encode())?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut ack = [0u8; ACK.len()];
-    stream.read_exact(&mut ack)?;
-    if ack == ACK { Ok(()) } else { Err(io::Error::other("unexpected reply from the running instance")) }
+    match stream.read_exact(&mut ack) {
+        Ok(()) if ack == ACK => Ok(()),
+        Ok(()) => Err(io::Error::other("unexpected reply from the running instance")),
+        // Connected and sent, but no answer yet: the running instance is still starting up (or
+        // busy) and will read the request from the socket's queue when it gets there. Starting
+        // a second instance now would handle the request twice.
+        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 impl Primary {
     /// Handles launch requests on a background thread for the rest of the process's life.
+    /// Call it as soon as possible after [`acquire`]: until then, later launches wait.
     pub fn serve(self, on_request: impl Fn(Request) + Send + 'static) {
         let spawned = std::thread::Builder::new().name("bastion-instance".into()).spawn(move || {
             // Move the whole guard in (not just the listener): the lock must be held for as
@@ -229,6 +237,23 @@ mod tests {
         // A plain launch (icon click) just asks for the window.
         assert!(matches!(acquire(dir.path(), &Request::default()).unwrap(), Startup::Forwarded));
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Request::default());
+    }
+
+    #[test]
+    fn a_launch_while_the_first_is_still_starting_is_queued_not_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        // The first instance holds the lock and the socket but is not serving yet (slow start).
+        let first = primary(dir.path());
+        let request = Request { token: None, import: Some("/home/u/a.rdp".into()) };
+        let started = std::time::Instant::now();
+        assert!(matches!(acquire(dir.path(), &request).unwrap(), Startup::Forwarded));
+        assert!(started.elapsed() < IO_TIMEOUT * 2);
+        // Once it serves, the queued request is delivered.
+        let (tx, rx) = mpsc::channel();
+        first.serve(move |r| {
+            let _ = tx.send(r);
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), request);
     }
 
     #[test]
