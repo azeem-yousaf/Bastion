@@ -27,6 +27,9 @@ pub struct Profile {
     pub drive: DriveSettings,
     pub security: SecuritySettings,
     pub reconnect: ReconnectSettings,
+    /// Nudge the remote mouse after this much local inactivity so the remote session (and apps
+    /// like Teams) don't go idle/away.
+    pub keep_active: KeepActive,
     /// Optional free-form folder/group for organising the connection list.
     pub group: String,
 }
@@ -47,6 +50,7 @@ impl Default for Profile {
             drive: DriveSettings::default(),
             security: SecuritySettings::default(),
             reconnect: ReconnectSettings::default(),
+            keep_active: KeepActive::default(),
             group: String::new(),
         }
     }
@@ -262,6 +266,48 @@ impl Default for ReconnectSettings {
     }
 }
 
+/// How long the session must be idle (no input sent) before Bastion moves the remote mouse.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum KeepActive {
+    #[default]
+    #[serde(rename = "off")]
+    Off,
+    #[serde(rename = "30s")]
+    Secs30,
+    #[serde(rename = "1m")]
+    Min1,
+    #[serde(rename = "5m")]
+    Min5,
+    #[serde(rename = "10m")]
+    Min10,
+}
+
+impl KeepActive {
+    pub const ALL: [Self; 5] = [Self::Off, Self::Secs30, Self::Min1, Self::Min5, Self::Min10];
+
+    /// `None` = feature disabled.
+    pub fn interval(self) -> Option<std::time::Duration> {
+        let secs = match self {
+            Self::Off => return None,
+            Self::Secs30 => 30,
+            Self::Min1 => 60,
+            Self::Min5 => 5 * 60,
+            Self::Min10 => 10 * 60,
+        };
+        Some(std::time::Duration::from_secs(secs))
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Secs30 => "After 30 seconds idle",
+            Self::Min1 => "After 1 minute idle",
+            Self::Min5 => "After 5 minutes idle",
+            Self::Min10 => "After 10 minutes idle",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +329,20 @@ mod tests {
         assert!(!p.validate().is_empty());
         let p = Profile { host: "pc01".into(), ..Default::default() };
         assert!(p.validate().is_empty());
+    }
+
+    #[test]
+    fn keep_active_serializes_and_defaults_off() {
+        assert_eq!(Profile::default().keep_active, KeepActive::Off);
+        // Profiles saved before the setting existed still load.
+        let old: Profile = toml::from_str("host = \"pc01\"").unwrap();
+        assert_eq!(old.keep_active, KeepActive::Off);
+        let p = Profile { host: "pc01".into(), keep_active: KeepActive::Min5, ..Default::default() };
+        let s = toml::to_string(&p).unwrap();
+        assert!(s.contains("keep_active = \"5m\""), "{s}");
+        assert_eq!(toml::from_str::<Profile>(&s).unwrap().keep_active, KeepActive::Min5);
+        assert_eq!(KeepActive::Secs30.interval(), Some(std::time::Duration::from_secs(30)));
+        assert_eq!(KeepActive::Off.interval(), None);
     }
 
     #[test]

@@ -39,6 +39,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::frame::{Rect, SharedFrame};
+use crate::keep_active::KeepActive;
 use crate::layout::DesktopLayout;
 use crate::tls::{CertificateRejection, PinningVerifier, RejectionSlot};
 
@@ -795,6 +796,14 @@ async fn active_session(
     let mut mic_rx = mic_rx;
     let mut housekeeping = tokio::time::interval(Duration::from_secs(5));
     let mut current_layout = layout.clone();
+    let mut keep_active = ctx.params.profile.keep_active.interval().map(|i| {
+        info!(interval_secs = i.as_secs(), "Keep-active enabled");
+        KeepActive::new(i, tokio::time::Instant::now())
+    });
+    // Only polled when keep-active is enabled; the far-future fallback is never reached.
+    let idle_deadline = |k: &Option<KeepActive>| {
+        k.as_ref().map_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400), KeepActive::deadline)
+    };
 
     macro_rules! write_frame {
         ($bytes:expr) => {{
@@ -831,7 +840,12 @@ async fn active_session(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { return SessionEnd::UserClosed };
                 match cmd {
-                    Command::Input(events) => session_try!(stage.process_fastpath_input(&mut image, &events)),
+                    Command::Input(events) => {
+                        if let Some(k) = keep_active.as_mut() {
+                            k.on_input(&events, tokio::time::Instant::now());
+                        }
+                        session_try!(stage.process_fastpath_input(&mut image, &events))
+                    }
                     Command::Disconnect => {
                         let out = stage.graceful_shutdown().unwrap_or_default();
                         for o in out {
@@ -894,6 +908,12 @@ async fn active_session(
                     Command::CertificateDecision { .. } => Vec::new(),
                 }
             }
+            () = tokio::time::sleep_until(idle_deadline(&keep_active)), if keep_active.is_some() => {
+                let Some(k) = keep_active.as_mut() else { continue };
+                let events = k.nudge((image.width(), image.height()), tokio::time::Instant::now());
+                debug!("Idle: nudging the remote mouse to keep the session active");
+                session_try!(stage.process_fastpath_input(&mut image, &events))
+            }
             _ = housekeeping.tick() => {
                 if let Some(c) = stage.get_svc_processor_mut::<CliprdrClient>()
                     && let Ok(m) = c.drive_timeouts() {
@@ -910,6 +930,9 @@ async fn active_session(
                 ActiveStageOutput::PointerDefault => ctx.emit(Event::Pointer(PointerEvent::Default)),
                 ActiveStageOutput::PointerHidden => ctx.emit(Event::Pointer(PointerEvent::Hidden)),
                 ActiveStageOutput::PointerPosition { x, y } => {
+                    if let Some(k) = keep_active.as_mut() {
+                        k.on_server_pointer(x, y);
+                    }
                     ctx.emit(Event::Pointer(PointerEvent::Position { x, y }))
                 }
                 ActiveStageOutput::PointerBitmap(p) => ctx.emit(Event::Pointer(PointerEvent::Bitmap(p))),

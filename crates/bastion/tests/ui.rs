@@ -101,6 +101,32 @@ fn create_and_save_connection_through_the_ui() {
 }
 
 #[test]
+fn keep_active_interval_is_chosen_in_editor_and_saved() {
+    let f = fixture();
+    let mut h = harness(manager(&f));
+    h.run();
+    h.get_by_label("+  New connection").click();
+    h.run();
+    let inputs: Vec<_> = h.query_all_by_role(egui::accesskit::Role::TextInput).collect();
+    inputs[2].focus();
+    inputs[2].type_text("pc01");
+    h.run();
+
+    h.get_by_label("Security & advanced").click();
+    h.run();
+    h.get_by_label("Move mouse").click();
+    h.run();
+    h.get_by_label("After 5 minutes idle").click();
+    h.run();
+    h.snapshot("editor_advanced_keep_active");
+
+    h.get_by_label("Save").click();
+    h.run();
+    let store = ProfileStore::load(&f.paths).unwrap();
+    assert_eq!(store.profiles()[0].keep_active, bastion_core::profile::KeepActive::Min5);
+}
+
+#[test]
 fn saving_without_computer_shows_validation_error() {
     let f = fixture();
     let mut h = harness(manager(&f));

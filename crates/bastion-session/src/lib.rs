@@ -4,6 +4,7 @@
 pub mod drive;
 pub mod engine;
 pub mod frame;
+mod keep_active;
 pub mod keyboard;
 pub mod layout;
 pub mod tls;

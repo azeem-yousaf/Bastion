@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 
-use bastion_core::profile::{DisplayMode, GatewaySettings, Profile};
+use bastion_core::profile::{DisplayMode, GatewaySettings, KeepActive, Profile};
 use bastion_core::secrets::{self, Secret, SecretKind};
 use bastion_core::store::{AppSettings, ProfileStore};
 use bastion_core::trust::TrustStore;
@@ -542,6 +542,25 @@ impl Manager {
                 form(ui, "rc", |ui| {
                     field(ui, "Attempts", |ui| ui.add(egui::DragValue::new(&mut d.reconnect.max_attempts).range(1..=100)));
                 });
+                theme::section(ui, "Keep session active");
+                form(ui, "keepactive", |ui| {
+                    field(ui, "Move mouse", |ui| {
+                        egui::ComboBox::from_id_salt("keep_active")
+                            .selected_text(d.keep_active.label())
+                            .show_ui(ui, |ui| {
+                                for k in KeepActive::ALL {
+                                    ui.selectable_value(&mut d.keep_active, k, k.label());
+                                }
+                            })
+                            .response
+                    })
+                    .on_hover_text("Nudges the remote mouse by one pixel when you haven't used the session for a while");
+                });
+                ui.label(
+                    egui::RichText::new("Keeps the remote computer from locking and apps like Teams showing you as Away.")
+                        .small()
+                        .color(theme::MUTED),
+                );
                 theme::section(ui, "Danger zone");
                 ui.checkbox(&mut d.security.allow_insecure_tls, egui::RichText::new("Skip certificate verification (insecure)").color(theme::DANGER));
                 if d.security.allow_insecure_tls {

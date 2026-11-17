@@ -6,7 +6,7 @@ use std::process::{Child, Command as Proc, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use bastion_core::profile::Profile;
+use bastion_core::profile::{KeepActive, Profile};
 use bastion_core::secrets::Secret;
 use bastion_core::trust::{EndpointKind, TrustStore};
 use bastion_session::{Command, ConnectParams, DesktopLayout, Event, SessionHandle, Status};
@@ -250,6 +250,39 @@ fn full_session_graphics_keyboard_and_mouse() {
     h.send(Command::Disconnect);
     let (_, error) = wait_disconnect(&h);
     assert!(!error);
+}
+
+/// Keep-active nudges the remote mouse one pixel and back once the session has been idle for the
+/// configured time (30 s — the shortest real setting), and not before.
+#[test]
+fn keep_active_nudges_mouse_after_idle_interval() {
+    let server = Server::start();
+    let mut p = profile(server.port);
+    p.keep_active = KeepActive::Secs30;
+    let h = connect(p, PASSWORD, pinned_trust(&server));
+    wait_event(&h, |e| matches!(e, Event::Status(Status::Connected { .. })).then_some(()));
+
+    let mut db = Database::new();
+    h.send(Command::Input(db.apply([Operation::MouseMove(MousePosition { x: 100, y: 200 })])));
+    let moved = Instant::now();
+    wait_until("user mouse move", || server.saw("MOUSE MOVE 100 200"));
+
+    let deadline = moved + Duration::from_secs(45);
+    while !server.saw("MOUSE MOVE 101 200") {
+        assert!(Instant::now() < deadline, "no keep-active nudge within 45 s");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let after = moved.elapsed();
+    assert!(after >= Duration::from_secs(29), "nudged too early: {after:?}");
+    // ...and returned the cursor to where it was.
+    wait_until("cursor returned", || {
+        let log = server.log.lock().unwrap();
+        let nudge = log.iter().position(|l| l == "MOUSE MOVE 101 200").unwrap();
+        log[nudge..].iter().any(|l| l == "MOUSE MOVE 100 200")
+    });
+
+    h.send(Command::Disconnect);
+    assert!(!wait_disconnect(&h).1);
 }
 
 #[test]
