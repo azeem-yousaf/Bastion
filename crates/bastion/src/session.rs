@@ -74,6 +74,12 @@ pub struct Session {
     last_sibling_restore: Option<Instant>,
     /// User setting: forward Alt+Tab/Super etc. to the remote computer.
     grab_shortcuts: bool,
+    /// The user pinned the session bar (kept visible on one window).
+    pin_bar: bool,
+    /// Window the bar was pinned on (defaults to the one showing the desktop's top-left).
+    pin_window: Option<WindowId>,
+    /// The user pinned or unpinned the bar; the app saves it as the default for new sessions.
+    pub pin_changed: Option<bool>,
     /// Set when sign-in failed, so a remembered (wrong) password is discarded.
     pub auth_failed: bool,
     /// Monitors (keys) the full-screen windows were created on; empty for a window or a
@@ -286,7 +292,7 @@ impl Session {
         screens: &[Screen],
         params_without_layout: impl FnOnce(DesktopLayout) -> bastion_session::ConnectParams,
         waker: bastion_session::Waker,
-        grab_shortcuts: bool,
+        settings: &bastion_core::store::AppSettings,
     ) -> anyhow::Result<Self> {
         let title = format!("{} — Bastion", profile.display_name());
         let mut notices = Vec::new();
@@ -322,7 +328,10 @@ impl Session {
             want_close: false,
             want_reconnect: false,
             auth_failed: false,
-            grab_shortcuts,
+            grab_shortcuts: settings.grab_system_shortcuts,
+            pin_bar: settings.pin_session_bar,
+            pin_window: None,
+            pin_changed: None,
             title,
             last_sibling_restore: None,
             in_use: built.in_use,
@@ -618,7 +627,11 @@ impl Session {
 
     /// Handles a window event for one of this session's windows.
     pub fn window_event(&mut self, gpu: &Gpu, id: WindowId, event: &WindowEvent) {
+        let pinned_here = self.pinned_view() == Some(id);
         let Some(view) = self.views.get_mut(&id) else { return };
+        if pinned_here {
+            view.bar = BarState::Pinned;
+        }
         let egui_resp = view.gfx.egui.on_window_event(&view.gfx.window, event);
         let modal = self.cert.is_some() || !matches!(self.phase, Phase::Connected);
         // egui asks to repaint on every pointer move; that only matters while one of our
@@ -749,8 +762,10 @@ impl Session {
                 if !self.grabbed && *state == ElementState::Pressed {
                     // Clicking back into the session re-captures the keyboard.
                     self.grabbed = true;
-                    view.bar = BarState::Hidden;
-                    view.bar_rect = None;
+                    if !pinned_here {
+                        view.bar = BarState::Hidden;
+                        view.bar_rect = None;
+                    }
                     view.gfx.window.request_redraw();
                 }
                 let b = match button {
@@ -853,10 +868,25 @@ impl Session {
     }
 
     fn hide_bars(&mut self) {
-        for v in self.views.values_mut() {
-            v.bar = BarState::Hidden;
-            v.bar_rect = None;
+        let pinned = self.pinned_view();
+        for (id, v) in &mut self.views {
+            if Some(*id) != pinned {
+                v.bar = BarState::Hidden;
+                v.bar_rect = None;
+            }
         }
+    }
+
+    /// The window showing the pinned session bar, if the bar is pinned.
+    fn pinned_view(&self) -> Option<WindowId> {
+        if !self.pin_bar {
+            return None;
+        }
+        if let Some(id) = self.pin_window.filter(|id| self.views.contains_key(id)) {
+            return Some(id);
+        }
+        // Pinned in an earlier session (or that window is gone): the main monitor's window.
+        self.views.iter().min_by_key(|(_, v)| v.region.map_or((0, 0), |(x, y, _, _)| (y, x))).map(|(id, _)| *id)
     }
 
     /// Keeps the Wayland shortcut inhibitor in sync with grab state.
@@ -889,6 +919,7 @@ impl Session {
         };
         let name = self.profile.display_name().to_owned();
         let quality = self.quality.current.clone();
+        let pinned = self.pinned_view() == Some(id);
         let host = self.profile.host.clone();
         let notices: Vec<String> = self.notices.iter().map(|(_, n)| n.clone()).collect();
         let mut cert = self.cert.take();
@@ -905,6 +936,9 @@ impl Session {
             Some((x, y, w, h)) => (x, y, w, h),
             None => (0, 0, fw, fh),
         };
+        if pinned {
+            view.bar = BarState::Pinned;
+        }
         let tex_id = view.tex_id;
         let fullscreen = view.gfx.window.fullscreen().is_some();
         let show_bar = view.bar != BarState::Hidden;
@@ -948,7 +982,8 @@ impl Session {
                 }
 
                 if show_bar && disconnected.is_none() && phase_text.is_none() {
-                    bar_rect = Some(session_bar(ui, &name, quality.as_ref(), grabbed, fullscreen, &mut actions));
+                    bar_rect =
+                        Some(session_bar(ui, &name, quality.as_ref(), grabbed, fullscreen, pinned, &mut actions));
                 }
                 if !offer.is_empty() {
                     prompt_rect = Some(monitor_prompt(ui, &offer, &mut actions));
@@ -1013,7 +1048,23 @@ impl Session {
                 self.grabbed = true;
                 self.hide_bars();
             }
-            Action::HideBar => self.hide_bars(),
+            Action::HideBar => {
+                // Closing a pinned bar unpins it.
+                if self.pin_bar {
+                    self.pin_bar = false;
+                    self.pin_changed = Some(false);
+                }
+                self.hide_bars();
+            }
+            Action::PinBar(pin) => {
+                self.pin_bar = pin;
+                self.pin_window = pin.then_some(id);
+                self.pin_changed = Some(pin);
+                if !pin && let Some(v) = self.views.get_mut(&id) {
+                    // Stays until the pointer moves away, like a bar revealed at the top edge.
+                    v.bar = BarState::Hover;
+                }
+            }
             Action::Minimize => {
                 // Minimise every window of this session (all monitors) and give the keyboard back.
                 let ev = self.input.release_all();
@@ -1043,6 +1094,8 @@ pub enum Action {
     Minimize,
     Grab,
     HideBar,
+    /// Keep the session bar visible (true) or let it hide again (false).
+    PinBar(bool),
     Refresh,
     /// Extend the session onto newly connected monitors.
     UseNewMonitors,
@@ -1185,6 +1238,7 @@ pub fn session_bar(
     quality: Option<&crate::quality::Quality>,
     grabbed: bool,
     fullscreen: bool,
+    pinned: bool,
     actions: &mut Vec<Action>,
 ) -> egui::Rect {
     egui::Area::new(egui::Id::unique("session-bar"))
@@ -1221,6 +1275,15 @@ pub fn session_bar(
                         }
                         if theme::danger_button(ui, "Disconnect").clicked() {
                             actions.push(Action::Disconnect);
+                        }
+                        ui.separator();
+                        let (pin_label, pin_hint) = if pinned {
+                            ("Unpin", "Let the bar hide again (move the pointer to the top edge to show it)")
+                        } else {
+                            ("Pin", "Keep this bar visible")
+                        };
+                        if ui.selectable_label(pinned, pin_label).on_hover_text(pin_hint).clicked() {
+                            actions.push(Action::PinBar(!pinned));
                         }
                         if ui.small_button("×").on_hover_text("Hide").clicked() {
                             actions.push(Action::HideBar);

@@ -76,11 +76,18 @@ pub struct AppSettings {
     /// Send Super/Alt+Tab etc. to the remote while the session is focused (Wayland shortcut inhibit).
     pub grab_system_shortcuts: bool,
     pub log_level: String,
+    /// Keep the session bar visible (pinned from the bar itself).
+    pub pin_session_bar: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
-        Self { release_chord: "Ctrl+Alt+Home".to_owned(), grab_system_shortcuts: true, log_level: "info".to_owned() }
+        Self {
+            release_chord: "Ctrl+Alt+Home".to_owned(),
+            grab_system_shortcuts: true,
+            log_level: "info".to_owned(),
+            pin_session_bar: false,
+        }
     }
 }
 
@@ -97,6 +104,17 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_session_bar_is_remembered_and_off_for_old_settings() {
+        let old: AppSettings = toml::from_str("grab_system_shortcuts = false").unwrap();
+        assert!(!old.pin_session_bar);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::rooted(dir.path());
+        let s = AppSettings { pin_session_bar: true, ..Default::default() };
+        s.save(&paths).unwrap();
+        assert!(AppSettings::load(&paths).pin_session_bar);
+    }
 
     #[test]
     fn persist_and_reload() {

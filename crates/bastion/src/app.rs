@@ -138,7 +138,7 @@ impl App {
                 camera_host: None,
             },
             self.waker(),
-            self.manager.settings.grab_system_shortcuts,
+            &self.manager.settings,
         );
         match result {
             Ok(session) => self.sessions.push(Live { session, request }),
@@ -184,7 +184,11 @@ impl App {
 
     fn reap_sessions(&mut self, event_loop: &ActiveEventLoop) {
         let mut reconnect = Vec::new();
+        let mut pin = None;
         self.sessions.retain_mut(|live| {
+            if let Some(p) = live.session.pin_changed.take() {
+                pin = Some(p);
+            }
             if live.session.auth_failed {
                 live.session.auth_failed = false;
                 self.manager.forget_password_after_auth_failure(live.request.profile.id);
@@ -199,6 +203,9 @@ impl App {
             }
             !live.session.want_close
         });
+        if let Some(p) = pin {
+            self.manager.set_pin_session_bar(p);
+        }
         for r in reconnect {
             self.start_session(event_loop, r);
         }

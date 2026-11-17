@@ -230,6 +230,16 @@ impl Manager {
         self.detect_mac = Some(rx);
     }
 
+    /// Remembers whether the session bar is pinned (changed from a session's bar).
+    pub fn set_pin_session_bar(&mut self, pinned: bool) {
+        if self.settings.pin_session_bar != pinned {
+            self.settings.pin_session_bar = pinned;
+            if let Err(e) = self.settings.save(&self.paths) {
+                tracing::warn!(error = %e, "Could not save settings");
+            }
+        }
+    }
+
     /// Sends the Wake-on-LAN packet for a saved connection.
     pub fn wake(&mut self, id: Uuid) {
         let Some(p) = self.profile(id) else { return };

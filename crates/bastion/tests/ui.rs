@@ -306,7 +306,7 @@ fn session_bar_shows_connection_details_on_hover() {
             bastion::theme::apply(ui.ctx());
             ui.ctx().global_style_mut(|s| s.interaction.tooltip_delay = 0.0);
             let q = quality(bastion::quality::Level::Poor, 230.0);
-            let _ = bastion::session::session_bar(ui, "Work PC", Some(&q), true, true, actions);
+            let _ = bastion::session::session_bar(ui, "Work PC", Some(&q), true, true, false, actions);
         },
         Vec::new(),
     );
@@ -326,7 +326,7 @@ fn session_bar_offers_minimise() {
         |ui, actions: &mut Vec<Action>| {
             bastion::theme::apply(ui.ctx());
             let q = quality(bastion::quality::Level::Good, 12.0);
-            let _ = bastion::session::session_bar(ui, "Work PC", Some(&q), true, true, actions);
+            let _ = bastion::session::session_bar(ui, "Work PC", Some(&q), true, true, false, actions);
         },
         Vec::new(),
     );
@@ -447,4 +447,28 @@ fn wake_button_sends_the_magic_packet() {
     assert_eq!(&buf[..n], &bastion_core::wol::magic_packet(mac));
     assert!(h.query_by_label_contains("Wake-up packet sent to Desktop").is_some());
     h.snapshot("details_wake_sent");
+}
+
+#[test]
+fn session_bar_can_be_pinned_and_unpinned() {
+    let mut h = Harness::builder().with_size(egui::vec2(900.0, 120.0)).wgpu().build_ui_state(
+        |ui, (pinned, actions): &mut (bool, Vec<Action>)| {
+            bastion::theme::apply(ui.ctx());
+            let q = quality(bastion::quality::Level::Good, 12.0);
+            let _ = bastion::session::session_bar(ui, "Work PC", Some(&q), true, true, *pinned, actions);
+        },
+        (false, Vec::new()),
+    );
+    h.run();
+    h.get_by_label("Pin").click();
+    h.run();
+    assert_eq!(h.state().1, vec![Action::PinBar(true)]);
+
+    h.state_mut().0 = true;
+    h.state_mut().1.clear();
+    h.run();
+    h.snapshot("session_bar_pinned");
+    h.get_by_label("Unpin").click();
+    h.run();
+    assert_eq!(h.state().1, vec![Action::PinBar(false)]);
 }
