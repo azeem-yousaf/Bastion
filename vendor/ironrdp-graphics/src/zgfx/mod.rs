@@ -11,15 +11,18 @@ use std::sync::LazyLock;
 
 pub use api::{CompressionMode, compress_and_wrap_egfx, wrap_uncompressed_recorded};
 use bitvec::bits;
+#[cfg(test)]
 use bitvec::field::BitField as _;
 use bitvec::order::Msb0;
 use bitvec::slice::BitSlice;
+#[cfg(test)]
 use byteorder::WriteBytesExt as _;
 pub use compressor::Compressor;
 pub use wrapper::{wrap_compressed, wrap_uncompressed};
 
 use self::circular_buffer::FixedCircularBuffer;
 use self::control_messages::{BulkEncodedData, CompressionFlags, SegmentedDataPdu};
+#[cfg(test)]
 use crate::utils::Bits;
 
 /// Sliding window size shared by compressor and decompressor.
@@ -68,12 +71,17 @@ pub(crate) const MAX_DECOMPRESSED_TOTAL: usize = 256 * 1024 * 1024;
 
 pub struct Decompressor {
     history: FixedCircularBuffer,
+    /// Tests only: decode with the original implementation.
+    #[cfg(test)]
+    use_reference: bool,
 }
 
 impl Decompressor {
     pub fn new() -> Self {
         Self {
             history: FixedCircularBuffer::new(HISTORY_SIZE),
+            #[cfg(test)]
+            use_reference: false,
         }
     }
 
@@ -141,7 +149,18 @@ impl Decompressor {
         }
     }
 
+    /// Bastion patch: a fast decoder (see [`fast`]) replaces the original bit-slice one, which
+    /// managed ~12 MB/s on real sessions. The original is kept as the test reference.
     fn decompress_segment(&mut self, encoded_data: &[u8], output: &mut Vec<u8>) -> Result<usize, ZgfxError> {
+        #[cfg(test)]
+        if self.use_reference {
+            return self.decompress_segment_reference(encoded_data, output);
+        }
+        fast::decompress_segment(&mut self.history, encoded_data, output)
+    }
+
+    #[cfg(test)]
+    fn decompress_segment_reference(&mut self, encoded_data: &[u8], output: &mut Vec<u8>) -> Result<usize, ZgfxError> {
         if encoded_data.is_empty() {
             return Ok(0);
         }
@@ -244,6 +263,7 @@ impl Default for Decompressor {
     }
 }
 
+#[cfg(test)]
 fn handle_match(
     bits: &mut Bits<'_>,
     distance_value_size: usize,
@@ -285,6 +305,7 @@ fn handle_match(
     }
 }
 
+#[cfg(test)]
 fn read_unencoded_bytes(
     bits: &mut Bits<'_>,
     history: &mut FixedCircularBuffer,
@@ -345,6 +366,7 @@ fn read_unencoded_bytes(
     Ok(unencoded_bytes.len())
 }
 
+#[cfg(test)]
 fn read_encoded_bytes(
     bits: &mut Bits<'_>,
     distance: usize,
@@ -772,8 +794,386 @@ impl From<io::Error> for ZgfxError {
     }
 }
 
+/// Bastion patch: table-driven ZGFX token decoding over a 64-bit bit buffer.
+///
+/// Produces exactly the bytes of the original decoder (checked against it on random data and
+/// on recordings of real sessions). Differences in how it gets there:
+/// - tokens are looked up in a table indexed by the next 9 bits (the longest prefix), built
+///   from `TOKEN_TABLE` itself, instead of comparing prefixes bit by bit;
+/// - the segment's bytes go to `output` only and are appended to the history in one write at
+///   the end; matches reaching back past the segment's start read the history (which still
+///   holds everything before the segment), the rest read `output`.
+mod fast {
+    use std::io::Write as _;
+    use std::sync::LazyLock;
+
+    use super::{
+        FixedCircularBuffer, HISTORY_SIZE, MAX_DECOMPRESSED_PER_SEGMENT, TOKEN_TABLE, TokenType, ZgfxError,
+    };
+
+    const LOOKUP_BITS: usize = 9;
+
+    #[derive(Clone, Copy)]
+    enum Entry {
+        Invalid,
+        NullLiteral,
+        Literal(u8),
+        Match { size: u8, base: u32 },
+    }
+
+    /// For every 9-bit value: the token whose prefix it starts with, and the prefix length.
+    static LOOKUP: LazyLock<Vec<(Entry, u8)>> = LazyLock::new(|| {
+        let mut table = vec![(Entry::Invalid, 0u8); 1 << LOOKUP_BITS];
+        // Walk in table order so that, as with the original `find`, the first matching
+        // token wins (the code is prefix-free, so there is exactly one anyway).
+        for token in TOKEN_TABLE.iter().rev() {
+            let len = token.prefix.len();
+            assert!(len <= LOOKUP_BITS, "ZGFX prefix longer than the lookup table");
+            let prefix = token.prefix.iter().fold(0usize, |acc, b| (acc << 1) | usize::from(*b));
+            let entry = match token.ty {
+                TokenType::NullLiteral => Entry::NullLiteral,
+                TokenType::Literal { literal_value } => Entry::Literal(literal_value),
+                TokenType::Match {
+                    distance_value_size,
+                    distance_base,
+                } => Entry::Match {
+                    size: u8::try_from(distance_value_size).expect("small"),
+                    base: distance_base,
+                },
+            };
+            let shift = LOOKUP_BITS - len;
+            for low in 0..(1usize << shift) {
+                table[(prefix << shift) | low] = (entry, u8::try_from(len).expect("small"));
+            }
+        }
+        table
+    });
+
+    /// MSB-first reader over `data[..]` limited to `end` bits.
+    struct BitReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        end: usize,
+    }
+
+    impl BitReader<'_> {
+        fn remaining(&self) -> usize {
+            self.end - self.pos
+        }
+
+        /// The next `n` (≤ 32) bits, zero-padded past the end.
+        fn peek(&self, n: usize) -> u32 {
+            debug_assert!(n <= 32);
+            if n == 0 {
+                return 0;
+            }
+            let byte = self.pos / 8;
+            let mut chunk = [0u8; 8];
+            let avail = self.data.len().saturating_sub(byte).min(8);
+            chunk[..avail].copy_from_slice(&self.data[byte..byte + avail]);
+            let word = u64::from_be_bytes(chunk) << (self.pos % 8);
+            let mut v = u32::try_from(word >> (64 - n)).expect("n <= 32");
+            // Bits past the logical end read as zero (the original never sees them).
+            let rem = self.remaining();
+            if rem < n {
+                v &= !((1u32 << (n - rem)) - 1);
+            }
+            v
+        }
+
+        fn take(&mut self, n: usize) -> Result<u32, ZgfxError> {
+            if n > self.remaining() {
+                return Err(ZgfxError::IncompleteBitStream {
+                    needed: n,
+                    remaining: self.remaining(),
+                });
+            }
+            let v = self.peek(n);
+            self.pos += n;
+            Ok(v)
+        }
+
+        /// Number of consecutive one bits from the current position.
+        fn leading_ones(&self) -> usize {
+            let mut count = 0;
+            loop {
+                let chunk = self.remaining().saturating_sub(count).min(32);
+                if chunk == 0 {
+                    return count;
+                }
+                let v = BitReader { data: self.data, pos: self.pos + count, end: self.end }.peek(chunk);
+                let ones = (v << (32 - chunk)).leading_ones() as usize;
+                let ones = ones.min(chunk);
+                count += ones;
+                if ones < chunk {
+                    return count;
+                }
+            }
+        }
+    }
+
+    pub(super) fn decompress_segment(
+        history: &mut FixedCircularBuffer,
+        encoded_data: &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<usize, ZgfxError> {
+        if encoded_data.is_empty() {
+            return Ok(0);
+        }
+        let trailing_unused = usize::from(*encoded_data.last().expect("encoded_data is not empty") & 0x07);
+        let bit_count = 8usize
+            .checked_mul(encoded_data.len() - 1)
+            .and_then(|n| n.checked_sub(trailing_unused))
+            .ok_or(ZgfxError::InvalidTrailingBitCount(trailing_unused))?;
+        let mut bits = BitReader {
+            data: encoded_data,
+            pos: 0,
+            end: bit_count,
+        };
+        let start = output.len();
+        let result = decode_tokens(history, &mut bits, output, start);
+        // Whatever was produced (also before an error, as the original wrote it byte by
+        // byte) becomes history.
+        history.write_all(&output[start..]).expect("circular buffer does not fail");
+        result.map(|()| output.len() - start)
+    }
+
+    fn decode_tokens(
+        history: &FixedCircularBuffer,
+        bits: &mut BitReader<'_>,
+        output: &mut Vec<u8>,
+        start: usize,
+    ) -> Result<(), ZgfxError> {
+        let table = &*LOOKUP;
+        while bits.remaining() > 0 {
+            let (entry, len) = table[bits.peek(LOOKUP_BITS) as usize];
+            let len = usize::from(len);
+            if matches!(entry, Entry::Invalid) || len > bits.remaining() {
+                return Err(ZgfxError::TokenBitsNotFound);
+            }
+            bits.pos += len;
+            let written = output.len() - start;
+            match entry {
+                Entry::Invalid => unreachable!("checked above"),
+                Entry::NullLiteral => {
+                    let value = bits.take(8)?;
+                    output.push(u8::try_from(value).expect("8 bits"));
+                }
+                Entry::Literal(value) => output.push(value),
+                Entry::Match { size, base } => {
+                    let max_remaining = MAX_DECOMPRESSED_PER_SEGMENT.checked_sub(written).ok_or(
+                        ZgfxError::SegmentDecompressedSizeExceedsLimit {
+                            decompressed: written,
+                            limit: MAX_DECOMPRESSED_PER_SEGMENT,
+                        },
+                    )?;
+                    let distance_value = bits.take(usize::from(size))?;
+                    let full = base
+                        .checked_add(distance_value)
+                        .ok_or(ZgfxError::InvalidIntegralConversion("token's full distance"))?;
+                    let distance = usize::try_from(full)
+                        .map_err(|_| ZgfxError::InvalidIntegralConversion("token's full distance"))?;
+                    if distance == 0 {
+                        unencoded(bits, output, max_remaining)?;
+                    } else {
+                        if distance > HISTORY_SIZE {
+                            return Err(ZgfxError::MatchDistanceOutOfRange {
+                                distance,
+                                history_size: HISTORY_SIZE,
+                            });
+                        }
+                        copy_match(history, bits, output, start, distance, max_remaining)?;
+                    }
+                }
+            }
+            if output.len() - start > MAX_DECOMPRESSED_PER_SEGMENT {
+                return Err(ZgfxError::SegmentDecompressedSizeExceedsLimit {
+                    decompressed: output.len() - start,
+                    limit: MAX_DECOMPRESSED_PER_SEGMENT,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn unencoded(bits: &mut BitReader<'_>, output: &mut Vec<u8>, max_remaining: usize) -> Result<(), ZgfxError> {
+        let length = bits.take(15)? as usize;
+        if length > max_remaining {
+            return Err(ZgfxError::SegmentDecompressedSizeExceedsLimit {
+                decompressed: MAX_DECOMPRESSED_PER_SEGMENT
+                    .saturating_sub(max_remaining)
+                    .saturating_add(length),
+                limit: MAX_DECOMPRESSED_PER_SEGMENT,
+            });
+        }
+        if bits.pos % 8 > 0 {
+            let pad = 8 - bits.pos % 8;
+            bits.take(pad)?;
+        }
+        let needed = length * 8;
+        if needed > bits.remaining() {
+            return Err(ZgfxError::IncompleteBitStream {
+                needed,
+                remaining: bits.remaining(),
+            });
+        }
+        let byte = bits.pos / 8;
+        output.extend_from_slice(&bits.data[byte..byte + length]);
+        bits.pos += needed;
+        Ok(())
+    }
+
+    fn copy_match(
+        history: &FixedCircularBuffer,
+        bits: &mut BitReader<'_>,
+        output: &mut Vec<u8>,
+        start: usize,
+        distance: usize,
+        max_remaining: usize,
+    ) -> Result<(), ZgfxError> {
+        let length_token_size = bits.leading_ones();
+        let prefix_len = length_token_size
+            .checked_add(1)
+            .ok_or(ZgfxError::LengthTokenSizeTooLarge(length_token_size))?;
+        if prefix_len > bits.remaining() {
+            return Err(ZgfxError::IncompleteBitStream {
+                needed: prefix_len,
+                remaining: bits.remaining(),
+            });
+        }
+        bits.pos += prefix_len;
+        let length = if length_token_size == 0 {
+            3
+        } else {
+            let value_bits = length_token_size + 1;
+            if value_bits >= usize::BITS as usize {
+                return Err(ZgfxError::LengthTokenSizeTooLarge(length_token_size));
+            }
+            if value_bits > bits.remaining() {
+                return Err(ZgfxError::IncompleteBitStream {
+                    needed: value_bits,
+                    remaining: bits.remaining(),
+                });
+            }
+            // Values wider than 32 bits are read in two parts.
+            let value = if value_bits > 32 {
+                let high = bits.take(value_bits - 32)? as usize;
+                (high << 32) | bits.take(32)? as usize
+            } else {
+                bits.take(value_bits)? as usize
+            };
+            1usize
+                .checked_shl(u32::try_from(value_bits).map_err(|_| ZgfxError::LengthTokenSizeTooLarge(length_token_size))?)
+                .and_then(|base| base.checked_add(value))
+                .ok_or(ZgfxError::LengthTokenSizeTooLarge(length_token_size))?
+        };
+        if length > max_remaining {
+            return Err(ZgfxError::SegmentDecompressedSizeExceedsLimit {
+                decompressed: MAX_DECOMPRESSED_PER_SEGMENT
+                    .saturating_sub(max_remaining)
+                    .saturating_add(length),
+                limit: MAX_DECOMPRESSED_PER_SEGMENT,
+            });
+        }
+        output.reserve(length);
+        let produced = output.len() - start;
+        if distance <= produced {
+            // Entirely within this segment's output (overlapping copies repeat the pattern).
+            let from = output.len() - distance;
+            if distance >= length {
+                output.extend_from_within(from..from + length);
+            } else {
+                for i in 0..length {
+                    let b = output[from + i];
+                    output.push(b);
+                }
+            }
+        } else {
+            for _ in 0..length {
+                let produced = output.len() - start;
+                let b = if distance <= produced {
+                    output[output.len() - distance]
+                } else {
+                    history.byte_back(distance - produced)
+                };
+                output.push(b);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// Bastion patch: the fast decoder must produce exactly what the original produces, across
+    /// a long sequence of messages sharing one history (matches reaching back into earlier
+    /// messages, overlapping copies, unencoded runs, multipart messages).
+    #[test]
+    fn fast_decoder_matches_reference_on_compressed_streams() {
+        let mut seed = 0x1234_5678_u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let mut compressor = Compressor::new();
+        let mut fast = Decompressor::new();
+        let mut reference = Decompressor::new();
+        reference.use_reference = true;
+        for round in 0..200 {
+            let len = (rnd() % 40_000) as usize + if round % 25 == 0 { 70_000 } else { 1 };
+            let data: Vec<u8> = match round % 4 {
+                // Text-like: small alphabet, lots of repeats.
+                0 => (0..len).map(|i| b"the quick brown fox "[(i + (rnd() as usize % 3)) % 20]).collect(),
+                // Random bytes (mostly literals / unencoded runs).
+                1 => (0..len).map(|_| rnd() as u8).collect(),
+                // Long runs (overlapping matches).
+                2 => (0..len).map(|i| (i / 997) as u8).collect(),
+                // Repeat of earlier content at a distance (matches into history).
+                _ => (0..len).map(|i| ((i * 31) % 251) as u8).collect(),
+            };
+            let wire = compress_and_wrap_egfx(&data, &mut compressor, CompressionMode::Always).unwrap();
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            fast.decompress(&wire, &mut a).unwrap();
+            reference.decompress(&wire, &mut b).unwrap();
+            assert!(a == b, "round {round}: fast decoder output differs from the reference");
+            assert!(a == data, "round {round}: round trip failed");
+        }
+    }
+
+    /// Bastion patch: compare on a recording of a real session
+    /// (`BASTION_ZGFX_CAPTURE=gfx-….bin cargo test -- --ignored zgfx_capture`).
+    #[test]
+    #[ignore = "needs a recording (BASTION_ZGFX_CAPTURE)"]
+    fn fast_decoder_matches_reference_on_capture() {
+        let Some(path) = std::env::var_os("BASTION_ZGFX_CAPTURE") else { return };
+        let data = std::fs::read(path).unwrap();
+        let mut rest = data.strip_prefix(b"BGFXCAP1".as_slice()).expect("Bastion recording");
+        let mut fast = Decompressor::new();
+        let mut reference = Decompressor::new();
+        reference.use_reference = true;
+        let (mut n, mut bytes) = (0, 0);
+        let (mut t_fast, mut t_ref) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        while rest.len() >= 4 {
+            let len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+            let msg = &rest[4..4 + len];
+            rest = &rest[4 + len..];
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            let t = std::time::Instant::now();
+            let ra = fast.decompress(msg, &mut a).map_err(|e| e.to_string());
+            t_fast += t.elapsed();
+            let t = std::time::Instant::now();
+            let rb = reference.decompress(msg, &mut b).map_err(|e| e.to_string());
+            t_ref += t.elapsed();
+            assert_eq!(ra, rb, "message {n}: results differ");
+            assert!(a == b, "message {n}: output differs");
+            n += 1;
+            bytes += a.len();
+        }
+        println!("{n} messages, {:.1} MB out: fast {t_fast:?}, reference {t_ref:?}", bytes as f64 / 1e6);
+    }
     use super::*;
 
     const ENCODED_ZGFX_SINGLE: [&[u8]; 5] = [

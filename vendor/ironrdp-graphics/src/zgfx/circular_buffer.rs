@@ -1,3 +1,4 @@
+#[cfg(test)]
 use core::cmp::min;
 use std::io;
 
@@ -14,6 +15,7 @@ impl FixedCircularBuffer {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn read_with_offset(&self, offset: usize, length: usize, output: &mut impl io::Write) -> io::Result<()> {
         // Defence-in-depth: callers should already have bounded the offset against the
         // buffer size, but reject out-of-range values here so a stray attacker-controlled

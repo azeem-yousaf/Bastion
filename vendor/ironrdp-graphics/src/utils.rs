@@ -4,11 +4,13 @@ use bitvec::prelude::{BitSlice, Msb0};
 
 // FIXME: check if this should be deleted in favor of something else
 
+#[cfg_attr(not(test), allow(dead_code, reason = "Bastion patch: only the test reference ZGFX decoder uses it"))]
 pub(crate) struct Bits<'a> {
     bits_slice: &'a BitSlice<u8, Msb0>,
     remaining_bits_of_last_byte: usize,
 }
 
+#[cfg_attr(not(test), allow(dead_code, reason = "Bastion patch: only the test reference ZGFX decoder uses it"))]
 impl<'a> Bits<'a> {
     pub(crate) fn new(bits_slice: &'a BitSlice<u8, Msb0>) -> Self {
         Self {
