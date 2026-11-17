@@ -45,6 +45,9 @@ struct CredPrompt {
     gateway_password: Secret,
     remember: bool,
     error: Option<String>,
+    /// Wipes freed memory while the prompt is open: egui's copies of what is typed. Declared
+    /// last so it outlives the other fields when the prompt is dropped.
+    _wipe: crate::wipe::WipeScope,
 }
 
 /// Largest file accepted as an `.rdp` file (the same bound `rdpfile::decode_text` applies to the
@@ -241,6 +244,7 @@ impl Manager {
             gateway_user,
             gateway_password: empty_secret(),
             error: None,
+            _wipe: crate::wipe::WipeScope::begin(),
         });
         None
     }
@@ -970,9 +974,10 @@ impl Manager {
 
         self.secret_fields = secret_fields;
         if cancel {
-            // Dropping the prompt wipes both passwords (`Secret` zeroizes on drop).
-            self.prompt = None;
+            // egui's field state first, while the prompt's wipe scope is still alive; dropping the
+            // prompt then wipes both passwords (`Secret` zeroizes on drop).
             self.forget_secret_fields(ui.ctx());
+            self.prompt = None;
             return None;
         }
         if !submit {
@@ -1008,11 +1013,17 @@ impl Manager {
         })
     }
 
-    /// Clears egui's per-widget state (cursor, undo history) of the prompt's password fields.
+    /// Clears what egui still holds of the prompt's passwords: per-widget state (cursor, undo
+    /// history) and this frame's input events, which carry the typed or pasted text and would
+    /// otherwise live until the next frame — after the prompt's wipe scope has ended.
     fn forget_secret_fields(&self, ctx: &egui::Context) {
         for id in &self.secret_fields {
             forget_secret_field(ctx, *id);
         }
+        ctx.input_mut(|i| {
+            i.events.clear();
+            i.raw.events.clear();
+        });
     }
 
     /// Called when a session fails to sign in, so a stored wrong password is not reused silently.

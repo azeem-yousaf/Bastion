@@ -9,6 +9,10 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use bastion_core::AppPaths;
 
+/// Zeroes freed memory while a password prompt is open (see `bastion::wipe`).
+#[global_allocator]
+static ALLOC: bastion::wipe::WipingAllocator = bastion::wipe::WipingAllocator;
+
 fn main() -> anyhow::Result<()> {
     let mut import = None;
     for arg in std::env::args_os().skip(1) {

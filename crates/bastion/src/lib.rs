@@ -12,3 +12,4 @@ pub mod session;
 pub mod single;
 pub mod theme;
 pub mod tray;
+pub mod wipe;
