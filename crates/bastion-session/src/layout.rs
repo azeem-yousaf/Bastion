@@ -1,6 +1,6 @@
 //! Desktop/monitor layout as negotiated with the server.
 
-use ironrdp_displaycontrol::pdu::{DisplayControlMonitorLayout, MonitorLayoutEntry};
+use ironrdp_displaycontrol::pdu::{DeviceScaleFactor, DisplayControlMonitorLayout, MonitorLayoutEntry};
 use ironrdp_pdu::gcc::{
     ClientMonitorData, ClientMonitorExtendedData, ExtendedMonitorInfo, Monitor, MonitorFlags, MonitorOrientation,
 };
@@ -121,7 +121,13 @@ impl DesktopLayout {
                 .with_position(m.x, m.y)
                 .ok()?
                 .with_desktop_scale_factor(m.scale)
-                .ok()?;
+                .ok()?
+                // Windows ignores the desktop scale unless the device scale is valid too
+                // (MS-RDPEDISP 2.2.2.2.1); use the same mapping as the connection-time GCC data.
+                .with_device_scale_factor(
+                    DeviceScaleFactor::from_value(device_scale(m.scale))
+                        .unwrap_or_else(|| DeviceScaleFactor::from_desktop_scale_factor(m.scale)),
+                );
                 Some(match m.physical_mm {
                     Some((w, h)) => e.clone().with_physical_dimensions(w, h).unwrap_or(e),
                     None => e,
@@ -269,15 +275,28 @@ mod tests {
                     primary: true,
                     physical_mm: Some((597, 336)),
                 },
-                MonitorSpec { x: 2560, y: 0, width: 1920, height: 1080, scale: 100, primary: false, physical_mm: None },
+                MonitorSpec { x: 2560, y: 0, width: 3840, height: 2160, scale: 165, primary: false, physical_mm: None },
             ],
         };
         let (gcc, ext) = l.gcc_monitors().unwrap();
         assert_eq!(gcc.monitors[1].left, 2560);
-        assert_eq!(gcc.monitors[1].right, 2560 + 1919);
+        assert_eq!(gcc.monitors[1].right, 2560 + 3839);
         assert_eq!(ext.extended_monitors_info.len(), 2);
         let dc = l.display_control().unwrap();
         assert_eq!(dc.monitors().len(), 2);
+        // Runtime layout changes (e.g. a monitor plugged back in) must carry a valid device
+        // scale, or Windows drops the HiDPI scale and the monitor comes back at 100 %.
+        let scales: Vec<_> =
+            dc.monitors().iter().map(|m| (m.desktop_scale_factor(), m.device_scale_factor())).collect();
+        assert_eq!(
+            scales,
+            vec![
+                (Some(100), Some(DeviceScaleFactor::Scale100Percent)),
+                (Some(165), Some(DeviceScaleFactor::Scale180Percent)),
+            ]
+        );
+        // Same device scale as the connection-time data.
+        assert_eq!(ext.extended_monitors_info[1].device_scale_factor, 180);
         assert!(DesktopLayout::single(1920, 1080, 100).gcc_monitors().is_none());
     }
 
