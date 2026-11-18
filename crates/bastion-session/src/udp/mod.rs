@@ -111,13 +111,8 @@ impl TunnelTx {
 #[derive(Debug)]
 pub struct TunnelRx {
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    task: tokio::task::AbortHandle,
-}
-
-impl Drop for TunnelRx {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
+    /// Dropped with this half: tells the task to log its final state and stop.
+    _stop: tokio::sync::oneshot::Sender<()>,
 }
 
 impl TunnelRx {
@@ -139,6 +134,7 @@ fn random_u32() -> u32 {
 async fn setup(p: TunnelParams) -> Result<UdpTunnel, TunnelError> {
     let bind: SocketAddr = if p.peer.is_ipv4() { ([0, 0, 0, 0], 0).into() } else { ([0u16; 8], 0).into() };
     let socket = UdpSocket::bind(bind).await?;
+    grow_buffers(&socket);
     socket.connect(p.peer).await?;
     let mut conn = Conn::connect(Instant::now(), random_u32());
     let mut buf = vec![0u8; 65536];
@@ -177,8 +173,32 @@ async fn setup(p: TunnelParams) -> Result<UdpTunnel, TunnelError> {
     info!(version, rtt_ms = link.conn.rtt().map(|r| r.as_millis()), "UDP tunnel established");
     let (out_tx, out_rx) = mpsc::unbounded_channel();
     let (in_tx, in_rx) = mpsc::unbounded_channel();
-    let task = tokio::spawn(run(link, out_rx, in_tx)).abort_handle();
-    Ok(UdpTunnel { tx: TunnelTx(out_tx), rx: TunnelRx { rx: in_rx, task }, version })
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(run(link, out_rx, in_tx, stop_rx));
+    Ok(UdpTunnel { tx: TunnelTx(out_tx), rx: TunnelRx { rx: in_rx, _stop: stop_tx }, version })
+}
+
+/// Asks for 4 MiB socket buffers: a burst of full-screen video arrives faster than the default
+/// (~200 KiB) can hold, and every overflowed datagram is a loss to recover. The kernel caps the
+/// request at `net.core.rmem_max`/`wmem_max`; that is fine, just less headroom.
+fn grow_buffers(socket: &UdpSocket) {
+    use std::os::fd::AsRawFd as _;
+    let size: libc::c_int = 4 << 20;
+    for opt in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+        // SAFETY: a valid socket descriptor and a correctly sized c_int option value.
+        let r = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                opt,
+                (&raw const size).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if r != 0 {
+            debug!(error = %std::io::Error::last_os_error(), "Could not enlarge a UDP socket buffer");
+        }
+    }
 }
 
 /// Sends every datagram that is due. A full socket buffer drops the datagram: the transport
@@ -297,8 +317,15 @@ fn record_chunks(out: &[u8], max: usize) -> Vec<Vec<u8>> {
     chunks
 }
 
-async fn run(mut link: Link, mut out: mpsc::UnboundedReceiver<Vec<u8>>, inbound: mpsc::UnboundedSender<Vec<u8>>) {
+async fn run(
+    mut link: Link,
+    mut out: mpsc::UnboundedReceiver<Vec<u8>>,
+    inbound: mpsc::UnboundedSender<Vec<u8>>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) {
     let mut bw: Option<(Instant, u32)> = None;
+    let mut watchdog = tokio::time::interval(Duration::from_secs(1));
+    let mut stalled: Option<Instant> = None;
     let result: Result<(), TunnelError> = async {
         loop {
             while let Some(pdu) = link.stream.next_pdu()? {
@@ -319,6 +346,21 @@ async fn run(mut link: Link, mut out: mpsc::UnboundedReceiver<Vec<u8>>, inbound:
             }
             link.flush()?;
             tokio::select! {
+                _ = &mut stop => return Ok(()),
+                _ = watchdog.tick() => {
+                    let now = Instant::now();
+                    match (link.conn.stall(now), stalled) {
+                        (Some(what), None) => {
+                            stalled = Some(now);
+                            warn!(problem = what, details = %link.conn.diagnostics(), "UDP tunnel stalled");
+                        }
+                        (None, Some(since)) => {
+                            stalled = None;
+                            info!(after_ms = since.elapsed().as_millis() + 2000, "UDP tunnel stall cleared");
+                        }
+                        _ => {}
+                    }
+                }
                 m = out.recv() => {
                     let Some(pdu) = m else { return Ok(()) };
                     link.tls.writer().write_all(&tunnel::data(&pdu, &[])?)?;
@@ -331,9 +373,8 @@ async fn run(mut link: Link, mut out: mpsc::UnboundedReceiver<Vec<u8>>, inbound:
         }
     }
     .await;
-    let stats = link.conn.stats();
     match result {
-        Ok(()) => info!(?stats, "UDP tunnel closed"),
+        Ok(()) => info!(details = %link.conn.diagnostics(), "UDP tunnel closed"),
         Err(e) => warn!(error = %e, details = %link.conn.diagnostics(), "UDP tunnel failed"),
     }
 }

@@ -1725,7 +1725,15 @@ async fn active_session(
                             &payload
                         ));
                         bastion_metrics::RDP_PROCESS.since(started);
-                        send_dvc!(batch);
+                        // Everything answering tunnel traffic goes back on the tunnel, including
+                        // the reply for a channel just declined or closed (no longer "on" it).
+                        if let Some(tx) = &udp_tx {
+                            for m in batch.into_messages() {
+                                let bytes = session_try!(m.encode_unframed_pdu().map_err(ironrdp_session::SessionError::encode));
+                                ctx.link.add_tx(bytes.len());
+                                let _ = tx.send(bytes);
+                            }
+                        }
                         out
                     }
                     None => {

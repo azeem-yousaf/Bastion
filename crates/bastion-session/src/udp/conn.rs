@@ -30,7 +30,12 @@ const SYN_INTERVAL: Duration = Duration::from_millis(800);
 const SYN_ATTEMPTS: u32 = 4;
 /// Retransmits of one datagram before giving up (product note <9>).
 const MAX_RETRANSMITS: u32 = 5;
-const MAX_RTO: Duration = Duration::from_secs(16);
+/// Longest wait before a retransmit. Windows doubles up to 120 s, but this carries an interactive
+/// session: graphics stop while a packet is outstanding, so give up within seconds (five
+/// retransmits ≈ 6 s) and let the session reconnect over TCP instead of freezing.
+const MAX_RTO: Duration = Duration::from_secs(2);
+/// Something outstanding this long is reported once by [`Conn::stall`].
+pub const STALL: Duration = Duration::from_secs(2);
 /// The peer is gone after this long without a datagram (3.1.1.9).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(65);
 /// Windows sends four keepalives per 65 s when quiet; do the same.
@@ -86,6 +91,7 @@ enum State {
 struct InFlight {
     source: u32,
     data: Vec<u8>,
+    first_sent: Instant,
     sent_at: Instant,
     deadline: Instant,
     retransmits: u32,
@@ -138,6 +144,8 @@ pub struct Conn {
     recent_acks: VecDeque<(u32, u16, Vec<Run>)>,
     /// The packet that hit the retransmit limit.
     gave_up_on: Option<u32>,
+    /// Since when data waits behind a missing packet.
+    gap_since: Option<Instant>,
     /// Delivered packets repeated at the start of each ACK vector ([`ACK_PREFIX`]; tests use 0
     /// to behave like a peer that lists only packets it still waits for).
     ack_prefix: usize,
@@ -187,6 +195,7 @@ impl Conn {
             stats: Stats::default(),
             recent_acks: VecDeque::new(),
             gave_up_on: None,
+            gap_since: None,
             ack_prefix: ACK_PREFIX,
             floor: 0,
             got: VecDeque::new(),
@@ -259,6 +268,18 @@ impl Conn {
 
     pub fn stats(&self) -> Stats {
         self.stats
+    }
+
+    /// Whether the connection has been stuck for [`STALL`]: a packet we sent unacknowledged, or
+    /// received data waiting behind a packet that has not arrived.
+    pub fn stall(&self, now: Instant) -> Option<&'static str> {
+        if self.in_flight.iter().any(|f| !f.acked && now.saturating_duration_since(f.first_sent) >= STALL) {
+            Some("a packet sent to the remote computer is not acknowledged")
+        } else if self.gap_since.is_some_and(|t| now.saturating_duration_since(t) >= STALL) {
+            Some("a packet from the remote computer is missing")
+        } else {
+            None
+        }
     }
 
     /// One line describing the sender's state and the peer's latest acknowledgements, logged
@@ -513,8 +534,12 @@ impl Conn {
                 self.delivered.push_back(d);
                 self.next_deliver = self.next_deliver.wrapping_add(1);
             }
+            if self.buffered.is_empty() {
+                self.gap_since = None;
+            }
         } else {
             self.buffered.insert(seq, data.to_vec());
+            self.gap_since.get_or_insert(now);
         }
         // Keep the vector bounded when the peer sends no ACK-of-ACKs.
         let keep_from = self.next_deliver.wrapping_sub(1).wrapping_sub(ACK_HISTORY);
@@ -753,6 +778,7 @@ impl Conn {
             self.in_flight.push_back(InFlight {
                 source,
                 data,
+                first_sent: now,
                 sent_at: now,
                 deadline: now + self.rto(),
                 retransmits: 0,
@@ -899,6 +925,10 @@ mod tests {
         /// Advances to the next event (a delivery or a timer) and processes it.
         fn step(&mut self) -> bool {
             self.flush();
+            if self.client.closed().is_some() {
+                // Don't run the clock past the moment the client gave up.
+                return true;
+            }
             let next_wire = self.wire.iter().map(|w| w.0).min();
             let timers = [self.client.poll_timeout(), self.server.as_ref().and_then(Conn::poll_timeout)];
             let Some(next) = next_wire.into_iter().chain(timers.into_iter().flatten()).min() else { return false };
@@ -1338,6 +1368,33 @@ mod tests {
         transfer(&mut net, &chunks(30, 100), true, Duration::from_secs(5));
         let d = net.client.diagnostics();
         assert!(d.contains("recent acks") && d.contains("0x0004 [0:"), "{d}");
+    }
+
+    #[test]
+    fn stalls_are_reported_and_a_stuck_packet_closes_within_seconds() {
+        let mut net = Net::new(1, 2);
+        established(&mut net);
+        net.drop = Box::new(|to_server, _, _| to_server);
+        net.client.send(vec![1; 10]);
+        let start = net.now;
+        net.run_until(|n| n.client.stall(n.now).is_some(), Duration::from_secs(5));
+        assert!(net.now - start >= STALL);
+        assert_eq!(net.client.stall(net.now), Some("a packet sent to the remote computer is not acknowledged"));
+        net.run_until(|n| n.client.closed().is_some(), Duration::from_secs(30));
+        assert_eq!(net.client.closed(), Some(Closed::RetransmitLimit));
+        // Capped back-off: the session falls back to TCP within seconds, not minutes.
+        assert!(net.now - start < Duration::from_secs(9), "took {:?}", net.now - start);
+    }
+
+    #[test]
+    fn a_missing_incoming_packet_is_reported_as_a_stall() {
+        let now = Instant::now();
+        let (mut c, _s) = pair(now);
+        c.handle_datagram(now, &source(102));
+        assert_eq!(c.stall(now), None);
+        assert_eq!(c.stall(now + STALL), Some("a packet from the remote computer is missing"));
+        c.handle_datagram(now + STALL, &source(101));
+        assert_eq!(c.stall(now + STALL * 2), None, "cleared once the gap is filled");
     }
 
     #[test]
