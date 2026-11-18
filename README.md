@@ -19,10 +19,11 @@ connecting to Windows PCs through a **Remote Desktop Gateway**.
 - **Multi-monitor:** full screen across every monitor (or the ones you pick per connection), one
   borderless window per screen. Unplugging a monitor keeps the session on the others; plugging
   one in asks whether to extend the session onto it.
-- **UDP transport** on direct connections: when Windows offers it, graphics and audio move to
-  reliable UDP (TLS-encrypted, pinned to the same certificate as the main connection), which
-  copes better with Wi-Fi and distant links. Falls back to TCP automatically. Hover the session
-  bar's quality dot to see which is in use.
+- **UDP transport (experimental, off by default)** on direct connections: when Windows offers
+  it, graphics and audio move to reliable UDP (TLS-encrypted, pinned to the same certificate as
+  the main connection). Known issue: it stalls while a webcam streams to Windows, and the session
+  then reconnects over TCP after about 8 seconds. Hover the session bar's quality dot to see
+  which transport is in use.
 - **Connection speed** per connection: let Windows detect it, or pick Local network, Broadband
   (no wallpaper) or Low bandwidth (no wallpaper, animations or transparency) for slow links.
 - **Folder sharing** (off by default), optionally read-only.
@@ -110,7 +111,7 @@ Configuration lives in `~/.config/bastion/` (mode 0700): `profiles.toml` and
   enabled.
 - **Video glitches**: run with `BASTION_NO_HWDEC=1` to force software decoding, or untick
   *H.264* in the connection's Display settings.
-- **Transport shows TCP although UDP is ticked**: the log has a `UDP transport unavailable` line
+- **Transport shows TCP although experimental UDP is ticked**: the log has a `UDP transport unavailable` line
   with the reason. Windows must allow UDP (policy *Select RDP transport protocols*: *Use both UDP
   and TCP*) and UDP port 3389 must be open in its firewall. Through an RD Gateway, Bastion always
   uses TCP.

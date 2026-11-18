@@ -770,9 +770,12 @@ impl Manager {
                 let via_gateway = d.gateway.is_some();
                 ui.add_enabled(
                     !via_gateway,
-                    egui::Checkbox::new(&mut d.display.udp, "Use UDP when available (smoother on Wi-Fi and distant links)"),
+                    egui::Checkbox::new(&mut d.display.experimental_udp, "Use UDP when available (experimental)"),
                 )
-                .on_hover_text("Graphics and audio move to UDP when the remote computer offers it; TCP is used otherwise")
+                .on_hover_text(
+                    "Graphics and audio move to UDP when the remote computer offers it. Known issue: \
+                     the connection stalls while a webcam is in use, then reconnects over TCP.",
+                )
                 .on_disabled_hover_text("Connections through an RD Gateway use TCP only");
                 ui.checkbox(&mut d.display.h264, "H.264 video codec (lower bandwidth, smoother video)");
                 ui.add_enabled(d.display.h264, egui::Checkbox::new(&mut d.display.hardware_decode, "Hardware decoding (NVDEC / VAAPI) when software can't keep up"))

@@ -1007,7 +1007,7 @@ async fn connect_inner(
         (Box::new(tcp), addr, peer)
     };
     // UDP is direct only: through an RD Gateway it needs the gateway's own UDP channel.
-    let udp_peer = tcp_peer.filter(|_| udp && p.display.udp);
+    let udp_peer = tcp_peer.filter(|_| udp && p.display.experimental_udp);
 
     phases.transport = started.elapsed();
     // 2. RDP negotiation, TLS (with our verifier), CredSSP/NLA, capability exchange.

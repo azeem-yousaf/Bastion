@@ -226,9 +226,11 @@ pub struct DisplaySettings {
     pub monitors: Vec<String>,
     /// Visual effects vs. bandwidth.
     pub speed: ConnectionSpeed,
-    /// Accept the remote computer's offer to move graphics and audio onto UDP (direct
-    /// connections only; RD Gateway connections stay on TCP).
-    pub udp: bool,
+    /// Experimental, off by default: accept the remote computer's offer to move graphics and
+    /// audio onto UDP (direct connections only). Known issue: the UDP connection stalls while a
+    /// webcam streams to Windows (the session then reconnects over TCP). Renamed from `udp` so
+    /// connections saved while it was on by default start with it off.
+    pub experimental_udp: bool,
 }
 
 impl Default for DisplaySettings {
@@ -243,7 +245,7 @@ impl Default for DisplaySettings {
             hardware_decode: true,
             monitors: Vec::new(),
             speed: ConnectionSpeed::Auto,
-            udp: true,
+            experimental_udp: false,
         }
     }
 }
@@ -405,6 +407,16 @@ impl KeepActive {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn udp_is_opt_in_even_for_connections_saved_with_the_old_setting() {
+        assert!(!Profile::default().display.experimental_udp);
+        let p = Profile { host: "pc01".into(), ..Default::default() };
+        let saved = toml::to_string(&p).unwrap().replace("experimental_udp = false", "udp = true");
+        assert!(saved.contains("udp = true"));
+        let loaded: Profile = toml::from_str(&saved).unwrap();
+        assert!(!loaded.display.experimental_udp);
+    }
     use super::*;
 
     #[test]
