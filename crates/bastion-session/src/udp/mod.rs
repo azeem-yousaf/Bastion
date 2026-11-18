@@ -292,27 +292,21 @@ impl Link {
     }
 }
 
-/// Splits TLS output at record boundaries into chunks of at most `max` bytes, keeping each record
-/// in one chunk (records are sized to fit) and packing small ones together.
+/// Splits TLS output into one chunk (one datagram) per TLS record.
+///
+/// Never several records per datagram: Windows decrypts only the first record of each datagram
+/// and drops the rest, after which its TLS sequence is out of step and it stops reading our
+/// stream (live: it froze during video, when frame acknowledgements queued up and were packed
+/// together). Records are sized to fit a datagram (`max_fragment_size`); one that does not is
+/// still split, as a byte stream.
 fn record_chunks(out: &[u8], max: usize) -> Vec<Vec<u8>> {
     let mut chunks = Vec::new();
-    let mut cur = Vec::new();
     let mut rest = out;
     while !rest.is_empty() {
         let len = if rest.len() >= 5 { 5 + usize::from(u16::from_be_bytes([rest[3], rest[4]])) } else { rest.len() };
         let (record, tail) = rest.split_at(len.min(rest.len()));
         rest = tail;
-        if !cur.is_empty() && cur.len() + record.len() > max {
-            chunks.push(std::mem::take(&mut cur));
-        }
-        if record.len() > max {
-            chunks.extend(record.chunks(max).map(<[u8]>::to_vec));
-        } else {
-            cur.extend_from_slice(record);
-        }
-    }
-    if !cur.is_empty() {
-        chunks.push(cur);
+        chunks.extend(record.chunks(max).map(<[u8]>::to_vec));
     }
     chunks
 }
@@ -486,7 +480,7 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
-    fn records_stay_whole_and_small_ones_share_a_chunk() {
+    fn every_record_gets_its_own_datagram() {
         let rec = |n: usize| {
             let mut r = vec![0x17, 3, 3];
             r.extend_from_slice(&(n as u16).to_be_bytes());
@@ -498,9 +492,7 @@ pub(crate) mod tests {
             out.extend(rec(n));
         }
         let chunks = record_chunks(&out, 1060);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0], [rec(10), rec(20), rec(1000)].concat());
-        assert_eq!(chunks[1], rec(30));
+        assert_eq!(chunks, vec![rec(10), rec(20), rec(1000), rec(30)]);
         // An oversized record (never produced with max_fragment_size) is still split safely.
         let big = rec(3000);
         assert_eq!(record_chunks(&big, 1060).concat(), big);
@@ -614,6 +606,63 @@ pub(crate) mod tests {
         for i in 0..64u8 {
             let got = tokio::time::timeout(Duration::from_secs(5), t.recv()).await.unwrap().unwrap();
             assert_eq!(got, [b"echo:".to_vec(), vec![i; 4096]].concat());
+        }
+    }
+
+    #[test]
+    fn a_batch_of_small_writes_never_shares_a_datagram() {
+        // Encrypt several tunnel PDUs written in one go (as queued frame acknowledgements are)
+        // and check each datagram payload is exactly one whole TLS record.
+        crate::tls::install_default_crypto_provider();
+        let cert = rcgen::generate_simple_self_signed(vec!["pc01".to_owned()]).unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+        let scfg = rustls::ServerConfig::builder_with_provider(crate::tls::crypto_provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert.der().clone()], key)
+            .unwrap();
+        let spki = {
+            use x509_cert::der::Decode as _;
+            let c = x509_cert::Certificate::from_der(cert.cert.der()).unwrap();
+            c.tbs_certificate().subject_public_key_info().subject_public_key.as_bytes().unwrap().to_vec()
+        };
+        let max = 1176;
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(client_config(&spki, max).unwrap()),
+            ServerName::try_from("pc01").unwrap(),
+        )
+        .unwrap();
+        let mut server = rustls::ServerConnection::new(Arc::new(scfg)).unwrap();
+        // Handshake in memory.
+        for _ in 0..10 {
+            let mut buf = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut buf).unwrap();
+            }
+            server.read_tls(&mut &buf[..]).unwrap();
+            server.process_new_packets().unwrap();
+            let mut buf = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut buf).unwrap();
+            }
+            client.read_tls(&mut &buf[..]).unwrap();
+            client.process_new_packets().unwrap();
+        }
+        assert!(!client.is_handshaking());
+        for i in 0..20u8 {
+            client.writer().write_all(&tunnel::data(&[i; 40], &[]).unwrap()).unwrap();
+        }
+        let mut out = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut out).unwrap();
+        }
+        let chunks = record_chunks(&out, max);
+        assert!(chunks.len() >= 20);
+        for c in &chunks {
+            let len = 5 + usize::from(u16::from_be_bytes([c[3], c[4]]));
+            assert_eq!(c.len(), len, "a datagram holds exactly one TLS record");
+            assert!(c.len() <= max);
         }
     }
 
