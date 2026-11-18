@@ -48,6 +48,8 @@ const MAX_ACK_RUNS: usize = 256;
 const ACK_HISTORY: u32 = 1024;
 const MAX_CWND: f64 = RECEIVE_WINDOW as f64;
 const INITIAL_CWND: f64 = 10.0;
+/// Already-delivered packets repeated at the start of each ACK vector.
+const ACK_PREFIX: usize = 32;
 /// Acknowledgements kept for [`Conn::diagnostics`].
 const RECENT_ACKS: usize = 8;
 /// Never shrink below this: with fewer packets in flight, three later acknowledgements can't
@@ -134,6 +136,11 @@ pub struct Conn {
     stats: Stats,
     /// The peer's latest acknowledgements (snSourceAck, flags, vector), for failure reports.
     recent_acks: VecDeque<(u32, u16, Vec<Run>)>,
+    /// The packet that hit the retransmit limit.
+    gave_up_on: Option<u32>,
+    /// Delivered packets repeated at the start of each ACK vector ([`ACK_PREFIX`]; tests use 0
+    /// to behave like a peer that lists only packets it still waits for).
+    ack_prefix: usize,
 
     // Receiver.
     /// The ACK vector covers `floor + 1 ..= floor + got.len()`.
@@ -179,6 +186,8 @@ impl Conn {
             since_ack_of_acks: 0,
             stats: Stats::default(),
             recent_acks: VecDeque::new(),
+            gave_up_on: None,
+            ack_prefix: ACK_PREFIX,
             floor: 0,
             got: VecDeque::new(),
             next_deliver: 0,
@@ -257,12 +266,13 @@ impl Conn {
     pub fn diagnostics(&self) -> String {
         use std::fmt::Write as _;
         let mut s = format!(
-            "local_isn={} peer_isn={} version={} next_source={} oldest_unacked={:?} in_flight={} cwnd={:.1} peer_window={} \
+            "local_isn={} peer_isn={} version={} next_source={} gave_up_on={:?} oldest_unacked={:?} in_flight={} cwnd={:.1} peer_window={} \
              rtt={:?} highest_received={} next_deliver={} {:?}; recent acks (snSourceAck flags [state:len]):",
             self.local.initial_seq,
             self.peer_isn,
             self.version,
             self.next_source,
+            self.gave_up_on,
             self.in_flight.iter().find(|f| !f.acked).map(|f| (f.source, f.retransmits)),
             self.in_flight.len(),
             self.cwnd,
@@ -535,19 +545,29 @@ impl Conn {
     }
 
     /// The ACK vector for `floor + 1 ..= highest`, keeping at most `max` of the newest runs.
-    fn ack_runs(&self, max: usize) -> Vec<Run> {
+    /// The ACK vector and the `snSourceAck` it ends at.
+    ///
+    /// Windows reads every Source Packet before the vector's first element as received (the
+    /// vector starts at the lowest sequence number the receiver still expects, 2.2.2.6). So the
+    /// vector always starts at or before the first missing packet — here with a short prefix of
+    /// delivered ones — and when it is too long, the *newest* end is cut and `snSourceAck`
+    /// lowered with it: under-reporting delays an acknowledgement, over-reporting would lose data.
+    fn ack_runs(&self, max: usize) -> (u32, Vec<Run>) {
+        let first_missing = self.next_deliver.wrapping_sub(self.floor).wrapping_sub(1) as usize;
+        let skip = first_missing.saturating_sub(self.ack_prefix).min(self.got.len());
         let mut runs: Vec<Run> = Vec::new();
-        for &g in &self.got {
+        let mut end = self.floor.wrapping_add(skip as u32);
+        for &g in self.got.iter().skip(skip) {
             let state = if g { STATE_RECEIVED } else { STATE_NOT_RECEIVED };
+            let full = runs.len() == max;
             match runs.last_mut() {
                 Some(r) if r.state == state && r.len < wire::MAX_RUN => r.len += 1,
+                _ if full => break,
                 _ => runs.push(Run { state, len: 1 }),
             }
+            end = end.wrapping_add(1);
         }
-        if runs.len() > max {
-            runs.drain(..runs.len() - max);
-        }
-        runs
+        (end, runs)
     }
 
     fn on_ack(&mut self, now: Instant, highest: u32, runs: &[Run], flags: u16) {
@@ -557,10 +577,17 @@ impl Conn {
         self.recent_acks.push_back((highest, flags, runs.to_vec()));
         let total: u32 = runs.iter().map(|r| u32::from(r.len)).sum();
         // Only acknowledgements of something we sent count (5.1.1).
-        if total > 0 && seq_before(highest, self.next_source) {
-            let mut seq = highest.wrapping_sub(total).wrapping_add(1);
+        if seq_before(highest, self.next_source) {
+            let base = highest.wrapping_sub(total).wrapping_add(1);
             let mut newly = 0u32;
             let mut sample = None;
+            // The vector starts at the lowest sequence number the peer still expects: everything
+            // before it has arrived, listed or not (Windows lists only the latest packets).
+            for f in self.in_flight.iter_mut().filter(|f| !f.acked && seq_before(f.source, base)) {
+                f.acked = true;
+                newly += 1;
+            }
+            let mut seq = base;
             for r in runs {
                 for _ in 0..r.len {
                     if r.state == STATE_RECEIVED
@@ -673,6 +700,7 @@ impl Conn {
         let mut gave_up = false;
         for f in self.in_flight.iter_mut().filter(|f| !f.acked && now >= f.deadline) {
             if f.retransmits >= MAX_RETRANSMITS {
+                self.gave_up_on = Some(f.source);
                 gave_up = true;
                 break;
             }
@@ -751,9 +779,9 @@ impl Conn {
         if self.cn {
             flags |= wire::FLAG_CN;
         }
-        let runs = self.ack_runs(MAX_ACK_RUNS);
+        let (source_ack, runs) = self.ack_runs(MAX_ACK_RUNS);
         let d = wire::encode(&Outgoing {
-            source_ack: self.source_ack(),
+            source_ack,
             receive_window: self.receive_window(),
             flags,
             ack_vector: &runs,
@@ -762,10 +790,6 @@ impl Conn {
         });
         self.out.push_back(d);
         self.acked_now();
-    }
-
-    fn source_ack(&self) -> u32 {
-        self.highest()
     }
 
     fn receive_window(&self) -> u16 {
@@ -798,9 +822,9 @@ impl Conn {
             // Everything up to the oldest unacknowledged packet is cumulatively acknowledged.
             self.in_flight.iter().find(|f| !f.acked).map_or(self.next_source, |f| f.source).wrapping_sub(1)
         });
-        let runs = self.ack_runs(DATA_ACK_RUNS);
+        let (source_ack, runs) = self.ack_runs(DATA_ACK_RUNS);
         let d = wire::encode(&Outgoing {
-            source_ack: self.source_ack(),
+            source_ack,
             receive_window: self.receive_window(),
             flags,
             ack_vector: &runs,
@@ -1153,15 +1177,133 @@ mod tests {
         let _ = &mut s;
     }
 
+    /// A client and server through the handshake, without a simulated network.
+    fn pair(now: Instant) -> (Conn, Conn) {
+        let mut c = Conn::connect(now, 1);
+        let syn = c.poll_transmit(now).unwrap();
+        let mut s = Conn::accept(now, &syn, 100).unwrap();
+        c.handle_datagram(now, &s.poll_transmit(now).unwrap());
+        (c, s)
+    }
+
+    fn source(seq: u32) -> Vec<u8> {
+        wire::encode(&Outgoing {
+            source_ack: 1,
+            receive_window: 64,
+            ack_vector: &[],
+            source: Some((seq, seq, b"x")),
+            ..Default::default()
+        })
+    }
+
+    fn last_ack(c: &mut Conn, now: Instant) -> (u32, Vec<Run>) {
+        let mut last = None;
+        while let Some(d) = c.poll_transmit(now) {
+            last = Some(d);
+        }
+        let d = wire::decode(last.as_ref().unwrap()).unwrap();
+        (d.source_ack, d.ack_vector.unwrap())
+    }
+
     #[test]
     fn long_runs_are_split_at_63() {
-        let mut net = Net::new(1, 2);
+        let now = Instant::now();
+        let (mut c, _s) = pair(now);
+        // 101 lost, 102..=231 received.
+        for seq in 102..=231 {
+            c.handle_datagram(now, &source(seq));
+        }
+        let (ack, runs) = last_ack(&mut c, now);
+        assert_eq!(ack, 231);
+        assert_eq!(
+            runs,
+            vec![
+                Run { state: STATE_NOT_RECEIVED, len: 1 },
+                Run { state: STATE_RECEIVED, len: 63 },
+                Run { state: STATE_RECEIVED, len: 63 },
+                Run { state: STATE_RECEIVED, len: 4 }
+            ]
+        );
+    }
+
+    #[test]
+    fn ack_vector_starts_near_the_first_missing_packet() {
+        // Windows reads everything before the vector as received, so the vector must never skip
+        // a gap: it starts a short prefix before the first missing packet.
+        let now = Instant::now();
+        let (mut c, _s) = pair(now);
+        for seq in 101..=300 {
+            c.handle_datagram(now, &source(seq));
+        }
+        let (ack, runs) = last_ack(&mut c, now);
+        assert_eq!(ack, 300);
+        assert_eq!(runs.iter().map(|r| usize::from(r.len)).sum::<usize>(), ACK_PREFIX);
+        // 301 lost: the vector still reaches back past it.
+        for seq in 302..=305 {
+            c.handle_datagram(now, &source(seq));
+        }
+        let (ack, runs) = last_ack(&mut c, now);
+        assert_eq!(ack, 305);
+        let base = ack - runs.iter().map(|r| u32::from(r.len)).sum::<u32>() + 1;
+        assert!(base <= 301, "vector starts at {base}");
+    }
+
+    #[test]
+    fn an_overlong_vector_is_cut_at_the_newest_end() {
+        let now = Instant::now();
+        let (mut c, _s) = pair(now);
+        // Every other packet lost: 101, 103, ... missing; 102, 104, ... received.
+        for seq in (102..=900).step_by(2) {
+            c.handle_datagram(now, &source(seq));
+        }
+        let (ack, runs) = c.ack_runs(DATA_ACK_RUNS);
+        assert_eq!(runs.len(), DATA_ACK_RUNS);
+        assert_eq!(runs[0], Run { state: STATE_NOT_RECEIVED, len: 1 }, "starts at the first gap");
+        let covered: u32 = runs.iter().map(|r| u32::from(r.len)).sum();
+        assert_eq!(ack, 100 + covered, "snSourceAck lowered to the vector's end");
+    }
+
+    #[test]
+    fn packets_before_the_vector_count_as_acknowledged() {
+        // The live failure: Windows' vectors listed only its latest 54 packets, so a packet it
+        // had received earlier never appeared in one and was resent until the limit.
+        let now = Instant::now();
+        let (mut c, mut s) = pair(now);
+        c.handle_datagram(now, &wire::encode(&Outgoing { source_ack: 100, receive_window: 200, ..Default::default() }));
+        for d in chunks(10, 10) {
+            c.send(d);
+        }
+        while c.poll_transmit(now).is_some() {}
+        assert_eq!(c.queued(), 100);
+        // Packets 2..=11 sent; the peer lists only 8..=11.
+        let ack = wire::encode(&Outgoing {
+            source_ack: 11,
+            receive_window: 200,
+            ack_vector: &[Run { state: STATE_RECEIVED, len: 4 }],
+            ..Default::default()
+        });
+        c.handle_datagram(now, &ack);
+        assert_eq!(c.queued(), 0, "{}", c.debug_state());
+        // An empty vector acknowledges everything up to snSourceAck.
+        c.send(vec![1; 10]);
+        while c.poll_transmit(now).is_some() {}
+        c.handle_datagram(now, &wire::encode(&Outgoing { source_ack: 12, receive_window: 200, ..Default::default() }));
+        assert_eq!(c.queued(), 0);
+        let _ = &mut s;
+    }
+
+    /// The simulated network with a receiver that, like Windows, lists only its latest few
+    /// packets: the transfer must still complete without hitting the retransmit limit.
+    #[test]
+    fn works_with_a_peer_that_lists_only_recent_packets() {
+        let mut net = Net::new(1000, 2);
+        net.delay = Duration::from_millis(1);
         established(&mut net);
-        transfer(&mut net, &chunks(130, 10), false, Duration::from_secs(10));
-        // Runs never exceed 63 and together cover exactly the tracked range.
-        let runs = net.client.ack_runs(MAX_ACK_RUNS);
-        assert!(runs.iter().all(|r| r.len <= 63));
-        assert_eq!(runs.iter().map(|r| u32::from(r.len)).sum::<u32>(), net.client.got.len() as u32);
+        net.server().ack_prefix = 0;
+        // A loss early on, then plenty of traffic.
+        net.drop = Box::new(|to_server, i, _| to_server && i == 5);
+        transfer(&mut net, &chunks(500, 500), true, Duration::from_secs(10));
+        assert!(net.client.is_established());
     }
 
     #[test]
