@@ -1256,6 +1256,20 @@ fn build_connector(
             .with_dynamic_channel_factory(ironrdp_rdpsnd::client::DVC_CHANNEL_NAME, move || a.channel())
             .with_dynamic_channel_factory(ironrdp_rdpsnd::client::LOSSY_DVC_CHANNEL_NAME, move || b.lossy_channel());
     }
+    // With a UDP tunnel, Windows asks for device redirection again as a dynamic channel and
+    // starts no audio output until it gets one (see `svc_dvc`). Offered whenever the static
+    // RDPDR is attached below, with the same folder sharing.
+    if p.drive.enabled || p.audio.playback || p.audio.microphone || p.camera.enabled {
+        let profile = p.clone();
+        let client_name = ctx.params.client_name.clone();
+        drdynvc = drdynvc.with_dynamic_channel_factory("rdpdr", move || {
+            let drive = profile.drive.enabled.then(|| drive_channel(&profile, &client_name).ok()).flatten();
+            let rdpdr = drive.unwrap_or_else(|| {
+                ironrdp_rdpdr::Rdpdr::new(Box::new(ironrdp_rdpdr::NoopRdpdrBackend), client_name.clone())
+            });
+            crate::svc_dvc::SvcOverDvc::new("rdpdr", rdpdr)
+        });
+    }
     // Microphone and camera both push data produced on their own threads through this uplink.
     if p.camera.enabled {
         let host = ctx.params.camera_host.clone().unwrap_or_else(bastion_camera::default_host);

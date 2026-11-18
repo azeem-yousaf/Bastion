@@ -9,6 +9,7 @@ mod keep_active;
 pub mod keyboard;
 pub mod layout;
 pub mod link;
+pub mod svc_dvc;
 pub mod tls;
 pub mod udp;
 pub mod wake;
