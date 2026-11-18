@@ -48,6 +48,8 @@ const MAX_ACK_RUNS: usize = 256;
 const ACK_HISTORY: u32 = 1024;
 const MAX_CWND: f64 = RECEIVE_WINDOW as f64;
 const INITIAL_CWND: f64 = 10.0;
+/// Acknowledgements kept for [`Conn::diagnostics`].
+const RECENT_ACKS: usize = 8;
 /// Never shrink below this: with fewer packets in flight, three later acknowledgements can't
 /// arrive and every loss would wait for the retransmit time-out.
 const MIN_CWND: f64 = 4.0;
@@ -130,6 +132,8 @@ pub struct Conn {
     cwr_seq: Option<u32>,
     since_ack_of_acks: u32,
     stats: Stats,
+    /// The peer's latest acknowledgements (snSourceAck, flags, vector), for failure reports.
+    recent_acks: VecDeque<(u32, u16, Vec<Run>)>,
 
     // Receiver.
     /// The ACK vector covers `floor + 1 ..= floor + got.len()`.
@@ -174,6 +178,7 @@ impl Conn {
             cwr_seq: None,
             since_ack_of_acks: 0,
             stats: Stats::default(),
+            recent_acks: VecDeque::new(),
             floor: 0,
             got: VecDeque::new(),
             next_deliver: 0,
@@ -245,6 +250,36 @@ impl Conn {
 
     pub fn stats(&self) -> Stats {
         self.stats
+    }
+
+    /// One line describing the sender's state and the peer's latest acknowledgements, logged
+    /// when the connection fails (never per packet).
+    pub fn diagnostics(&self) -> String {
+        use std::fmt::Write as _;
+        let mut s = format!(
+            "local_isn={} peer_isn={} version={} next_source={} oldest_unacked={:?} in_flight={} cwnd={:.1} peer_window={} \
+             rtt={:?} highest_received={} next_deliver={} {:?}; recent acks (snSourceAck flags [state:len]):",
+            self.local.initial_seq,
+            self.peer_isn,
+            self.version,
+            self.next_source,
+            self.in_flight.iter().find(|f| !f.acked).map(|f| (f.source, f.retransmits)),
+            self.in_flight.len(),
+            self.cwnd,
+            self.peer_window,
+            self.srtt,
+            self.highest(),
+            self.next_deliver,
+            self.stats,
+        );
+        for (ack, flags, runs) in &self.recent_acks {
+            let _ = write!(s, " {ack} {flags:#06x} [");
+            for r in runs {
+                let _ = write!(s, "{}:{} ", r.state, r.len);
+            }
+            s.push(']');
+        }
+        s
     }
 
     pub fn rtt(&self) -> Option<Duration> {
@@ -516,6 +551,10 @@ impl Conn {
     }
 
     fn on_ack(&mut self, now: Instant, highest: u32, runs: &[Run], flags: u16) {
+        if self.recent_acks.len() == RECENT_ACKS {
+            self.recent_acks.pop_front();
+        }
+        self.recent_acks.push_back((highest, flags, runs.to_vec()));
         let total: u32 = runs.iter().map(|r| u32::from(r.len)).sum();
         // Only acknowledgements of something we sent count (5.1.1).
         if total > 0 && seq_before(highest, self.next_source) {
@@ -544,19 +583,16 @@ impl Conn {
                 self.cwnd = if self.cwnd < self.ssthresh { self.cwnd + 1.0 } else { self.cwnd + 1.0 / self.cwnd };
             }
             self.cwnd = self.cwnd.min(MAX_CWND);
-            // Lost: not acknowledged while three later ones were. A retransmit gets a round trip
-            // before the same evidence can declare it lost again.
-            let rtt = self.srtt.unwrap_or(self.min_rto());
+            // Lost: not acknowledged while three later ones were. Each packet gets one fast
+            // retransmit; if that copy is lost too, the retransmit time-out takes over (as in TCP).
+            // Re-sending on every acknowledgement would use up the retransmit limit within a few
+            // round trips on a fast LAN.
             let mut later = 0;
             let mut lost = false;
             for f in self.in_flight.iter_mut().rev() {
                 if f.acked {
                     later += 1;
-                } else if later >= 3
-                    && !f.resend
-                    && seq_before(f.source, highest)
-                    && (f.retransmits == 0 || now.saturating_duration_since(f.sent_at) >= rtt)
-                {
+                } else if later >= 3 && !f.resend && f.retransmits == 0 && seq_before(f.source, highest) {
                     f.resend = true;
                     lost = true;
                     self.stats.fast_retransmits += 1;
@@ -1126,6 +1162,40 @@ mod tests {
         let runs = net.client.ack_runs(MAX_ACK_RUNS);
         assert!(runs.iter().all(|r| r.len <= 63));
         assert_eq!(runs.iter().map(|r| u32::from(r.len)).sum::<u32>(), net.client.got.len() as u32);
+    }
+
+    #[test]
+    fn a_twice_lost_packet_on_a_fast_link_is_recovered_not_fatal() {
+        // A 2 ms round trip (a home LAN). Packet 4 from the client is lost twice: the original
+        // and its fast retransmit. Re-sending it on every later acknowledgement would use up the
+        // retransmit limit within milliseconds; the time-out must recover it instead.
+        let mut net = Net::new(1000, 2);
+        net.delay = Duration::from_millis(1);
+        established(&mut net);
+        let mut lost = 0;
+        net.drop = Box::new(move |to_server, _, d| {
+            let hit = to_server
+                && matches!(wire::decode(d).map(|d| d.payload), Ok(Some(Payload::Source { source: 1004, .. })));
+            if hit && lost < 2 {
+                lost += 1;
+                return true;
+            }
+            false
+        });
+        transfer(&mut net, &chunks(400, 500), true, Duration::from_secs(10));
+        assert!(net.client.is_established());
+        let s = net.client.stats();
+        assert_eq!(s.fast_retransmits, 1, "{s:?}");
+        assert_eq!(s.timeout_retransmits, 1, "{s:?}");
+    }
+
+    #[test]
+    fn diagnostics_list_the_peers_recent_acknowledgements() {
+        let mut net = Net::new(1, 2);
+        established(&mut net);
+        transfer(&mut net, &chunks(30, 100), true, Duration::from_secs(5));
+        let d = net.client.diagnostics();
+        assert!(d.contains("recent acks") && d.contains("0x0004 [0:"), "{d}");
     }
 
     #[test]

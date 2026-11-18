@@ -322,9 +322,10 @@ async fn run(mut link: Link, mut out: mpsc::UnboundedReceiver<Vec<u8>>, inbound:
         }
     }
     .await;
+    let stats = link.conn.stats();
     match result {
-        Ok(()) => debug!("UDP tunnel closed"),
-        Err(e) => warn!(error = %e, "UDP tunnel failed"),
+        Ok(()) => info!(?stats, "UDP tunnel closed"),
+        Err(e) => warn!(error = %e, details = %link.conn.diagnostics(), "UDP tunnel failed"),
     }
 }
 
