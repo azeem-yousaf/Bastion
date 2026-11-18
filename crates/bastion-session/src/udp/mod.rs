@@ -151,7 +151,10 @@ async fn setup(p: TunnelParams) -> Result<UdpTunnel, TunnelError> {
     let config = client_config(&p.server_key, conn.max_payload())?;
     let name =
         ServerName::try_from(p.server_name.clone()).map_err(|_| rustls::Error::General("bad server name".into()))?;
-    let tls = rustls::ClientConnection::new(Arc::new(config), name)?;
+    let mut tls = rustls::ClientConnection::new(Arc::new(config), name)?;
+    // No cap on plaintext waiting to be encrypted (rustls defaults to 64 KiB and then refuses
+    // writes): a burst of webcam frames is larger, and the transport queues and paces it anyway.
+    tls.set_buffer_limit(None);
     let mut link = Link { socket, conn, tls: tls.into(), stream: tunnel::Reassembler::default(), buf };
     while link.tls.is_handshaking() {
         link.flush()?;
@@ -248,18 +251,24 @@ impl Link {
             while !rest.is_empty() {
                 self.tls.read_tls(&mut rest)?;
                 self.tls.process_new_packets()?;
+                // Take the plaintext out after every record: rustls refuses more input once
+                // 16 KiB of it is waiting, and one burst of datagrams carries far more.
+                self.drain_plaintext()?;
             }
         }
+        Ok(())
+    }
+
+    fn drain_plaintext(&mut self) -> Result<(), TunnelError> {
         let mut plain = [0u8; 16384];
         loop {
             match self.tls.reader().read(&mut plain) {
                 Ok(0) => return Err(TunnelError::PeerClosed),
                 Ok(n) => self.stream.push(&plain[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(())
     }
 }
 
@@ -470,7 +479,8 @@ pub(crate) mod tests {
             .with_no_client_auth()
             .with_single_cert(vec![cert.cert.der().clone()], key)
             .unwrap();
-        let tls = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+        let mut tls = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+        tls.set_buffer_limit(None);
         let mut link = Link { socket, conn, tls: tls.into(), stream: tunnel::Reassembler::default(), buf };
         loop {
             while let Some(pdu) = link.stream.next_pdu().unwrap() {
@@ -482,6 +492,12 @@ pub(crate) mod tests {
                         let mut resp = vec![tunnel::ACTION_CREATE_RESPONSE, 4, 0, 4];
                         resp.extend_from_slice(&hr.to_le_bytes());
                         link.tls.writer().write_all(&resp).unwrap();
+                    }
+                    tunnel::ACTION_DATA if pdu.payload == b"burst" => {
+                        // 256 KiB written at once: arrives as one burst of datagrams.
+                        for i in 0..64u8 {
+                            link.tls.writer().write_all(&tunnel::data(&[i; 4096], &[]).unwrap()).unwrap();
+                        }
                     }
                     tunnel::ACTION_DATA => {
                         let mut echo = b"echo:".to_vec();
@@ -526,6 +542,37 @@ pub(crate) mod tests {
             assert!(t.send(msg.clone()));
             let got = tokio::time::timeout(Duration::from_secs(5), t.recv()).await.unwrap().unwrap();
             assert_eq!(got, [b"echo:".to_vec(), msg].concat());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_large_burst_from_the_server_is_received() {
+        // Live failure: graphics arrive in bursts far larger than the 16 KiB rustls holds
+        // undelivered ("received plaintext buffer full").
+        let cookie = [3u8; 16];
+        let (peer, server_key) = server(cookie).await;
+        let params = TunnelParams { peer, server_name: "pc01".into(), server_key, request_id: 7, cookie };
+        let mut t = UdpTunnel::connect(params).await.expect("tunnel");
+        assert!(t.send(b"burst".to_vec()));
+        for i in 0..64u8 {
+            let got = tokio::time::timeout(Duration::from_secs(5), t.recv()).await.unwrap().unwrap();
+            assert_eq!(got, vec![i; 4096]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_large_upload_is_sent() {
+        // Webcam frames can queue up well past rustls' default 64 KiB send buffer.
+        let cookie = [4u8; 16];
+        let (peer, server_key) = server(cookie).await;
+        let params = TunnelParams { peer, server_name: "pc01".into(), server_key, request_id: 7, cookie };
+        let mut t = UdpTunnel::connect(params).await.expect("tunnel");
+        for i in 0..64u8 {
+            assert!(t.send(vec![i; 4096]));
+        }
+        for i in 0..64u8 {
+            let got = tokio::time::timeout(Duration::from_secs(5), t.recv()).await.unwrap().unwrap();
+            assert_eq!(got, [b"echo:".to_vec(), vec![i; 4096]].concat());
         }
     }
 
