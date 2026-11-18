@@ -139,7 +139,7 @@ async fn setup(p: TunnelParams) -> Result<UdpTunnel, TunnelError> {
     let mut conn = Conn::connect(Instant::now(), random_u32());
     let mut buf = vec![0u8; 65536];
     while !conn.is_established() {
-        transmit(&socket, &mut conn)?;
+        transmit(&socket, &mut conn).await?;
         wait(&socket, &mut conn, &mut buf).await?;
     }
     debug!(version = conn.version(), payload = conn.max_payload(), "UDP transport handshake done");
@@ -153,12 +153,12 @@ async fn setup(p: TunnelParams) -> Result<UdpTunnel, TunnelError> {
     tls.set_buffer_limit(None);
     let mut link = Link { socket, conn, tls: tls.into(), stream: tunnel::Reassembler::default(), buf };
     while link.tls.is_handshaking() {
-        link.flush()?;
+        link.flush().await?;
         link.wait().await?;
     }
     link.tls.writer().write_all(&tunnel::create_request(p.request_id, &p.cookie))?;
     let first = loop {
-        link.flush()?;
+        link.flush().await?;
         if let Some(pdu) = link.stream.next_pdu()? {
             break pdu;
         }
@@ -201,16 +201,13 @@ fn grow_buffers(socket: &UdpSocket) {
     }
 }
 
-/// Sends every datagram that is due. A full socket buffer drops the datagram: the transport
-/// retransmits it like any other loss.
-fn transmit(socket: &UdpSocket, conn: &mut Conn) -> Result<(), TunnelError> {
+/// Sends every datagram that is due. When the socket buffer is full this waits for room rather
+/// than dropping the datagram, which would only come back as a retransmit 300 ms later.
+async fn transmit(socket: &UdpSocket, conn: &mut Conn) -> Result<(), TunnelError> {
     let now = Instant::now();
     while let Some(d) = conn.poll_transmit(now) {
-        match socket.try_send(&d) {
-            Ok(_) => bastion_metrics::NET_TX.add(d.len() as u64),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e.into()),
-        }
+        socket.send(&d).await?;
+        bastion_metrics::NET_TX.add(d.len() as u64);
     }
     match conn.closed() {
         Some(c) => Err(c.into()),
@@ -250,7 +247,7 @@ struct Link {
 
 impl Link {
     /// Moves TLS output into the transport and sends what is due.
-    fn flush(&mut self) -> Result<(), TunnelError> {
+    async fn flush(&mut self) -> Result<(), TunnelError> {
         if self.tls.wants_write() {
             let mut out = Vec::new();
             while self.tls.wants_write() {
@@ -260,7 +257,7 @@ impl Link {
                 self.conn.send(chunk);
             }
         }
-        transmit(&self.socket, &mut self.conn)
+        transmit(&self.socket, &mut self.conn).await
     }
 
     /// Waits for input or a timer, then decrypts whatever arrived in order.
@@ -338,7 +335,7 @@ async fn run(
                     return Ok(());
                 }
             }
-            link.flush()?;
+            link.flush().await?;
             tokio::select! {
                 _ = &mut stop => return Ok(()),
                 _ = watchdog.tick() => {
@@ -540,7 +537,7 @@ pub(crate) mod tests {
                     _ => panic!("unexpected action"),
                 }
             }
-            if link.flush().is_err() || link.wait().await.is_err() {
+            if link.flush().await.is_err() || link.wait().await.is_err() {
                 return;
             }
         }

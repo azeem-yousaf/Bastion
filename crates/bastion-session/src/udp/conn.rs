@@ -52,6 +52,12 @@ const MAX_ACK_RUNS: usize = 256;
 /// peer sends no ACK-of-ACKs.
 const ACK_HISTORY: u32 = 1024;
 const MAX_CWND: f64 = RECEIVE_WINDOW as f64;
+/// Most packets in flight from the oldest unacknowledged one, whatever the peer advertises.
+/// Windows acknowledges only up to its first missing packet and, with too many waiting behind
+/// that gap, drops every new packet — the retransmit that fills the gap included — so the
+/// session froze under heavy upload. At 48 × ~1.2 kB per round trip this still allows over
+/// 20 MB/s on a LAN.
+const MAX_SPAN: usize = 48;
 const INITIAL_CWND: f64 = 10.0;
 /// Already-delivered packets repeated at the start of each ACK vector.
 const ACK_PREFIX: usize = 32;
@@ -149,6 +155,11 @@ pub struct Conn {
     /// Delivered packets repeated at the start of each ACK vector ([`ACK_PREFIX`]; tests use 0
     /// to behave like a peer that lists only packets it still waits for).
     ack_prefix: usize,
+    /// Tests: behave like Windows' receiver as seen live — acknowledge only the unbroken run up
+    /// to the first missing packet (at most 54 of it), and hold at most this many packets out of
+    /// order, dropping any packet that arrives while that buffer is full.
+    #[cfg(test)]
+    windows_like: Option<usize>,
 
     // Receiver.
     /// The ACK vector covers `floor + 1 ..= floor + got.len()`.
@@ -197,6 +208,8 @@ impl Conn {
             gave_up_on: None,
             gap_since: None,
             ack_prefix: ACK_PREFIX,
+            #[cfg(test)]
+            windows_like: None,
             floor: 0,
             got: VecDeque::new(),
             next_deliver: 0,
@@ -515,6 +528,10 @@ impl Conn {
             }
             return;
         }
+        #[cfg(test)]
+        if self.windows_like.is_some_and(|limit| self.buffered.len() >= limit) {
+            return;
+        }
         let idx = seq.wrapping_sub(self.floor).wrapping_sub(1) as usize;
         if idx < self.got.len() && self.got[idx] {
             self.stats.duplicates += 1;
@@ -579,10 +596,18 @@ impl Conn {
     /// lowered with it: under-reporting delays an acknowledgement, over-reporting would lose data.
     fn ack_runs(&self, max: usize) -> (u32, Vec<Run>) {
         let first_missing = self.next_deliver.wrapping_sub(self.floor).wrapping_sub(1) as usize;
-        let skip = first_missing.saturating_sub(self.ack_prefix).min(self.got.len());
+        #[allow(unused_mut)]
+        let mut skip = first_missing.saturating_sub(self.ack_prefix).min(self.got.len());
+        #[allow(unused_mut)]
+        let mut until = self.got.len();
+        #[cfg(test)]
+        if self.windows_like.is_some() {
+            until = first_missing.min(self.got.len());
+            skip = until.saturating_sub(54);
+        }
         let mut runs: Vec<Run> = Vec::new();
         let mut end = self.floor.wrapping_add(skip as u32);
-        for &g in self.got.iter().skip(skip) {
+        for &g in self.got.iter().take(until).skip(skip) {
             let state = if g { STATE_RECEIVED } else { STATE_NOT_RECEIVED };
             let full = runs.len() == max;
             match runs.last_mut() {
@@ -768,7 +793,7 @@ impl Conn {
         // the span from the oldest unacknowledged one, which the receiver must buffer.
         let mut outstanding = self.in_flight.iter().filter(|f| !f.acked).count();
         while outstanding < self.cwnd as usize
-            && self.in_flight.len() < usize::from(self.peer_window)
+            && self.in_flight.len() < usize::from(self.peer_window).min(MAX_SPAN)
             && let Some(data) = self.pending.pop_front()
         {
             outstanding += 1;
@@ -951,7 +976,11 @@ mod tests {
 
         fn run_until(&mut self, mut done: impl FnMut(&mut Self) -> bool, limit: Duration) {
             let end = self.now + limit;
+            // A livelock (events forever at one instant) must fail the test, not hang CI.
+            let mut steps = 0u64;
             while !done(self) {
+                steps += 1;
+                assert!(steps < 5_000_000, "simulation livelocked: {}", self.client.debug_state());
                 assert!(
                     self.now < end,
                     "simulation did not finish in {limit:?}: client {}, server {}",
@@ -1395,6 +1424,22 @@ mod tests {
         assert_eq!(c.stall(now + STALL), Some("a packet from the remote computer is missing"));
         c.handle_datagram(now + STALL, &source(101));
         assert_eq!(c.stall(now + STALL * 2), None, "cleared once the gap is filled");
+    }
+
+    /// Live (4 MB/s webcam upload): Windows acknowledges only up to its first missing packet,
+    /// and once enough packets wait behind that gap it drops everything — including the
+    /// retransmit that would fill it. The sender must keep what it has outstanding past its
+    /// oldest unacknowledged packet small enough for that buffer.
+    #[test]
+    fn heavy_upload_with_loss_to_a_windows_like_receiver() {
+        let mut net = Net::new(1000, 2);
+        net.delay = Duration::from_millis(2);
+        established(&mut net);
+        net.server().windows_like = Some(64);
+        // A long loss-free run lets the window grow, then one packet is lost.
+        net.drop = Box::new(|to_server, i, _| to_server && i == 2500);
+        transfer(&mut net, &chunks(4000, 1100), true, Duration::from_secs(60));
+        assert!(net.client.is_established() && net.server().is_established());
     }
 
     #[test]
