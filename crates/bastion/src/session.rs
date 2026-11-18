@@ -30,6 +30,8 @@ pub struct View {
     /// Remote-desktop region shown by this window (x, y, w, h). `None` = whole desktop.
     region: Option<(u32, u32, u32, u32)>,
     tex_id: Option<egui::TextureId>,
+    /// Sampling filter `tex_id` is registered with: nearest while shown pixel for pixel.
+    tex_filter: wgpu::FilterMode,
     /// Where the image was drawn last frame (window physical pixels).
     image_rect: Option<(f64, f64, f64, f64)>,
     pointer_in_ui: bool,
@@ -68,6 +70,8 @@ pub struct Session {
     /// Keyboard goes to the remote session (false after the release chord until clicked back).
     grabbed: bool,
     texture: Option<(wgpu::Texture, wgpu::TextureView, u64)>,
+    /// Dirty pixels packed out of the shared frame, reused between uploads (see `upload`).
+    upload_buf: Vec<u8>,
     cursor_cache: HashMap<usize, CustomCursor>,
     remote_cursor: RemoteCursor,
     pending_layout: Option<(Instant, DesktopLayout)>,
@@ -149,6 +153,7 @@ impl View {
             gfx,
             region,
             tex_id: None,
+            tex_filter: wgpu::FilterMode::Linear,
             image_rect: None,
             pointer_in_ui: false,
             bar: BarState::Hidden,
@@ -296,6 +301,49 @@ pub fn isolate_keyboard(ctx: &egui::Context) {
 
 /// Checks a desktop size chosen by the remote computer against what the GPU can hold in one
 /// texture (`max_side`). The error is shown to the user as the reason the session ended.
+/// Copies each rectangle of a `width`-pixel-wide RGBA frame into `buf`, rows packed tightly,
+/// one rectangle after another; returns each rectangle's byte offset in `buf`. Rectangles are
+/// already clipped to the frame.
+fn pack_rects(frame: &[u8], width: u32, rects: &[bastion_session::Rect], buf: &mut Vec<u8>) -> Vec<u64> {
+    buf.clear();
+    let stride = width as usize * 4;
+    rects
+        .iter()
+        .map(|d| {
+            let offset = buf.len() as u64;
+            let row = d.w as usize * 4;
+            for y in d.y as usize..(d.y + d.h) as usize {
+                let start = y * stride + d.x as usize * 4;
+                buf.extend_from_slice(&frame[start..start + row]);
+            }
+            offset
+        })
+        .collect()
+}
+
+/// How far (physical pixels, per side) the remote image may fall short of the window and still
+/// be shown pixel for pixel rather than stretched. RDP rounds widths down to even numbers, and
+/// a resize reaches the remote computer a moment late; stretching by 0.9996 for that would
+/// blur every pixel of text.
+const UNSCALED_SLACK: u32 = 8;
+
+/// Where a `src` (w, h) remote image goes in a `win` (w, h) window, in window physical pixels
+/// (x, y, w, h), and whether it is shown pixel for pixel. Otherwise it is fitted preserving
+/// its aspect ratio, centred.
+pub(crate) fn place_image(win: (u32, u32), src: (u32, u32)) -> ((f64, f64, f64, f64), bool) {
+    let fits = |w: u32, s: u32| s <= w && w - s <= UNSCALED_SLACK;
+    if fits(win.0, src.0) && fits(win.1, src.1) {
+        // Whole-pixel offsets: half a pixel off would resample everything.
+        let (x, y) = ((win.0 - src.0) / 2, (win.1 - src.1) / 2);
+        return ((f64::from(x), f64::from(y), f64::from(src.0), f64::from(src.1)), true);
+    }
+    let (ww, wh) = (f64::from(win.0), f64::from(win.1));
+    let (sw, sh) = (f64::from(src.0.max(1)), f64::from(src.1.max(1)));
+    let scale = (ww / sw).min(wh / sh);
+    let (w, h) = (sw * scale, sh * scale);
+    (((ww - w) / 2.0, (wh - h) / 2.0, w, h), false)
+}
+
 pub fn check_desktop_size(width: u32, height: u32, max_side: u32) -> Result<(), String> {
     if crate::gpu::texture_size_ok(width, height, max_side) {
         return Ok(());
@@ -395,6 +443,7 @@ impl Session {
             input: InputState::new(),
             grabbed: true,
             texture: None,
+            upload_buf: Vec::new(),
             cursor_cache: HashMap::new(),
             remote_cursor: RemoteCursor::Default,
             pending_layout: None,
@@ -948,16 +997,10 @@ impl Session {
             let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
             for v in self.views.values_mut() {
                 match v.tex_id {
-                    Some(id) => v.gfx.renderer.update_egui_texture_from_wgpu_texture(
-                        &gpu.device,
-                        &view,
-                        wgpu::FilterMode::Linear,
-                        id,
-                    ),
-                    None => {
-                        v.tex_id =
-                            Some(v.gfx.renderer.register_native_texture(&gpu.device, &view, wgpu::FilterMode::Linear))
+                    Some(id) => {
+                        v.gfx.renderer.update_egui_texture_from_wgpu_texture(&gpu.device, &view, v.tex_filter, id)
                     }
+                    None => v.tex_id = Some(v.gfx.renderer.register_native_texture(&gpu.device, &view, v.tex_filter)),
                 }
             }
             self.texture = Some((tex, view, f.generation));
@@ -971,9 +1014,14 @@ impl Session {
             bastion_metrics::FRAME_LATENCY.since(t);
         }
         let started = Instant::now();
+        // Only a memcpy of the changed rows into a warm, reused buffer happens under the lock;
+        // `write_texture` (which allocates fresh staging memory per call) runs after it is
+        // released, so the graphics thread no longer waits for it.
+        let packed = pack_rects(&f.data, f.width, &rects, &mut self.upload_buf);
+        drop(f);
+        bastion_metrics::UI_UPLOAD_LOCK.since(started);
         let Some((tex, _, _)) = self.texture.as_ref() else { return };
-        for d in &rects {
-            let offset = (u64::from(d.y) * u64::from(f.width) + u64::from(d.x)) * 4;
+        for (d, offset) in rects.iter().zip(packed) {
             gpu.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: tex,
@@ -981,8 +1029,8 @@ impl Session {
                     origin: wgpu::Origin3d { x: d.x, y: d.y, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
-                &f.data,
-                wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(f.width * 4), rows_per_image: Some(d.h) },
+                &self.upload_buf,
+                wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(d.w * 4), rows_per_image: Some(d.h) },
                 wgpu::Extent3d { width: d.w, height: d.h, depth_or_array_layers: 1 },
             );
             bastion_metrics::UI_UPLOAD_BYTES.add(d.area() * 4);
@@ -1076,6 +1124,17 @@ impl Session {
         if pinned {
             view.bar = BarState::Pinned;
         }
+        let size = view.gfx.window.inner_size();
+        let (placed, unscaled) = place_image((size.width, size.height), (src.2, src.3));
+        // Pixel for pixel, nearest sampling keeps text exact even if float rounding puts a
+        // sample a hair off a texel centre; a scaled image needs linear filtering.
+        let filter = if unscaled { wgpu::FilterMode::Nearest } else { wgpu::FilterMode::Linear };
+        if view.tex_filter != filter {
+            view.tex_filter = filter;
+            if let (Some(id), Some((_, tex_view, _))) = (view.tex_id, self.texture.as_ref()) {
+                view.gfx.renderer.update_egui_texture_from_wgpu_texture(&gpu.device, tex_view, filter, id);
+            }
+        }
         let tex_id = view.tex_id;
         let fullscreen = view.gfx.window.fullscreen().is_some();
         let show_bar = view.bar != BarState::Hidden;
@@ -1098,23 +1157,17 @@ impl Session {
             egui::CentralPanel::no_frame().show(ui, |ui| {
                 let avail = ui.max_rect();
                 if let (Some(tex), true) = (tex_id, fw > 0 && fh > 0) {
-                    // Fit preserving aspect ratio; exact 1:1 when sizes match (dynamic resolution).
-                    let (sw, sh) = (src.2 as f32 / ppp as f32, src.3 as f32 / ppp as f32);
-                    let scale = (avail.width() / sw).min(avail.height() / sh);
-                    let size = egui::vec2(sw * scale, sh * scale);
-                    let rect = egui::Rect::from_center_size(avail.center(), size);
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2((placed.0 / ppp) as f32, (placed.1 / ppp) as f32),
+                        egui::vec2((placed.2 / ppp) as f32, (placed.3 / ppp) as f32),
+                    );
                     let uv = egui::Rect::from_min_max(
                         egui::pos2(src.0 as f32 / fw as f32, src.1 as f32 / fh as f32),
                         egui::pos2((src.0 + src.2) as f32 / fw as f32, (src.1 + src.3) as f32 / fh as f32),
                     );
                     ui.painter().rect_filled(avail, 0.0, egui::Color32::BLACK);
                     ui.painter().image(tex, rect, uv, egui::Color32::WHITE);
-                    image_rect = Some((
-                        f64::from(rect.min.x) * ppp,
-                        f64::from(rect.min.y) * ppp,
-                        f64::from(rect.width()) * ppp,
-                        f64::from(rect.height()) * ppp,
-                    ));
+                    image_rect = Some(placed);
                 } else {
                     ui.painter().rect_filled(avail, 0.0, egui::Color32::from_rgb(0x10, 0x12, 0x16));
                 }
@@ -1641,5 +1694,51 @@ mod bar_tests {
             bar_on_pointer(BarState::Hover, egui::pos2(W / 2.0 + 200.0, 30.0), W, true, bar()).0,
             BarState::Hover
         );
+    }
+}
+
+#[cfg(test)]
+mod place_tests {
+    use super::{pack_rects, place_image};
+    use bastion_session::Rect;
+
+    #[test]
+    fn dirty_rects_are_packed_row_by_row() {
+        // 4×3 frame, pixel value = its index.
+        let frame: Vec<u8> = (0..12u8).flat_map(|i| [i; 4]).collect();
+        let mut buf = vec![99; 3];
+        let rects = [Rect { x: 1, y: 1, w: 2, h: 2 }, Rect { x: 3, y: 0, w: 1, h: 1 }];
+        let offsets = pack_rects(&frame, 4, &rects, &mut buf);
+        assert_eq!(offsets, vec![0, 16]);
+        let px: Vec<u8> = buf.chunks(4).map(|p| p[0]).collect();
+        assert_eq!(px, vec![5, 6, 9, 10, 3]);
+    }
+
+    #[test]
+    fn matching_sizes_are_shown_pixel_for_pixel() {
+        assert_eq!(place_image((2560, 1440), (2560, 1440)), ((0.0, 0.0, 2560.0, 1440.0), true));
+    }
+
+    #[test]
+    fn odd_window_width_is_not_stretched() {
+        // RDP rounded 1921 down to 1920: a 1 px black margin, never a 0.9995× resample.
+        let ((x, y, w, h), unscaled) = place_image((1921, 1081), (1920, 1080));
+        assert!(unscaled);
+        assert_eq!((x, y, w, h), (0.0, 0.0, 1920.0, 1080.0));
+        // Offsets stay on whole pixels.
+        let ((x, y, _, _), _) = place_image((1925, 1083), (1920, 1080));
+        assert_eq!((x, y), (2.0, 1.0));
+    }
+
+    #[test]
+    fn larger_differences_are_fitted_preserving_aspect_ratio() {
+        let ((x, y, w, h), unscaled) = place_image((1920, 1200), (1920, 1080));
+        assert!(!unscaled);
+        assert_eq!((w, h), (1920.0, 1080.0));
+        assert_eq!((x, y), (0.0, 60.0));
+        // Remote larger than the window: shrunk to fit.
+        let ((_, _, w, h), unscaled) = place_image((1280, 720), (2560, 1440));
+        assert!(!unscaled);
+        assert_eq!((w, h), (1280.0, 720.0));
     }
 }

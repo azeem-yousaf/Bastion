@@ -729,7 +729,40 @@ impl GfxHandler {
     }
 }
 
+/// The capability sets advertised: IronRDP's defaults (10.7 down to 8) without `SMALL_CACHE`.
+/// With it the server may cache only 16 MB / 4096 entries — less than one screen of two
+/// 1440p monitors — and re-sends (and we re-decode) content it could have copied from the
+/// cache; without it the cache is 100 MB / 25 600 entries (MS-RDPEGFX 3.3.1.4). V10.3 always
+/// implies the small cache and has no flag for it.
+fn advertised_capabilities() -> Vec<ironrdp_egfx::pdu::CapabilitySet> {
+    use ironrdp_egfx::pdu::{
+        CapabilitiesV8Flags as F8, CapabilitiesV10Flags as F10, CapabilitiesV81Flags as F81,
+        CapabilitiesV103Flags as F103, CapabilitiesV104Flags as F104, CapabilitiesV107Flags as F107,
+        CapabilitySet as C,
+    };
+    vec![
+        C::V10_7 { flags: F107::empty() },
+        C::V10_6 { flags: F104::empty() },
+        C::V10_5 { flags: F104::empty() },
+        C::V10_4 { flags: F104::empty() },
+        C::V10_3 { flags: F103::empty() },
+        C::V10_2 { flags: F10::empty() },
+        C::V10_1,
+        C::V10 { flags: F10::empty() },
+        C::V8_1 { flags: F81::AVC420_ENABLED },
+        C::V8 { flags: F8::empty() },
+    ]
+}
+
 impl GraphicsPipelineHandler for GfxHandler {
+    fn capabilities(&self) -> Vec<ironrdp_egfx::pdu::CapabilitySet> {
+        advertised_capabilities()
+    }
+
+    fn on_surface_to_cache(&mut self, _pdu: &ironrdp_egfx::pdu::SurfaceToCachePdu) {
+        bastion_metrics::GFX_CACHE_STORES.incr();
+    }
+
     /// Only the codec is read (for metrics), so decoders may skip copying pixels for us.
     fn wants_bitmap_data(&self) -> bool {
         false
@@ -754,7 +787,8 @@ impl GraphicsPipelineHandler for GfxHandler {
         self.mark(codec_bits::OTHER);
     }
 
-    fn on_cache_to_surface(&mut self, _pdu: &ironrdp_egfx::pdu::CacheToSurfacePdu) {
+    fn on_cache_to_surface(&mut self, pdu: &ironrdp_egfx::pdu::CacheToSurfacePdu) {
+        bastion_metrics::GFX_CACHE_HITS.add(pdu.destination_points.len() as u64);
         self.mark(codec_bits::OTHER);
     }
 
@@ -833,6 +867,29 @@ mod tests {
         let caps = advertised(&display);
         assert!(matches!(caps.first(), Some(CapabilitySet::V10_7 { .. })), "{caps:?}");
         assert!(caps.iter().any(|c| matches!(c, CapabilitySet::V8_1 { .. })), "V8.1 kept as fallback: {caps:?}");
+    }
+
+    #[test]
+    fn the_large_bitmap_cache_is_advertised() {
+        use ironrdp_egfx::pdu::CapabilitySet as C;
+        let display = bastion_core::profile::DisplaySettings { hardware_decode: false, ..Default::default() };
+        let caps = advertised(&display);
+        assert!(caps.len() >= 9, "every version still offered: {caps:?}");
+        for c in &caps {
+            let small = match c {
+                C::V8 { flags } => flags.contains(ironrdp_egfx::pdu::CapabilitiesV8Flags::SMALL_CACHE),
+                C::V8_1 { flags } => flags.contains(ironrdp_egfx::pdu::CapabilitiesV81Flags::SMALL_CACHE),
+                C::V10 { flags } | C::V10_2 { flags } => {
+                    flags.contains(ironrdp_egfx::pdu::CapabilitiesV10Flags::SMALL_CACHE)
+                }
+                C::V10_4 { flags } | C::V10_5 { flags } | C::V10_6 { flags } => {
+                    flags.contains(ironrdp_egfx::pdu::CapabilitiesV104Flags::SMALL_CACHE)
+                }
+                C::V10_7 { flags } => flags.contains(ironrdp_egfx::pdu::CapabilitiesV107Flags::SMALL_CACHE),
+                _ => false,
+            };
+            assert!(!small, "small cache advertised in {c:?}");
+        }
     }
 
     #[test]

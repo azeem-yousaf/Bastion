@@ -533,6 +533,10 @@ fn to_rgba(p: &Planes<'_>) -> DecoderResult<DecodedFrame> {
                 width: p.width,
                 height: p.height,
             };
+            // Chroma is replicated over each 2×2 block on purpose. Bilinear upsampling was tried
+            // and measured worse on screen content (coloured text on flat backgrounds: 35 dB
+            // against 48.6 dB PSNR, visible pink/green halos): encoders average 2×2 blocks, so
+            // replication reconstructs flat colours exactly.
             yuv::yuv420_to_rgba(&img, &mut rgba, stride, RANGE, MATRIX).map_err(conv)?;
         }
         PlanesKind::Nv12 { uv, stride: cs } => {

@@ -188,6 +188,10 @@ pub static RDP_PROCESS: Histogram = Histogram::new("rdp.process", 30);
 pub static GFX_PROCESS: Histogram = Histogram::new("gfx.process", 30);
 /// Graphics-pipeline messages that failed (undecodable or out-of-protocol server data).
 pub static GFX_ERRORS: Counter = Counter::count("gfx.errors");
+/// Graphics copied from the bitmap cache instead of being sent again (CacheToSurface rects).
+pub static GFX_CACHE_HITS: Counter = Counter::count("gfx.cache_hits");
+/// Graphics the server stored in the bitmap cache (SurfaceToCache).
+pub static GFX_CACHE_STORES: Counter = Counter::count("gfx.cache_stores");
 /// `gfx.process` time of messages whose graphics used a single codec (the decoder's cost), so
 /// the slow one can be identified. `mixed` = several codecs in one PDU.
 pub static GFX_AVC420: Histogram = Histogram::new("gfx.avc420", 30);
@@ -241,6 +245,8 @@ pub static UI_REDRAW_SURFACE: Counter = Counter::count("ui.redraw.surface_retry"
 pub static UI_FRAMES_SKIPPED: Counter = Counter::count("ui.frames_skipped");
 /// Uploading dirty pixels to the GPU.
 pub static UI_UPLOAD: Histogram = Histogram::new("ui.upload", 10);
+/// How long the upload holds the shared frame (the graphics thread waits meanwhile).
+pub static UI_UPLOAD_LOCK: Histogram = Histogram::new("ui.upload.lock", 5);
 /// Building and presenting one window frame (egui + wgpu + present).
 pub static UI_RENDER: Histogram = Histogram::new("ui.render", 33);
 
@@ -277,6 +283,8 @@ static COUNTERS: &[&Counter] = &[
     &FRAME_UPDATES,
     &FRAME_PIXELS,
     &GFX_ERRORS,
+    &GFX_CACHE_HITS,
+    &GFX_CACHE_STORES,
     &VIDEO_FRAMES,
     &VIDEO_HW_FALLBACKS,
     &INPUT_BATCHES,
@@ -319,6 +327,7 @@ static HISTOGRAMS: &[&Histogram] = &[
     &INPUT_LATENCY,
     &UI_EVENT,
     &UI_UPLOAD,
+    &UI_UPLOAD_LOCK,
     &UI_RENDER,
     &AUDIO_DECODE,
     &AUDIO_BUFFER,
