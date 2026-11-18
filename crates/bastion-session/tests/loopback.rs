@@ -531,14 +531,43 @@ fn wake_on_lan_is_not_sent_to_a_computer_that_answers() {
     wait_disconnect(&h);
 }
 
+/// A local port whose connection attempts get no answer at all, like a computer that is
+/// asleep. Linux silently drops a SYN while the listener's accept queue is full (unless
+/// `net.ipv4.tcp_abort_on_overflow` is set), so we fill a backlog-0 queue and never accept.
+/// This replaced a TEST-NET address, whose behaviour depended on the developer's router.
+struct SilentPort {
+    port: u16,
+    _listener: socket2::Socket,
+    _queued: Vec<std::net::TcpStream>,
+}
+
+impl SilentPort {
+    fn new() -> Self {
+        use socket2::{Domain, Socket, Type};
+        let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        listener.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into()).unwrap();
+        listener.listen(0).unwrap();
+        let addr = listener.local_addr().unwrap().as_socket().unwrap();
+        let mut queued = Vec::new();
+        for _ in 0..16 {
+            match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)) {
+                Ok(s) => queued.push(s),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    return Self { port: addr.port(), _listener: listener, _queued: queued };
+                }
+                Err(e) => panic!("filling the accept queue: {e}"),
+            }
+        }
+        panic!("the accept queue never filled (is net.ipv4.tcp_abort_on_overflow set?)");
+    }
+}
+
 #[test]
 fn wake_on_lan_wakes_a_computer_that_does_not_answer() {
     let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     rx.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    // TEST-NET-1 (RFC 5737): never answers, like a computer that is asleep.
-    let mut p = wake_profile(3389, &rx);
-    p.host = "192.0.2.1".into();
-    let h = connect(p, PASSWORD, Arc::new(Mutex::new(TrustStore::in_memory())));
+    let asleep = SilentPort::new();
+    let h = connect(wake_profile(asleep.port, &rx), PASSWORD, Arc::new(Mutex::new(TrustStore::in_memory())));
     wait_event(&h, |e| matches!(e, Event::Status(Status::Waking)).then_some(()));
     let mut buf = [0u8; 200];
     let n = rx.recv(&mut buf).expect("magic packet");

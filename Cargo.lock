@@ -646,6 +646,7 @@ dependencies = [
  "rustls-native-certs",
  "sha2 0.10.9",
  "smallvec",
+ "socket2",
  "sspi",
  "tempfile",
  "thiserror 2.0.21",
