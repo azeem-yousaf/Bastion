@@ -226,6 +226,9 @@ pub struct DisplaySettings {
     pub monitors: Vec<String>,
     /// Visual effects vs. bandwidth.
     pub speed: ConnectionSpeed,
+    /// Accept the remote computer's offer to move graphics and audio onto UDP (direct
+    /// connections only; RD Gateway connections stay on TCP).
+    pub udp: bool,
 }
 
 impl Default for DisplaySettings {
@@ -240,6 +243,7 @@ impl Default for DisplaySettings {
             hardware_decode: true,
             monitors: Vec::new(),
             speed: ConnectionSpeed::Auto,
+            udp: true,
         }
     }
 }

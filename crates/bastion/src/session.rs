@@ -1502,6 +1502,7 @@ fn quality_chip(ui: &mut egui::Ui, quality: Option<&crate::quality::Quality>) {
                 row("Available", format!("{c:.0} Mbit/s (remote computer's estimate)"));
             }
             row("Route", if q.via_gateway { "Through RD Gateway" } else { "Direct" }.into());
+            row("Transport", if q.udp { "UDP (graphics and audio)" } else { "TCP" }.into());
         });
     });
 }

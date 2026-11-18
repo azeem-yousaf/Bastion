@@ -20,6 +20,7 @@ pub struct LinkStats {
     probe: Mutex<Option<TcpProbe>>,
     server: Mutex<Option<ServerReport>>,
     via_gateway: std::sync::atomic::AtomicBool,
+    udp: std::sync::atomic::AtomicBool,
 }
 
 /// A point-in-time reading; the UI turns two of them into rates.
@@ -33,6 +34,8 @@ pub struct LinkSample {
     pub tcp: Option<TcpSample>,
     pub server: Option<ServerReport>,
     pub via_gateway: bool,
+    /// Graphics and audio travel over the UDP tunnel.
+    pub udp: bool,
 }
 
 /// The kernel's view of the TCP connection (to the remote computer, or to the gateway).
@@ -70,12 +73,18 @@ impl LinkStats {
         *self.probe.lock().unwrap_or_else(|p| p.into_inner()) = probe;
         *self.server.lock().unwrap_or_else(|p| p.into_inner()) = None;
         self.via_gateway.store(via_gateway, Ordering::Relaxed);
+        self.udp.store(false, Ordering::Relaxed);
     }
 
     /// Forgets the connection's socket once it has ended. The probe is a duplicate of that
     /// socket, and the connection only really closes when every duplicate is gone.
     pub fn clear_connection(&self) {
         *self.probe.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Whether the session's UDP tunnel is up.
+    pub fn set_udp(&self, on: bool) {
+        self.udp.store(on, Ordering::Relaxed);
     }
 
     pub fn set_server_report(&self, report: ServerReport) {
@@ -90,6 +99,7 @@ impl LinkStats {
             tcp: self.probe.lock().unwrap_or_else(|p| p.into_inner()).as_ref().and_then(TcpProbe::read),
             server: *self.server.lock().unwrap_or_else(|p| p.into_inner()),
             via_gateway: self.via_gateway.load(Ordering::Relaxed),
+            udp: self.udp.load(Ordering::Relaxed),
         }
     }
 }

@@ -491,6 +491,8 @@ async fn run(ctx: EngineCtx, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
     let mut cookie: Option<ServerAutoReconnect> = None;
     let mut ever_connected = false;
     let mut attempt = 0u32;
+    // Cleared when a UDP tunnel dies mid-session: reconnects then stay on TCP.
+    let mut udp_ok = true;
     let max_attempts = if p.reconnect.enabled { p.reconnect.max_attempts } else { 0 };
 
     let (end_reason, is_error) = loop {
@@ -503,12 +505,12 @@ async fn run(ctx: EngineCtx, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
             }
         }
 
-        let result = connect(&ctx, &layout, cliprdr_factory.as_deref(), cookie.clone(), &mut cmd_rx).await;
+        let result = connect(&ctx, &layout, cliprdr_factory.as_deref(), cookie.clone(), udp_ok, &mut cmd_rx).await;
         if result.is_err() {
             // Nothing may keep a failed connection's socket open (e.g. during a certificate prompt).
             ctx.link.clear_connection();
         }
-        let (conn, framed, mic_rx) = match result {
+        let connected = match result {
             Ok(v) => v,
             Err(ConnectFailure::Cancelled) => break ("Disconnected.".to_owned(), false),
             Err(ConnectFailure::Certificate(rej)) => {
@@ -538,7 +540,7 @@ async fn run(ctx: EngineCtx, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 
         ever_connected = true;
         let session_started = std::time::Instant::now();
-        let end = active_session(&ctx, conn, framed, &mut cmd_rx, mic_rx, &mut cookie, &layout).await;
+        let end = active_session(&ctx, connected, &mut cmd_rx, &mut udp_ok, &mut cookie, &layout).await;
         // The latency probe holds a duplicate of the socket; drop it so the connection really
         // closes now, not when the UI lets go of the session.
         ctx.link.clear_connection();
@@ -834,9 +836,10 @@ async fn connect(
     layout: &DesktopLayout,
     cliprdr: Option<&(dyn CliprdrBackendFactory + Send)>,
     cookie: Option<ServerAutoReconnect>,
+    udp: bool,
     cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
-) -> Result<(ConnectionResult, Framed, Option<MicRx>), ConnectFailure> {
-    let fut = connect_inner(ctx, layout, cliprdr, cookie);
+) -> Result<Connected, ConnectFailure> {
+    let fut = connect_inner(ctx, layout, cliprdr, cookie, udp);
     tokio::pin!(fut);
     // Waking a computer adds up to two minutes before the connection itself starts.
     let wake = if ctx.params.profile.wake.configured().is_some() { Duration::from_secs(130) } else { Duration::ZERO };
@@ -859,7 +862,8 @@ async fn connect_inner(
     layout: &DesktopLayout,
     cliprdr: Option<&(dyn CliprdrBackendFactory + Send)>,
     cookie: Option<ServerAutoReconnect>,
-) -> Result<(ConnectionResult, Framed, Option<MicRx>), ConnectFailure> {
+    udp: bool,
+) -> Result<Connected, ConnectFailure> {
     let p = &ctx.params.profile;
     let insecure = p.security.allow_insecure_tls;
     let rejected: RejectionSlot = Arc::default();
@@ -872,7 +876,7 @@ async fn connect_inner(
     let started = std::time::Instant::now();
     let mut phases = Phases::default();
     // 1. Transport: RD Gateway tunnel or direct TCP.
-    let (stream, client_addr): (Erased, SocketAddr) = if let Some(gw) = &p.gateway {
+    let (stream, client_addr, tcp_peer): (Erased, SocketAddr, Option<SocketAddr>) = if let Some(gw) = &p.gateway {
         ctx.emit(Event::Status(Status::ConnectingGateway));
         if p.wake.on_connect
             && let Some((mac, to)) = p.wake.configured()
@@ -946,7 +950,7 @@ async fn connect_inner(
             debug!("Gateway socket not found; latency comes from the remote computer's reports only");
         }
         ctx.link.set_connection(probe, true);
-        (Box::new(client), addr)
+        (Box::new(client), addr, None)
     } else {
         ctx.emit(Event::Status(Status::Connecting));
         let target = (p.host.trim(), p.port);
@@ -999,14 +1003,17 @@ async fn connect_inner(
         let _ = tcp.set_nodelay(true);
         ctx.link.set_connection(crate::link::TcpProbe::new(std::os::fd::AsFd::as_fd(&tcp)), false);
         let addr = tcp.local_addr().map_err(|e| ConnectFailure::Error { message: e.to_string(), retryable: true })?;
-        (Box::new(tcp), addr)
+        let peer = tcp.peer_addr().ok();
+        (Box::new(tcp), addr, peer)
     };
+    // UDP is direct only: through an RD Gateway it needs the gateway's own UDP channel.
+    let udp_peer = tcp_peer.filter(|_| udp && p.display.udp);
 
     phases.transport = started.elapsed();
     // 2. RDP negotiation, TLS (with our verifier), CredSSP/NLA, capability exchange.
     ctx.emit(Event::Status(Status::Connecting));
     let (uplink_tx, mic_rx) = uplink();
-    let mut connector = build_connector(ctx, layout, client_addr, cliprdr, uplink_tx);
+    let mut connector = build_connector(ctx, layout, client_addr, cliprdr, uplink_tx, udp_peer.is_some());
     if let Some(c) = cookie {
         connector = connector.with_auto_reconnect_cookie(c);
     }
@@ -1056,14 +1063,18 @@ async fn connect_inner(
 
     ctx.emit(Event::Status(Status::Authenticating));
     let t = std::time::Instant::now();
-    let outcome = ironrdp_tokio::connect_finalize(
+    let mut tunnel: Option<crate::udp::UdpTunnel> = None;
+    let outcome = ironrdp_tokio::connect_finalize_with_multitransport(
         upgraded,
         connector,
         &mut framed,
         &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
         ServerName::new(p.host.trim()),
-        server_key,
+        server_key.clone(),
         None,
+        async |request: ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu, _soft_sync: bool| {
+            Ok(open_udp(&mut tunnel, udp_peer, p.host.trim(), &server_key, request).await)
+        },
     )
     .await
     .map_err(err)?;
@@ -1088,9 +1099,51 @@ async fn connect_inner(
         auth_and_setup_ms = phases.finalize.as_millis(),
         total_ms = started.elapsed().as_millis(),
         gateway = p.gateway.is_some(),
+        udp = tunnel.is_some(),
         "RDP session established"
     );
-    Ok((result, framed, Some(mic_rx)))
+    Ok((result, framed, Some(mic_rx), tunnel))
+}
+
+/// A connected session: the result, the TCP connection, the microphone uplink and the UDP
+/// tunnel when Windows offered one and it came up.
+type Connected = (ConnectionResult, Framed, Option<MicRx>, Option<crate::udp::UdpTunnel>);
+
+/// Answers an Initiate Multitransport Request: opens the UDP tunnel for a reliable-UDP request
+/// on a direct connection, and declines everything else (the session then stays on TCP).
+async fn open_udp(
+    slot: &mut Option<crate::udp::UdpTunnel>,
+    peer: Option<SocketAddr>,
+    host: &str,
+    server_key: &[u8],
+    request: ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu,
+) -> ironrdp_connector::MultitransportResult {
+    use ironrdp_pdu::rdp::multitransport::{MultitransportResponsePdu, RequestedProtocol};
+    let decline = ironrdp_connector::MultitransportResult::Failure(MultitransportResponsePdu::E_ABORT);
+    let Some(peer) = peer else { return decline };
+    if slot.is_some() || request.requested_protocol != RequestedProtocol::UdpFecR {
+        debug!(protocol = ?request.requested_protocol, "Declining additional multitransport request");
+        return decline;
+    }
+    let params = crate::udp::TunnelParams {
+        peer,
+        server_name: host.to_owned(),
+        server_key: server_key.to_vec(),
+        request_id: request.request_id,
+        cookie: request.security_cookie,
+    };
+    let started = std::time::Instant::now();
+    match crate::udp::UdpTunnel::connect(params).await {
+        Ok(t) => {
+            info!(setup_ms = started.elapsed().as_millis(), version = t.version, "UDP transport ready");
+            *slot = Some(t);
+            ironrdp_connector::MultitransportResult::Success
+        }
+        Err(e) => {
+            warn!(error = %e, setup_ms = started.elapsed().as_millis(), "UDP transport unavailable; staying on TCP");
+            decline
+        }
+    }
 }
 
 /// How long each connection phase took (logged once per connection).
@@ -1168,6 +1221,7 @@ fn build_connector(
     client_addr: SocketAddr,
     cliprdr: Option<&(dyn CliprdrBackendFactory + Send)>,
     uplink: UplinkTx,
+    udp: bool,
 ) -> ClientConnector {
     let p = &ctx.params.profile;
     let primary = layout.primary();
@@ -1293,7 +1347,12 @@ fn build_connector(
         compression_type: None,
         enable_server_pointer: true,
         pointer_software_rendering: false,
-        multitransport_flags: None,
+        // Reliable UDP only: lossy UDP needs DTLS, which Bastion does not implement.
+        multitransport_flags: udp.then_some(
+            ironrdp_pdu::gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_FECR
+                | ironrdp_pdu::gcc::MultiTransportFlags::TRANSPORT_TYPE_UDP_PREFERRED
+                | ironrdp_pdu::gcc::MultiTransportFlags::SOFT_SYNC_TCP_TO_UDP,
+        ),
         support_dyn_vc_gfx_protocol: true,
     };
 
@@ -1509,10 +1568,9 @@ fn publish(
 
 async fn active_session(
     ctx: &EngineCtx,
-    conn: ConnectionResult,
-    framed: Framed,
+    (conn, framed, mic_rx, tunnel): Connected,
     cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
-    mic_rx: Option<MicRx>,
+    udp_ok: &mut bool,
     cookie: &mut Option<ServerAutoReconnect>,
     layout: &DesktopLayout,
 ) -> SessionEnd {
@@ -1542,6 +1600,19 @@ async fn active_session(
     }
     .build();
     ctx.emit(Event::Status(Status::Connected { width: size.width, height: size.height }));
+    // Soft-Sync may now move dynamic channels onto the UDP tunnel.
+    let (udp_tx, mut udp_rx) = match tunnel.map(crate::udp::UdpTunnel::split) {
+        Some((tx, rx)) => match stage.enable_reliable_udp_dvc_tunnel() {
+            Ok(()) => (Some(tx), Some(rx)),
+            Err(e) => {
+                warn!(error = %e, "Cannot use the UDP tunnel; staying on TCP");
+                (None, None)
+            }
+        },
+        None => (None, None),
+    };
+    let mut udp_open = udp_rx.is_some();
+    ctx.link.set_udp(udp_open);
 
     let mut mic_rx = mic_rx;
     let mut housekeeping = tokio::time::interval(Duration::from_secs(5));
@@ -1595,6 +1666,32 @@ async fn active_session(
             }
         };
     }
+    use ironrdp_session::SessionErrorExt as _;
+    // Dynamic-channel messages go wherever Soft-Sync put their channel: the UDP tunnel or TCP.
+    macro_rules! send_dvc {
+        ($batch:expr) => {{
+            let batch: ironrdp_dvc::DvcMessageBatch = $batch;
+            match (&udp_tx, stage.dvc_tunnel_for_channel(batch.channel_id())) {
+                (Some(tx), Some(_)) => {
+                    for m in batch.into_messages() {
+                        let bytes =
+                            session_try!(m.encode_unframed_pdu().map_err(ironrdp_session::SessionError::encode));
+                        ctx.link.add_tx(bytes.len());
+                        // A closed tunnel is noticed (and handled) by its receiving branch.
+                        let _ = tx.send(bytes);
+                    }
+                }
+                _ => write_frame!(session_try!(stage.encode_dvc_messages(batch.into_messages()))),
+            }
+        }};
+    }
+    macro_rules! dvc_batch {
+        ($channel:expr, $msgs:expr) => {
+            session_try!(
+                ironrdp_dvc::DvcMessageBatch::try_new($channel, $msgs).map_err(ironrdp_session::SessionError::pdu)
+            )
+        };
+    }
 
     loop {
         let outputs = tokio::select! {
@@ -1612,9 +1709,38 @@ async fn active_session(
                 out
             }
             () = write_stalled.notified() => return SessionEnd::NetworkError(WRITE_STALLED.into()),
-            Some((_, msgs)) = async { match mic_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {
-                write_frame!(session_try!(stage.encode_dvc_messages(msgs)));
+            Some((channel, msgs)) = async { match mic_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {
+                send_dvc!(dvc_batch!(channel, msgs));
                 Vec::new()
+            }
+            pdu = async { match udp_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } }, if udp_open => {
+                match pdu {
+                    Some(payload) => {
+                        bastion_metrics::NET_PDUS.incr();
+                        ctx.link.add_rx(payload.len());
+                        let started = std::time::Instant::now();
+                        let (batch, out) = session_try!(stage.process_dvc_tunnel(
+                            &mut image,
+                            ironrdp_dvc::pdu::SoftSyncTunnelType::RELIABLE_UDP,
+                            &payload
+                        ));
+                        bastion_metrics::RDP_PROCESS.since(started);
+                        send_dvc!(batch);
+                        out
+                    }
+                    None => {
+                        udp_open = false;
+                        ctx.link.set_udp(false);
+                        if stage.reliable_udp_dvc_tunnel_in_use() {
+                            // Channels moved to UDP cannot move back: reconnect, over TCP only.
+                            *udp_ok = false;
+                            return SessionEnd::NetworkError("the UDP connection was lost".into());
+                        }
+                        let _ = stage.disable_reliable_udp_dvc_tunnel();
+                        warn!("UDP tunnel closed before it was used; continuing on TCP");
+                        Vec::new()
+                    }
+                }
             }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { return SessionEnd::UserClosed };
@@ -1639,18 +1765,18 @@ async fn active_session(
                         if new == current_layout {
                             Vec::new()
                         } else {
-                            let frame = match (new.is_multi(), new.display_control()) {
-                                (true, Some(dc)) => stage.encode_monitor_layout(&dc),
+                            let batch = match (new.is_multi(), new.display_control()) {
+                                (true, Some(dc)) => stage.prepare_monitor_layout(&dc),
                                 _ => {
                                     let m = new.primary();
-                                    stage.encode_resize(m.width, m.height, Some(m.scale), m.physical_mm)
+                                    stage.prepare_resize(m.width, m.height, Some(m.scale), m.physical_mm)
                                 }
                             };
-                            match frame {
-                                Some(f) => {
+                            match batch {
+                                Some(b) => {
                                     debug!(layout = ?new, "Sent display layout update");
                                     current_layout = new;
-                                    write_frame!(session_try!(f));
+                                    send_dvc!(session_try!(b));
                                     Vec::new()
                                 }
                                 // Server doesn't support dynamic resize: reconnect at the new size.
@@ -1694,7 +1820,7 @@ async fn active_session(
                     }
                     Command::CertificateDecision { .. } => Vec::new(),
                     Command::GfxReply(reply) => {
-                        write_frame!(session_try!(stage.encode_dvc_messages(reply.0)));
+                        send_dvc!(dvc_batch!(reply.0, reply.1));
                         Vec::new()
                     }
                     Command::GfxFailed(message) => return SessionEnd::Fatal(message.to_owned()),
@@ -1829,6 +1955,59 @@ async fn active_session(
 
 #[cfg(test)]
 mod tests {
+    fn udp_request(
+        protocol: ironrdp_pdu::rdp::multitransport::RequestedProtocol,
+        cookie: [u8; 16],
+    ) -> ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu {
+        use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
+        ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu {
+            security_header: BasicSecurityHeader { flags: BasicSecurityHeaderFlags::TRANSPORT_REQ },
+            request_id: 7,
+            requested_protocol: protocol,
+            security_cookie: cookie,
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_offer_is_answered_only_for_reliable_udp_on_direct_connections() {
+        use ironrdp_connector::MultitransportResult;
+        use ironrdp_pdu::rdp::multitransport::{MultitransportResponsePdu, RequestedProtocol};
+        let decline = MultitransportResult::Failure(MultitransportResponsePdu::E_ABORT);
+        let cookie = [5u8; 16];
+        let (peer, key) = crate::udp::tests::server(cookie).await;
+        let mut slot = None;
+
+        // No direct peer (RD Gateway, or UDP switched off): declined without trying.
+        let r = super::open_udp(&mut slot, None, "pc01", &key, udp_request(RequestedProtocol::UdpFecR, cookie)).await;
+        assert_eq!(r, decline);
+        // Lossy UDP needs DTLS, which Bastion does not implement.
+        let r =
+            super::open_udp(&mut slot, Some(peer), "pc01", &key, udp_request(RequestedProtocol::UdpFecL, cookie)).await;
+        assert_eq!(r, decline);
+        assert!(slot.is_none());
+        // Reliable UDP to a reachable server: accepted, and the tunnel is kept.
+        let r =
+            super::open_udp(&mut slot, Some(peer), "pc01", &key, udp_request(RequestedProtocol::UdpFecR, cookie)).await;
+        assert_eq!(r, MultitransportResult::Success);
+        assert!(slot.is_some());
+        // A second request while one tunnel is up is declined.
+        let r =
+            super::open_udp(&mut slot, Some(peer), "pc01", &key, udp_request(RequestedProtocol::UdpFecR, cookie)).await;
+        assert_eq!(r, decline);
+    }
+
+    #[tokio::test]
+    async fn failed_udp_setup_declines_so_the_session_stays_on_tcp() {
+        use ironrdp_pdu::rdp::multitransport::RequestedProtocol;
+        let (peer, key) = crate::udp::tests::server([1u8; 16]).await;
+        let mut slot = None;
+        // Wrong cookie: the server refuses the tunnel.
+        let r =
+            super::open_udp(&mut slot, Some(peer), "pc01", &key, udp_request(RequestedProtocol::UdpFecR, [2u8; 16]))
+                .await;
+        assert!(matches!(r, ironrdp_connector::MultitransportResult::Failure(_)));
+        assert!(slot.is_none());
+    }
     #[test]
     fn connection_speed_sets_network_type_and_effects() {
         use super::{ConnectionSpeed, PerformanceFlags, experience};

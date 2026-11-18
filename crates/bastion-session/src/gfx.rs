@@ -42,7 +42,7 @@ use crate::frame::{Rect, SharedFrame};
 
 /// Encoded pipeline replies for the session loop to send (see [`Command::GfxReply`]).
 #[derive(Debug)]
-pub struct GfxReply(pub(crate) Vec<SvcMessage>);
+pub struct GfxReply(pub(crate) u32, pub(crate) Vec<SvcMessage>);
 
 /// What the graphics thread needs from the session.
 #[derive(Clone)]
@@ -585,7 +585,7 @@ fn reply(shared: &GfxShared, channel_id: u32, msgs: Vec<DvcMessage>) {
     }
     match ironrdp_dvc::encode_dvc_messages(channel_id, msgs, ironrdp_svc::ChannelFlags::empty()) {
         Ok(svc) => {
-            let _ = shared.replies.send(Command::GfxReply(GfxReply(svc)));
+            let _ = shared.replies.send(Command::GfxReply(GfxReply(channel_id, svc)));
         }
         Err(e) => gated!(warn, error = %e, "Cannot encode graphics pipeline reply"),
     }

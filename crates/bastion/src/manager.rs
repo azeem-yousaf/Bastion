@@ -767,6 +767,13 @@ impl Manager {
                          Applies from the next connection.",
                     );
                 });
+                let via_gateway = d.gateway.is_some();
+                ui.add_enabled(
+                    !via_gateway,
+                    egui::Checkbox::new(&mut d.display.udp, "Use UDP when available (smoother on Wi-Fi and distant links)"),
+                )
+                .on_hover_text("Graphics and audio move to UDP when the remote computer offers it; TCP is used otherwise")
+                .on_disabled_hover_text("Connections through an RD Gateway use TCP only");
                 ui.checkbox(&mut d.display.h264, "H.264 video codec (lower bandwidth, smoother video)");
                 ui.add_enabled(d.display.h264, egui::Checkbox::new(&mut d.display.hardware_decode, "Hardware decoding (NVDEC / VAAPI) when software can't keep up"))
                     .on_hover_text("Remote-desktop video usually decodes faster on the CPU; the graphics card takes over for heavy video");

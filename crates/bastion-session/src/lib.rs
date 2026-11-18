@@ -10,6 +10,7 @@ pub mod keyboard;
 pub mod layout;
 pub mod link;
 pub mod tls;
+pub mod udp;
 pub mod wake;
 
 pub use engine::{Command, ConnectParams, Event, PointerEvent, SessionHandle, Status, Waker};

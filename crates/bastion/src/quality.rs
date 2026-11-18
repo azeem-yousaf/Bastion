@@ -76,6 +76,8 @@ pub struct Quality {
     /// The remote computer's estimate of the available bandwidth.
     pub capacity_mbps: Option<f32>,
     pub via_gateway: bool,
+    /// Graphics and audio use the UDP tunnel.
+    pub udp: bool,
 }
 
 impl Quality {
@@ -184,6 +186,7 @@ impl Meter {
                 .and_then(|r| r.bandwidth_kbps)
                 .map(|k| k as f32 / 1000.0),
             via_gateway: sample.via_gateway,
+            udp: sample.udp,
         };
 
         let mut warning = None;
@@ -242,7 +245,7 @@ mod tests {
     }
 
     fn sample(rx: u64, frames: u64, tcp: Option<TcpSample>) -> LinkSample {
-        LinkSample { rx_bytes: rx, tx_bytes: rx / 100, frames, tcp, server: None, via_gateway: false }
+        LinkSample { rx_bytes: rx, tx_bytes: rx / 100, frames, tcp, server: None, via_gateway: false, udp: false }
     }
 
     #[test]

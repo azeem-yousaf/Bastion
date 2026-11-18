@@ -461,6 +461,7 @@ fn quality(level: bastion::quality::Level, latency: f32) -> bastion::quality::Qu
         up_mbps: 0.25,
         capacity_mbps: None,
         via_gateway: true,
+        udp: false,
     }
 }
 
