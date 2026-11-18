@@ -80,6 +80,12 @@ impl Gpu {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("bastion"),
             required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            // The default (`Performance`) suballocates CPU-visible memory in 64–128 MiB blocks,
+            // and on NVIDIA without Resizable BAR wgpu's upload staging lands in the 256 MiB
+            // BAR1 window shared by every process. Our texture uploads alone grew to fill most
+            // of it, so other GPU apps (Chrome) failed to map memory and crashed. Small blocks
+            // keep our share to a few MiB; we upload a few MB per frame at most.
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
             ..Default::default()
         }))
         .context("create GPU device")?;
